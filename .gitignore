@@ -1,0 +1,32 @@
+# PyCharm ve IDE dosyaları
+.idea/
+*.iml
+.vscode/
+
+# Python cache ve derleme dosyaları
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Derleme/Çıktı klasörleri
+build/
+dist/
+
+# PyInstaller veya diğer paketleme araçları
+*.spec
+*.exe
+*.dll
+*.pyd
+
+# Log ve geçici dosyalar
+*.log
+*.tmp
+
+# Sistem dosyaları (Windows, macOS)
+.DS_Store
+Thumbs.db
