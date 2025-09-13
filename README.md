@@ -160,14 +160,14 @@ cd License-Plate-Recognition
 ```
 
 2. Bağımlılıkları Yükleyin
-```bash
 Gerekli kütüphaneleri kurmak için:
+```bash
 pip install -r requirements.txt
 ```
 
 3. Uygulamayı Başlatın
-```bash
 Uygulamayı çalıştırmak için:
+```bash
 python main.py
 ```
 
