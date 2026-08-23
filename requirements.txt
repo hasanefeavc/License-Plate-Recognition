@@ -1,0 +1,65 @@
+# Runtime dependencies for the headless LPR core (API + pipeline + hardware).
+# Pinned with a lower bound and a "<next-major" upper bound so patch/minor
+# updates flow in automatically but breaking major bumps require a deliberate
+# review. Install with: pip install -r requirements.txt
+#
+# Target: Python 3.12, Ubuntu 24.04 LTS / Windows 11. See pyproject.toml for
+# the authoritative requires-python range (>=3.11,<3.14) -- ultralytics and
+# easyocr's dependency chains (torch, numba/llvmlite via some easyocr
+# versions) are not yet reliable on 3.14, hence the cap.
+
+# --- Computer vision / ML -----------------------------------------------
+opencv-python-headless>=4.9,<5
+numpy>=1.26,<2.3
+ultralytics>=8.2,<9
+# Linear-assignment solver used by ultralytics' ByteTrack association step.
+# Not a hard dependency of ultralytics: it pip-installs it on first use
+# instead, which fails in an offline/read-only container. Pinned here so the
+# image is complete at build time.
+lap>=0.5.12,<1
+# CPU inference backend for models exported by scripts/export_onnx.py. The
+# detector prefers models/plate_yolov8n.onnx over the .pt when one exists.
+# Deliberately the CPU wheel: ultralytics reaches for the 250 MB
+# onnxruntime-gpu build whenever torch reports a CUDA device, so on a GPU host
+# install that variant explicitly instead of letting it AutoUpdate.
+onnxruntime>=1.17,<2
+easyocr>=1.7,<2
+torch>=2.2,<3
+torchvision>=0.17,<1
+pillow>=10.3,<12
+
+# --- API server ------------------------------------------------------------
+fastapi>=0.111,<1
+uvicorn[standard]>=0.29,<1
+websockets>=12.0,<14
+python-multipart>=0.0.9,<0.1
+httpx>=0.27,<1
+
+# --- Config / validation -----------------------------------------------
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
+pyyaml>=6.0,<7
+
+# --- Hardware / auth / security ------------------------------------------
+pyserial>=3.5,<4
+argon2-cffi>=23.1,<24
+pyjwt>=2.8,<3
+
+# ---------------------------------------------------------------------------
+# NOT installed here: the Tkinter GUI client.
+#
+# The Tkinter desktop client (src/lpr/ui) is a separate, non-containerised
+# app that runs on the operator's Windows/Linux desktop, not inside the
+# Docker image. It additionally needs:
+#
+#   ttkbootstrap         - themed widgets on top of stdlib tkinter
+#   pillow               - decodes the MJPEG frames the API streams
+#   requests / websockets - talk to the lpr-api service (REST + event stream)
+#
+# Note it does NOT need opencv, torch or a database driver: the client is a
+# pure thin client that only speaks HTTP and WebSocket to the service.
+#
+# Install those via the "gui" extra instead, e.g.:
+#   pip install -e ".[gui]"
+# See pyproject.toml [project.optional-dependencies].
+# ---------------------------------------------------------------------------

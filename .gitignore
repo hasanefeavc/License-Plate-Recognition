@@ -1,32 +1,66 @@
-# PyCharm ve IDE dosyaları
+# --- IDE / editor -----------------------------------------------------------
 .idea/
 *.iml
 .vscode/
 
-# Python cache ve derleme dosyaları
+# --- Python cache / bytecode -------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environment
+# --- Virtual environments -----------------------------------------------
 venv/
 env/
 ENV/
+.venv/
 
-# Derleme/Çıktı klasörleri
+# --- Build / packaging output --------------------------------------------
 build/
 dist/
-
-# PyInstaller veya diğer paketleme araçları
+*.egg-info/
 *.spec
+
+# --- Windows packaging artifacts (PyInstaller etc.) ------------------------
 *.exe
 *.dll
 *.pyd
 
-# Log ve geçici dosyalar
+# --- Test / lint / type-check caches --------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Logs and temp files --------------------------------------------------
 *.log
 *.tmp
 
-# Sistem dosyaları (Windows, macOS)
+# --- System files (Windows, macOS) -----------------------------------------
 .DS_Store
 Thumbs.db
+
+# --- Runtime data / models / secrets ----------------------------------------
+# data/ and models/ are Docker volumes and local working directories, not
+# repo content: camera captures, the sqlite DB, downloaded/fine-tuned model
+# weights. Fetch models via scripts/fetch_models.py, not git.
+data/
+models/*.pt
+models/*.pt.bak
+models/*.onnx
+
+# Training artefacts: ultralytics run directories (weights, plots, metrics)
+# and downloaded datasets. Produced by scripts/train_plate_detector.py; only
+# the finished models/plate_yolov8n.pt matters, and that is ignored above too.
+runs/
+datasets/
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# --- Vendored Windows OCR binaries (removed from the repo) ------------------
+# A ~123MB vendored Windows Tesseract-OCR binary tree used to live here.
+# The refactored pipeline uses easyocr (see requirements.txt) instead, so
+# this directory must never be re-added.
+Tesseract-OCR/

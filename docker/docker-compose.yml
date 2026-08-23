@@ -1,0 +1,43 @@
+services:
+  lpr-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: lpr-api:latest
+    container_name: lpr-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+      - ../config.yaml:/app/config.yaml:ro
+    # Optional: create a `.env` file next to this compose file (or in the
+    # repo root and reference it as ../.env) for secrets like
+    # LPR_API__SECRET_KEY. Safe to leave absent -- compose just skips it.
+    env_file:
+      - path: .env
+        required: false
+
+    # --- Serial relay passthrough (Linux hosts only) --------------------
+    # Uncomment to expose a physical serial gate relay to the container.
+    # This only works when the Docker daemon runs on Linux (bind-mounting a
+    # host device node is a Linux-only Docker feature); on Windows there is
+    # no equivalent device passthrough into Linux containers. On Windows
+    # hosts, run the relay driver on the host itself (outside Docker) and
+    # set LPR_RELAY__MOCK=true here (or leave relay.mock as configured in
+    # config.yaml) so the containerised API doesn't try to open a serial
+    # port that isn't reachable from inside the container.
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+
+    # --- GPU acceleration (optional) -------------------------------------
+    # Requires the NVIDIA Container Toolkit on the host and a CUDA-enabled
+    # image (see the CPU/GPU note at the top of docker/Dockerfile).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

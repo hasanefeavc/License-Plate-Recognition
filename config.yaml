@@ -1,0 +1,203 @@
+# LPR configuration.
+
+#
+
+# Precedence (lowest to highest): this file  <  environment variables
+
+# (LPR_ prefix, "__" for nesting, e.g. LPR_RELAY__PORT=/dev/ttyUSB0)  <
+
+# explicit constructor args passed to lpr.config.Settings(...).
+
+#
+
+# See src/lpr/config.py for the full schema, validation rules, and the
+
+# per-field docstrings.
+
+
+
+app:
+
+  name: lpr
+
+  headless: true
+
+  log_level: INFO
+
+  data_dir: data
+
+  models_dir: models
+
+
+
+cameras:
+
+  entry:
+
+    source: "0"
+
+    width: 1280
+
+    height: 720
+
+    fps_limit: 15
+
+    reconnect_delay_s: 5.0
+
+    queue_size: 2
+
+  exit:
+
+    source: "0"
+
+    width: 1280
+
+    height: 720
+
+    fps_limit: 15
+
+    reconnect_delay_s: 5.0
+
+    queue_size: 2
+
+  # Motion gating (applies to both cameras): a frame with nothing moving in
+
+  # it never reaches YOLO. threshold is the largest moving contour's area in
+
+  # full-frame pixels -- raise it if swaying trees or rain trigger inference,
+
+  # lower it if a slowly approaching car is missed. heartbeat_s forces a
+
+  # frame through even on a still scene, so tracker state still ages out.
+
+  motion:
+
+    enabled: true
+
+    threshold: 5000
+
+    heartbeat_s: 3.0
+
+
+
+detection:
+
+  model_path: models/plate_yolov8n.pt
+
+  confidence: 0.35
+
+  iou: 0.5
+
+  device: auto
+
+  imgsz: 640
+
+  frame_stride: 3
+
+  # ByteTrack: gives every plate a stable id across frames, so the pipeline
+
+  # can recognise a car once instead of once per frame. Set track: false to
+
+  # go back to stateless per-frame detection.
+
+  track: true
+
+  tracker: bytetrack.yaml
+
+  # Use models/plate_yolov8n.onnx instead of the .pt when it exists. Create it
+
+  # with `python scripts/export_onnx.py`, which benchmarks both backends and
+
+  # tells you whether ONNX is actually faster on your box -- it often is not.
+
+  # The export is fixed at the imgsz it was built with and is verified at
+
+  # startup, so a mismatched or broken file falls back to the .pt rather than
+
+  # failing at the gate.
+
+  prefer_onnx: true
+
+
+
+ocr:
+
+  backend: easyocr
+
+  gpu: false
+
+  min_confidence: 0.5
+
+  allowlist: "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
+
+
+
+voting:
+
+  window: 5
+
+  min_votes: 3
+
+  ttl_s: 4.0
+
+  cooldown_s: 3.0
+
+  # Per-track OCR budget (only used when detection.track is on): a plate that
+
+  # has been read this many times without confirming is muted for cooldown_s.
+
+  max_track_attempts: 12
+
+  track_ttl_s: 30.0
+
+
+
+relay:
+
+  enabled: true
+
+  port: auto
+
+  baud: 9600
+
+  open_byte: "A"
+
+  close_byte: "a"
+
+  pulse_ms: 1000
+
+  mock: false
+
+
+
+database:
+
+  path: data/plates.db
+
+  log_retention_days: 10
+
+
+
+api:
+
+  host: 0.0.0.0
+
+  port: 8000
+
+  cors_origins:
+
+    - "*"
+
+  token_ttl_min: 720
+
+  # Overridden via LPR_API__SECRET_KEY in any real deployment; enforced by
+
+  # a validator in src/lpr/config.py when LPR_ENV=production.
+
+  secret_key: change-me
+
+
+
+security:
+
+  password_hasher: argon2
