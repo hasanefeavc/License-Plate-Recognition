@@ -1,261 +1,245 @@
-# 🚗 License Plate Recognition System
-This project is a Python-based License Plate Recognition System. It combines OpenCV for image 
-processing and Pytesseract for optical character recognition (OCR) to automatically detect and 
-read vehicle license plates. Tesseract OCR is integrated into the project, requiring no additional installation.
+# 🚗 License Plate Recognition (LPR)
 
-## ✨ Features
+Turkish license-plate recognition for gate/barrier control. A headless FastAPI service
+runs the vision pipeline in Docker; the Tkinter desktop app is now a thin client that
+talks to it over HTTP + WebSocket.
 
-- Automatic Plate Detection: Quickly and accurately identifies vehicle license plates.
-- OCR Text Recognition: Reads letters and numbers on plates using Pytesseract.
-- Live Camera Support: Works with real-time camera feeds.
-- Advanced Image Processing: Utilizes robust OpenCV-based algorithms.
-- User-Friendly Interface: Provides an intuitive and easy-to-use interface.
+Targets **Ubuntu 24.04 LTS** and **Windows 11**.
 
+---
 
-## 📋 System Requirements
+## Architecture
 
-- Operating System: Windows, macOS, or Linux
-- Python: 3.8 or higher
-- Dependencies: Libraries listed in the requirements.txt file
-- Hardware: Camera (IP or local) and optional relay device
-- Storage: Minimum 500 MB free space (for database and logs)
-
-
-## 🛠 Installation
-1. Download the Project
-Run the following command in your terminal to clone the project:
-```bash
-git clone https://github.com/hasanefeavc/License-Plate-Recognition.git
-cd License-Plate-Recognition
+```
+                 ┌──────────────────────────────────────────────┐
+   RTSP / USB    │  headless core  (Docker, no display needed)  │
+   cameras ─────▶│                                              │
+                 │  CameraWorker ──▶ YOLOv8n ──▶ EasyOCR ──▶     │
+                 │   (1 thread     detect      recognise        │
+                 │    per camera)                 │             │
+                 │                                ▼             │
+                 │                    normalise → multi-frame   │
+                 │                       vote → decide          │
+                 │                          │                   │
+                 │            ┌─────────────┼─────────────┐     │
+                 │            ▼             ▼             ▼     │
+                 │        SQLite/WAL    relay thread   FastAPI  │
+                 └────────────────────────────┬─────────────────┘
+                                              │ HTTP + WS + MJPEG
+                        ┌─────────────────────┴──────────────────┐
+                        ▼                                        ▼
+                 Tkinter client                            any other client
+                 (lpr-gui)                                 (browser, mobile)
 ```
 
-2. Install Dependencies
-To install the required libraries:
+Every stage is decoupled through the protocols in `src/lpr/contracts.py`
+(`Detector`, `Recognizer`, `Voter`, `Relay`), so the pipeline never imports a
+concrete ML class and can be unit-tested with fakes and no GPU.
+
+### Layout
+
+```
+src/lpr/
+├── contracts.py        shared dataclasses + protocols (the integration seam)
+├── config.py           pydantic-settings: config.yaml ← env (LPR_*) ← args
+├── platform_compat.py  the ONLY place with sys.platform branching
+├── logging_conf.py     human logs on a TTY, single-line JSON in the container
+├── db/                 thread-local SQLite (WAL), repositories, legacy migrator
+├── hardware/relay.py   queue-driven serial relay + MockRelay fallback
+├── pipeline/           per-camera capture threads, orchestrator, DI factory
+├── detect/             YOLOv8n detector, crop preprocessing, contour fallback
+├── ocr/                EasyOCR/PaddleOCR backends, TR normaliser, voting
+├── api/                FastAPI routes, JWT auth, MJPEG stream, WS events
+└── ui/                 Tkinter client + transport-only API/WS client
+docker/                 Dockerfile, compose, entrypoint
+scripts/fetch_models.py model bootstrap
+legacy/main_legacy.py   the original 836-line single-file app, kept for reference
+```
+
+---
+
+## Quick start
+
+### Docker (headless core — recommended)
+
 ```bash
+cp .env.example docker/.env          # then set LPR_API__SECRET_KEY
+python scripts/fetch_models.py       # downloads baseline weights into models/
+docker compose -f docker/docker-compose.yml up --build
+curl http://localhost:8000/health
+```
+
+`data/`, `models/` and `config.yaml` are bind-mounted, so the database, weights and
+settings live on the host and survive rebuilds.
+
+### Native
+
+```bash
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e ".[gui]"                               # only for the desktop client
+lpr-api                                               # http://127.0.0.1:8000/docs
+lpr-gui --api-url http://127.0.0.1:8000               # separate process/machine
 ```
 
-3. Launch the Application
-To start the application:
+---
+
+## Configuration
+
+`config.yaml` holds the defaults; environment variables override it and win.
+Nested keys use a double underscore:
+
 ```bash
-python main.py
+LPR_CAMERAS__ENTRY__SOURCE=rtsp://user:pass@10.0.0.5:554/stream1
+LPR_RELAY__PORT=/dev/ttyUSB0      # COM3 on Windows, "auto" resolves per-OS
+LPR_DETECTION__DEVICE=cuda
 ```
 
+See `.env.example` for the full annotated list.
 
-# 🖥 Interface and Usage
+---
 
-![anasayfa](https://github.com/user-attachments/assets/b12aead9-b969-42e6-9a2d-8fc8f7295d3b)
+## API
 
-### Initial Setup and User Management
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | liveness; reports `degraded` when the pipeline is down |
+| `POST /api/auth/login` · `/register` | none · first-user-or-admin | JWT bearer token |
+| `GET/POST /api/plates` · `DELETE /api/plates/{plate}` | user · admin | allow-list CRUD |
+| `GET /api/logs` · `/api/logs/dates` | user | history, filterable by camera/plate/date |
+| `GET /api/stats` · `/api/cameras` | user | pipeline and per-camera health |
+| `POST /api/relay/trigger` · `/api/pipeline/pause` · `/resume` | admin | manual control |
+| `GET /api/stream/{camera}` | bearer | MJPEG preview (capped ~10 fps) |
+| `WS /ws/events?token=` | token | live plate events as JSON |
 
-- On first launch, the application creates a database file named plates and prompts you to create a user account.
+Interactive docs at `/docs`.
 
-- Registered user information is stored; subsequent logins require only your username and password.
+---
 
-![kayıt1](https://github.com/user-attachments/assets/4851a095-aabe-4c99-a20d-c36bc8a3ae39)
-![giriş2](https://github.com/user-attachments/assets/26ebc3cc-9e78-4220-8b09-6246de429378)
+## Accuracy design
 
+The legacy pipeline was Canny edge detection → contour search → a four-point warp →
+Tesseract `--psm 8`. It needed a clean quadrilateral, so it failed on angled, blurred,
+night and partially-occluded plates.
 
-## Interface Features
+The replacement stacks five independent accuracy layers:
 
-### Plate Registration
+1. **YOLOv8n detection** — learned plate localisation, plus plausibility filters on
+   aspect ratio, area, and Laplacian sharpness so blurred crops never reach OCR.
+2. **Crop enhancement** — upscale, CLAHE, deskew; the recogniser tries the grayscale,
+   thresholded and deskewed variants and keeps the best candidate.
+3. **Turkish normalisation** — `^(0[1-9]|[1-7][0-9]|8[01])([A-Z]{1,3})([0-9]{2,4})$`,
+   with a *positional* confusion map (`0↔O`, `1↔I`, `8↔B`, `5↔S`, …) applied per block:
+   digits in the province code, letters in the middle, digits in the tail. Q/W/X and
+   the diacritic letters are rejected — they never appear on Turkish plates.
+4. **ByteTrack tracking** — detection runs through `model.track(persist=True)`, so each
+   plate keeps a stable `track_id` while it is in view (one tracker state per camera).
+   Reads sharing an id are the same physical plate and reinforce each other regardless
+   of spelling, and reads from *different* ids are never merged.
+5. **Multi-frame voting** — a plate must win `min_votes` of the last `window` reads
+   inside a `ttl_s` time window before the relay fires, with confidence weighting,
+   Levenshtein-1 candidate merging, and a per-plate cooldown.
 
-- Add or remove plates via the "Registered Plates" tab.
+Before any of that runs, the capture thread applies **motion gating**: each frame is
+subsampled by an integer stride to ~320 px, blurred, differenced against a running-average
+background (`cv2.accumulateWeighted`), and dropped unless the largest moving contour clears
+`cameras.motion.threshold` (in full-frame pixels). It costs ~0.09 ms/frame against a
+30–100 ms inference pass, and on a still scene with sensor noise and JPEG artefacts it
+removes ~99% of frames. `cameras.motion.heartbeat_s` forces one through periodically so
+tracker state still ages out, and the gate fails open — a broken motion check means *more*
+inference, never a blind pipeline. Skipped frames are counted per camera as
+`motion_skipped`, and `latest()` keeps updating so the live preview never freezes.
 
-![plakakayıt1](https://github.com/user-attachments/assets/84ffeb08-3f87-4705-af6f-c45a7b567737)
+Tracking also caps the OCR bill: once a track has opened (or been refused at) the gate,
+or has burned `voting.max_track_attempts` reads without confirming anything, EasyOCR is
+skipped for that track entirely — the pipeline recognises a *car*, not a *frame*. The
+saving shows up as `ocr_skipped` in `GET /api/stats`. Set `detection.track: false` to
+go back to stateless per-frame detection; everything downstream falls back to the
+text-only voting path when a detection has no `track_id`.
 
+### ONNX (optional)
 
-### History Logs
-
-- Recognition records are stored in the database for 10 days and can be viewed from the interface. On the 11th day,
-the oldest logs are automatically deleted and new entries are added.
-
-
-
-
-### Camera Settings
-
-- Configure the IP addresses for entry and exit cameras through the interface.
-
-![kamerakaynakları](https://github.com/user-attachments/assets/5104c0a5-8c8c-4660-a8af-fbcdfc4bbecd)
-
-
-### Uptime
-
-- The top-right corner of the interface displays the application's uptime, which resets when the application is restarted.
-
-![çalışmasüresi](https://github.com/user-attachments/assets/0224591a-d81b-45bb-b1bc-365be612b6c3)
-
-
-
-
-## ⚙️ Code Customization
-### Relay Connection
-
-- Modify the code based on the signal type of the relay device used. Relay signals may vary depending on the device.
-
-![role1](https://github.com/user-attachments/assets/07add916-1d91-429d-a770-f2e4c4d9eb78)
-
-
-### 💡 Usage Tips
-
-- Camera Configuration: Ensure IP addresses are correctly set.
-- Relay Integration: Adjust settings according to the relay device's specifications.
-- Performance: Use high-resolution cameras for better results.
-- Troubleshooting: Refer to OpenCV and Pytesseract documentation for debugging assistance.
-
-
-### 📜 License
-This project is distributed under the MIT License. See the LICENSE file for details.
-
-### 🤝 Contributing
-To contribute to the project:
-
-### Fork the repository.
-Create a new feature branch (git checkout -b feature/new-feature).
-Make your changes and commit them (git commit -m 'Added new feature').
-Push your branch (git push origin feature/new-feature).
-Open a Pull Request.
-
-
-### 📞 Contact
-### For questions or suggestions:
-
-### GitHub: hasanefeavc
-### Email: hasanefeavc@gmail.com
-
-
-
----------------------------------------------------------------------------------------------------------
-
-
-
-# 🚗 Araç Plaka Tanıma Sistemi
-Bu proje, Python tabanlı bir Araç Plaka Tanıma Sistemidir. OpenCV ile görüntü işleme ve Pytesseract ile optik karakter tanıma (OCR) teknolojilerini birleştirerek araç plakalarını otomatik olarak tespit eder ve okur. Tesseract OCR, proje içine entegre edilmiştir; ek kurulum gerektirmez.
-
-## ✨ Özellikler
-
-- Otomatik Plaka Tespiti: Araç plakalarını hızlı ve doğru bir şekilde algılar.
-- OCR ile Metin Okuma: Plakalardaki harf ve rakamları Pytesseract ile tanır.
-- Canlı Kamera Desteği: Gerçek zamanlı kamera akışıyla çalışır.
-- Güçlü Görüntü İşleme: OpenCV tabanlı gelişmiş algoritmalar kullanır.
-- Kullanıcı Dostu Arayüz: Sezgisel ve kolay kullanımlı bir arayüz sunar.
-
-
-## 📋 Sistem Gereksinimleri
-
-- İşletim Sistemi: Windows, macOS veya Linux
-- Python: 3.8 veya üzeri
-- Bağımlılıklar: requirements.txt dosyasında listelenen kütüphaneler
-- Donanım: Kamera (IP veya yerel) ve opsiyonel röle cihazı
-- Depolama: Minimum 500 MB boş alan (veritabanı ve loglar için)
-
-
-## 🛠 Kurulum
-1. Projeyi İndirin
-Terminalde aşağıdaki komutu çalıştırarak projeyi klonlayın:
 ```bash
-git clone https://github.com/hasanefeavc/License-Plate-Recognition.git
-cd License-Plate-Recognition
+python scripts/export_onnx.py    # writes models/plate_yolov8n.onnx, then benchmarks both
 ```
 
-2. Bağımlılıkları Yükleyin
-Gerekli kütüphaneleri kurmak için:
+The detector prefers a sibling `.onnx` over the configured `.pt` automatically
+(`detection.prefer_onnx`), verifying it at startup and falling back to the `.pt` if the
+export is corrupt or was built for a different `imgsz`. ByteTrack works identically on
+either backend.
+
+**Benchmark before deploying it.** ONNX Runtime is not automatically faster than a
+oneDNN-enabled PyTorch build on recent Intel CPUs — on this project's development machine
+it measured ~2× *slower* (53 ms vs 23 ms per frame). The export script prints both numbers
+and warns you if the `.pt` wins; if it does, delete the `.onnx` or set
+`detection.prefer_onnx: false`.
+
+### Model weights
+
+`scripts/fetch_models.py` fetches the generic `yolov8n.pt` baseline so the stack runs
+immediately. **It is not plate-specific.** For production accuracy, fine-tune on a
+plate dataset (single class `plate`, YOLO format) and drop the result at
+`models/plate_yolov8n.pt`. Without weights the system falls back to the legacy contour
+detector and logs a loud warning — it works, but it is materially less accurate.
+
 ```bash
-pip install -r requirements.txt
+python scripts/train_plate_detector.py --data dataset/data.yaml   # installs models/plate_yolov8n.pt
 ```
 
-3. Uygulamayı Başlatın
-Uygulamayı çalıştırmak için:
+`scripts/train_plate_detector.py` fine-tunes YOLOv8n (imgsz 640, 100 epochs, batch 16,
+early-stop patience 20, horizontal flip disabled) and installs the result where the
+pipeline expects it. It can pull the dataset straight from Roboflow via `ROBOFLOW_*`
+env vars. Colab instructions: **[README_TRAINING.md](README_TRAINING.md)**. Once a
+custom model exists, `fetch_models.py` stops downloading the baseline and says so.
+
+---
+
+## Migrating an existing `plates.db`
+
+The old schema stored one table per day (`logs_YYYY_MM_DD`) and unsalted SHA-256
+passwords. The migrator folds those into the new indexed `logs` table:
+
 ```bash
-python main.py
+python -m lpr.db.migrate path/to/plates.db
 ```
 
+It is idempotent and transactional. Legacy password hashes are imported with a
+`sha256$` marker and transparently upgraded to argon2 on each user's next login.
 
-# 🖥 Arayüz ve Kullanım
+---
 
-![anasayfa](https://github.com/user-attachments/assets/b12aead9-b969-42e6-9a2d-8fc8f7295d3b)
+## What changed from the legacy app
 
-### İlk Kurulum ve Kullanıcı Yönetimi
+| Legacy | Now |
+|---|---|
+| One 836-line `main.py` | `src/lpr` package, protocol-separated modules |
+| One global SQLite connection, `check_same_thread=False` | thread-local connections, WAL, busy-timeout |
+| One table per day, f-string SQL | single `logs` table, indexed on `ts`, parameterised |
+| `time.sleep(1)` in the capture loop on every gate open | relay pulse on its own thread; `trigger()` returns immediately |
+| Both cameras read serially in one loop | one capture thread per camera, bounded drop-oldest queues |
+| Worker threads mutating Tkinter widgets | queue + single `root.after` drain on the main thread |
+| Unsalted SHA-256 passwords | argon2, with legacy verify-then-rehash |
+| `ctypes.windll` at import (crashed on Linux) | guarded in `platform_compat` |
+| 123 MB vendored `Tesseract-OCR/` in git | untracked; OCR via EasyOCR/PaddleOCR |
+| OCR on every frame of both cameras | `frame_stride` gating + detector plausibility filters |
+| YOLO on an empty driveway all day | motion gating in the capture thread: a ~0.09 ms frame-difference check drops ~99% of idle frames before inference |
 
-- Uygulama ilk açıldığında plates adında bir veritabanı dosyası oluşturur ve bir kullanıcı hesabı oluşturmanızı ister.
+---
 
-- Kayıtlı kullanıcı bilgileri saklanır; sonraki girişlerde kullanıcı adı ve şifrenizle oturum açabilirsiniz.
+## Development
 
-![kayıt1](https://github.com/user-attachments/assets/4851a095-aabe-4c99-a20d-c36bc8a3ae39)
-![giriş2](https://github.com/user-attachments/assets/26ebc3cc-9e78-4220-8b09-6246de429378)
+```bash
+pip install -r requirements-dev.txt
+make test      # pytest
+make lint      # ruff + mypy
+make fmt
+```
 
+Tests run without torch, OpenCV or a camera: the ML-dependent modules are
+`importorskip`-guarded and the pipeline tests use protocol fakes.
 
-## Arayüz Özellikleri
+---
 
-### Plaka Kayıt
+## License
 
-- "Kayıtlı Plakalar" sekmesinden plakaları ekleyebilir veya silebilirsiniz.
-
-![plakakayıt1](https://github.com/user-attachments/assets/84ffeb08-3f87-4705-af6f-c45a7b567737)
-
-
-
-
-### Geçmiş Loglar
-
-- Tanıma işlemleri 10 gün boyunca veritabanında saklanır ve arayüzden görüntülenebilir.11. günde,
-en eski loglar otomatik olarak silinir ve yeni kayıtlar eklenir.
-
-![geçmişloglar](https://github.com/user-attachments/assets/5e04a53b-cf0f-4fbf-9f32-e6aa3445a974)
-
-
-
-
-### Kamera Ayarları
-
-- Giriş ve çıkış kameralarının IP adresleri arayüzden yapılandırılabilir.
-
-![kamerakaynakları](https://github.com/user-attachments/assets/5104c0a5-8c8c-4660-a8af-fbcdfc4bbecd)
-
-
-
-### Çalışma Süresi
-
-- Arayüzün sağ üst köşesinde uygulamanın çalışma süresi gösterilir. Uygulama yeniden başlatıldığında sıfırlanır.
-
-![çalışmasüresi](https://github.com/user-attachments/assets/0224591a-d81b-45bb-b1bc-365be612b6c3)
-
-
-
-
-## ⚙ ️ Kod Özelleştirme
-### Röle Bağlantısı
-
-- Kullandığınız rölenin sinyal türüne göre kodda gerekli düzenlemeleri yapın. Röle sinyalleri cihaza bağlı olarak farklılık gösterebilir.
-
-![role1](https://github.com/user-attachments/assets/07add916-1d91-429d-a770-f2e4c4d9eb78)
-
-
-
-## 💡 Kullanım İpuçları
-
-- Kamera Yapılandırması: IP adreslerinin doğru olduğundan emin olun.
-- Röle Entegrasyonu: Röle cihazının teknik özelliklerine uygun ayarlamalar yapın.
-- Performans: Daha iyi sonuçlar için yüksek çözünürlüklü kameralar kullanın.
-- Hata Ayıklama: OpenCV ve Pytesseract dökümanlarını inceleyerek sorun giderme yapabilirsiniz.
-
-
-### 📜 Lisans
-Bu proje MIT Lisansı altında dağıtılmaktadır. Detaylar için LICENSE dosyasını inceleyin.
-
-### 🤝 Katkıda Bulunma
-Katkıda bulunmak isterseniz:
-
-Depoyu fork edin.
-Yeni bir özellik dalı oluşturun (git checkout -b feature/yeni-ozellik).
-Değişikliklerinizi yapın ve commit edin (git commit -m 'Yeni özellik eklendi').
-Dalınızı push edin (git push origin feature/yeni-ozellik).
-Bir Pull Request açın.
-
-
-### 📞 İletişim
-### Sorularınız veya önerileriniz için:
-
-### GitHub: hasanefeavc
-### E-posta: [hasanefeavc@gmail.com]
+MIT — see [LICENSE](LICENSE).

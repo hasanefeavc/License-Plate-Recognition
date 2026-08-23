@@ -1,0 +1,17 @@
+# Development / CI tooling on top of requirements.txt.
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
+
+pytest>=8.2,<9
+pytest-asyncio>=0.23,<1
+pytest-cov>=5.0,<6
+ruff>=0.4,<1
+mypy>=1.10,<2
+types-pyyaml>=6.0,<7
+types-requests>=2.32,<3
+
+# --- ONNX export toolchain -------------------------------------------------
+# Only needed to *produce* models/plate_yolov8n.onnx with
+# scripts/export_onnx.py, which is an operator/CI task. The runtime container
+# needs onnxruntime alone (requirements.txt) to consume the result.
+onnx>=1.16,<2
+onnxslim>=0.1,<1

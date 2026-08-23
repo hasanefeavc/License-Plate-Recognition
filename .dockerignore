@@ -1,0 +1,44 @@
+# Keep the Docker build context small and avoid baking host state into the image.
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+*.iml
+
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Python virtual envs
+venv/
+env/
+ENV/
+.venv/
+
+# Large / host-only assets that are mounted as volumes, not shipped in the image
+data/
+models/
+Tesseract-OCR/
+
+# Docs, GUI-only assets, misc
+README.md
+LICENSE
+*.ico
+docs/
+
+# Local config / secrets
+.env
+*.db
+*.db-wal
+*.db-shm
+
+# NOTE: docker/ itself is intentionally NOT ignored here -- entrypoint.sh
+# must remain in the build context (Docker cannot re-include a file whose
+# parent directory is excluded), and the Dockerfile/compose file are tiny.
