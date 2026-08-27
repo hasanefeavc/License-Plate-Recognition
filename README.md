@@ -216,6 +216,8 @@ snapshots:
 | `GET /api/license` · `POST /api/license` | user · admin | licence state; install a new key |
 | `GET /api/stream/{camera}` | bearer | MJPEG preview (capped ~10 fps) |
 | `GET /api/users` · `POST /api/users` · `DELETE /api/users/{username}` | admin | account management |
+| `POST`/`DELETE /api/users/{username}/license` | admin | issue / revoke an operator licence |
+| `GET /api/license/me` · `POST /api/license/activate` | user | own licence state; enter a key |
 | `GET /api/system/version` | user | deployed version (`git describe`), commit and branch |
 | `GET/POST /api/system/update` | admin | OTA update status; trigger an update (202) |
 | `GET /api/system/events` | admin | operational audit trail (nightly OTA activity) |
@@ -629,6 +631,84 @@ Two things worth being deliberate about before enabling it:
 Repeat alerts are already bounded by `voting.cooldown_s`: a car idling at the
 gate re-confirms constantly but decides once, so one refused vehicle is one
 email, not one per frame.
+
+---
+
+## Roles and per-operator licences
+
+### What each role may do
+
+| | Operator | Admin |
+|---|---|---|
+| Plates: add, edit, block, delete, import, export | ✅ | ✅ |
+| Gate, pause/resume, camera source | ✅ | ✅ |
+| Parking capacity, stream quality | ✅ | ✅ |
+| OTA: status **and trigger** | ✅ | ✅ |
+| **Kullanıcılar** (accounts, licences) | ❌ | ✅ |
+
+Only account management is admin-only. Everything that *operates* the site is
+an operator's job — they are the ones standing at the barrier.
+
+> **Operators can trigger OTA updates on this deployment.** That runs
+> `git pull` and a `docker compose` rebuild, so it is code execution on the
+> host for anyone holding an operator session. If that is not what you want,
+> `/api/system/update` is one dependency change (`LicensedUser` → `AdminUser`)
+> away from being admin-only again.
+
+### Per-operator licences
+
+Distinct from the deployment licence: that one is RS256 from the vendor and
+decides whether this *installation* may run. These are HS256 keys the server
+issues to its own operators and decide *who* may drive it. They cannot be
+confused — different algorithm, different key material, and a `typ` claim
+checked on the way in.
+
+**Administrators are exempt by construction.** The account that issues keys
+cannot sensibly be locked out by one: an admin holding an expired key could not
+issue a replacement, and the installation would need its database edited by
+hand to recover. Admins carry a permanent **Sınırsız Yönetici Lisansı** badge.
+
+**Disabled until configured.** With `LPR_LICENSE_SECRET` unset there is nothing
+to sign with and every operator passes. That is deliberate rather than
+fail-closed — an upgrade that silently locked every operator out of a working
+barrier, at a site never told to set a new secret, is the worse failure.
+
+| State | Meaning |
+|---|---|
+| `unlimited` | An administrator, or enforcement switched off |
+| `active` | Key verifies and has not expired |
+| `expired` | Key verifies but its date has passed |
+| `revoked` | Withdrawn by an admin — beats a key that still verifies |
+| `missing` | No key, or one that does not verify |
+
+Revocation keeps the key on the row and changes the *status*. A signed key
+cannot be un-signed, so the status flag is the only thing that can actually
+withdraw it — and keeping the key lets an admin see what was revoked.
+
+Keys are bound to the account they were issued to. Without that, any operator
+could activate a colleague's key and inherit its validity.
+
+### Enforcement
+
+`require_license` gates every operational endpoint and answers **402 Payment
+Required**, not 403. The distinction is load-bearing for the dashboard: 403
+means "not your role, nothing you can do", 402 means "your access lapsed, here
+is where you enter a key" — and the client opens the licence dialog on exactly
+that code, once per lapse.
+
+Two endpoints are deliberately never gated: `GET /api/license/me` (an operator
+whose licence lapsed is precisely who needs to read it) and
+`POST /api/license/activate` (it is the way *out* of being unlicensed).
+
+A failure to *read* the licence lets the request through, like the revocation
+check it sits beside: this is a layer on top of an already-valid session, and a
+database hiccup must not close a working barrier.
+
+### Issuing a key
+
+**Kullanıcılar → Lisans Üret**, with 30 / 90 / 365 days or a custom span. The
+key is shown once so the admin can pass it on, and stored on the account. The
+operator pastes it into **Lisans Anahtarı Girin**.
 
 ---
 
@@ -1103,17 +1183,17 @@ make fmt
 
 ### Test suite
 
-**785 passing tests** across 22 modules (787 collected: 785 pass, 1 skipped, 1 known
+**835 passing tests** across 23 modules (837 collected: 835 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 109 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_api.py` | 129 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
+| `test_web_ui.py` | 71 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
-| `test_web_ui.py` | 62 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
 | `test_pipeline.py` | 47 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
 | `test_db.py` | 42 | Repositories, migrations, retention, system-event trail, partial plate updates |
@@ -1123,6 +1203,7 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 | `test_notify.py` | 27 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
+| `test_user_license.py` | 21 | Key issue/verify, binding, expiry, revocation precedence |
 | `test_secrets.py` | 20 | No credentials in tracked templates; `.env*` ignore rules |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
@@ -1135,7 +1216,7 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 787 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 837 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

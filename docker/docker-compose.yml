@@ -11,6 +11,7 @@ services:
       - "8000:8000"
     devices:
       - "/dev/video0:/dev/video0"
+      - "/dev/video1:/dev/video1"
       # Röle cihazını USB'ye taktığında aşağıdaki satırın başındaki '#' işaretini kaldır:
       # - "/dev/ttyUSB0:/dev/ttyUSB0"
     volumes:
@@ -24,7 +25,7 @@ services:
     environment:
       LPR_SYSTEM_UPDATE__REPO_DIR: /repo
     env_file:
-      - path: .env
+      - path: ../.env
         required: false
 
     # --- Serial relay passthrough (Linux hosts only) --------------------

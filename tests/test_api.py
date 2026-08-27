@@ -457,12 +457,23 @@ def test_invalid_token_is_401(api_client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_plate_write_requires_admin(api_client: TestClient, operator_token: str) -> None:
-    response = api_client.post(
+def test_an_operator_may_manage_plates(
+    api_client: TestClient, operator_token: str, plate_repo: FakePlateRepository
+) -> None:
+    """Plate CRUD is an operator's job -- they are the ones at the barrier."""
+    created = api_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=auth(operator_token)
     )
+    assert created.status_code == 201
+    assert plate_repo.is_registered("34ABC123")
 
-    assert response.status_code == 403
+    removed = api_client.delete("/api/plates/34ABC123", headers=auth(operator_token))
+    assert removed.status_code == 200
+
+
+def test_plate_writes_still_require_authentication(api_client: TestClient) -> None:
+    assert api_client.post("/api/plates", json={"plate": "34ABC123"}).status_code == 401
+    assert api_client.delete("/api/plates/34ABC123").status_code == 401
 
 
 def test_plate_crud_round_trip(
@@ -640,8 +651,17 @@ def test_pause_and_resume(api_client: TestClient, admin_token: str, api_app: Any
     assert api_app.state.paused is False
 
 
-def test_pause_requires_admin(api_client: TestClient, operator_token: str) -> None:
-    assert api_client.post("/api/pipeline/pause", headers=auth(operator_token)).status_code == 403
+def test_an_operator_may_pause_the_pipeline(
+    api_client: TestClient, operator_token: str
+) -> None:
+    """Pausing is shift-floor work, not administration."""
+    assert (
+        api_client.post("/api/pipeline/pause", headers=auth(operator_token)).status_code == 200
+    )
+
+
+def test_pausing_still_requires_authentication(api_client: TestClient) -> None:
+    assert api_client.post("/api/pipeline/pause").status_code == 401
 
 
 def test_relay_trigger_writes_manual_event(
@@ -1011,20 +1031,33 @@ def test_update_requires_authentication(update_client: TestClient) -> None:
     assert update_client.post("/api/system/update").status_code == 401
 
 
-def test_update_is_forbidden_to_an_operator(
+def test_an_operator_may_trigger_an_update(
     update_client: TestClient, operator_token: str, updater: FakeUpdater
 ) -> None:
-    """The whole feature is remote code execution; operators must not reach it."""
+    """Deliberate policy: operators run OTA updates on this deployment.
+
+    Worth knowing what that grants -- the updater runs `git pull` and a
+    `docker compose` rebuild, so this is code execution on the host for anyone
+    holding an operator session.
+    """
     response = update_client.post("/api/system/update", headers=auth(operator_token))
-    assert response.status_code == 403
-    assert updater.starts == 0, "a rejected caller must never reach the updater"
+    assert response.status_code == 202
+    assert updater.starts == 1
 
 
-def test_update_status_is_forbidden_to_an_operator(
+def test_updating_still_requires_authentication(
+    update_client: TestClient, updater: FakeUpdater
+) -> None:
+    assert update_client.post("/api/system/update").status_code == 401
+    assert updater.starts == 0
+
+
+def test_an_operator_may_read_the_update_status(
     update_client: TestClient, operator_token: str
 ) -> None:
-    response = update_client.get("/api/system/update", headers=auth(operator_token))
-    assert response.status_code == 403
+    assert (
+        update_client.get("/api/system/update", headers=auth(operator_token)).status_code == 200
+    )
 
 
 def test_an_admin_can_start_an_update(
@@ -1123,14 +1156,13 @@ def events_client(api_app: Any, events_repo: FakeSystemEventRepo) -> TestClient:
     return TestClient(api_app)
 
 
-def test_system_events_require_admin(
+def test_system_events_require_authentication(
     events_client: TestClient, operator_token: str
 ) -> None:
-    """The audit trail says when the machine last rebuilt itself."""
+    """Readable by an operator, who is the one who finds the gate rebuilt."""
     assert events_client.get("/api/system/events").status_code == 401
     assert (
-        events_client.get("/api/system/events", headers=auth(operator_token)).status_code
-        == 403
+        events_client.get("/api/system/events", headers=auth(operator_token)).status_code == 200
     )
 
 
@@ -1241,9 +1273,17 @@ def upload(client: TestClient, token: str, body: bytes, query: str = "") -> Any:
     )
 
 
-def test_plate_import_requires_admin(csv_client: TestClient, operator_token: str) -> None:
-    response = upload(csv_client, operator_token, b"plate\n34ABC123\n")
-    assert response.status_code == 403
+def test_an_operator_may_import_plates(
+    csv_client: TestClient, operator_token: str
+) -> None:
+    assert upload(csv_client, operator_token, b"plate\n34ABC123\n").status_code == 200
+
+
+def test_importing_still_requires_authentication(csv_client: TestClient) -> None:
+    response = csv_client.post(
+        "/api/plates/import", files={"file": ("r.csv", b"plate\n34ABC123\n", "text/csv")}
+    )
+    assert response.status_code == 401
 
 
 def test_plate_import_reports_counts_per_row(
@@ -1287,9 +1327,10 @@ def test_plate_import_rejects_a_file_without_a_plate_column(
     assert report["errors"]
 
 
-def test_plate_export_requires_admin(csv_client: TestClient, operator_token: str) -> None:
-    """The resident list is names and apartment numbers, not just plates."""
-    assert csv_client.get("/api/plates/export", headers=auth(operator_token)).status_code == 403
+def test_an_operator_may_export_plates(
+    csv_client: TestClient, operator_token: str
+) -> None:
+    assert csv_client.get("/api/plates/export", headers=auth(operator_token)).status_code == 200
 
 
 def test_plate_export_returns_a_downloadable_csv(
@@ -1475,11 +1516,16 @@ def test_unblocking_restores_the_active_status(
     assert body["status"] == "active"
 
 
-def test_patching_requires_admin(detail_client: TestClient, operator_token: str) -> None:
+def test_an_operator_may_block_a_plate(
+    detail_client: TestClient, admin_token: str, operator_token: str
+) -> None:
+    """Blocking a plate is exactly what an operator at the gate needs to do."""
+    detail_client.post("/api/plates", headers=auth(admin_token), json={"plate": "34ABC123"})
     response = detail_client.patch(
         "/api/plates/34ABC123", headers=auth(operator_token), json={"blocked": True}
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert response.json()["status"] == "blocked"
 
 
 def test_patching_an_unknown_plate_is_a_404(
@@ -1566,6 +1612,17 @@ class ManagedUserRepository:
         name = (username or "").strip()
         self.passwords.pop(name, None)
         return self.rows.pop(name, None) is not None
+
+    def set_license(
+        self, username: str, key: str | None, expires_at: str | None, status: str
+    ) -> bool:
+        row = self.rows.get((username or "").strip())
+        if row is None:
+            return False
+        row["license_key"] = key
+        row["license_expires_at"] = expires_at
+        row["license_status"] = status
+        return True
 
 
 @pytest.fixture()
@@ -1784,3 +1841,211 @@ def test_health_stops_advertising_setup_once_an_account_exists(
     users_client: TestClient
 ) -> None:
     assert users_client.get("/health").json()["setup_required"] is False
+
+
+# ---------------------------------------------------------------------------
+# Per-operator licence enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def licensing(tmp_settings: Any, users_repo: ManagedUserRepository) -> Any:
+    """Licence enforcement switched on, with an admin and an operator."""
+    tmp_settings.license_secret = "s" * 40
+    return tmp_settings
+
+
+@pytest.fixture()
+def license_client(
+    api_app: Any, users_repo: ManagedUserRepository, licensing: Any
+) -> TestClient:
+    api_app.dependency_overrides[deps.get_user_repository] = lambda: users_repo
+    api_app.state.user_repository = users_repo
+    return TestClient(api_app)
+
+
+def operator_auth() -> dict[str, str]:
+    return auth(create_token("bekci", "operator"))
+
+
+def test_an_unlicensed_operator_is_blocked_with_402(
+    license_client: TestClient
+) -> None:
+    """402, not 403. The dashboard opens the key dialog on exactly this code.
+
+    403 would say "not your role", which is wrong and offers nothing to do.
+    """
+    response = license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+    )
+    assert response.status_code == 402
+
+
+def test_an_admin_is_never_blocked(license_client: TestClient) -> None:
+    """Exempt by construction: the account that issues keys cannot need one."""
+    response = license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=admin_auth()
+    )
+    assert response.status_code == 201
+
+
+def test_a_licensed_operator_passes(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    from lpr.user_license import STATUS_ACTIVE, issue_key
+
+    key, expires_at = issue_key("bekci", 30, licensing)
+    users_repo.set_license("bekci", key, expires_at, STATUS_ACTIVE)
+
+    response = license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+    )
+    assert response.status_code == 201
+
+
+def test_a_revoked_licence_blocks_immediately(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """Revocation is a database fact; the signed key cannot be un-signed."""
+    from lpr.user_license import STATUS_ACTIVE, STATUS_REVOKED, issue_key
+
+    key, expires_at = issue_key("bekci", 30, licensing)
+    users_repo.set_license("bekci", key, expires_at, STATUS_ACTIVE)
+    assert license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+    ).status_code == 201
+
+    users_repo.set_license("bekci", key, expires_at, STATUS_REVOKED)
+    assert license_client.post(
+        "/api/plates", json={"plate": "06MNP99"}, headers=operator_auth()
+    ).status_code == 402
+
+
+def test_reading_your_own_licence_is_never_gated(license_client: TestClient) -> None:
+    """An operator whose licence lapsed is exactly who needs to read this."""
+    response = license_client.get("/api/license/me", headers=operator_auth())
+    assert response.status_code == 200
+    assert response.json()["status"] == "missing"
+
+
+def test_an_admin_reads_an_unlimited_licence(license_client: TestClient) -> None:
+    body = license_client.get("/api/license/me", headers=admin_auth()).json()
+    assert body["status"] == "unlimited"
+    assert body["valid"] is True
+    assert body["unlimited"] is True
+
+
+def test_activating_a_key_is_never_gated(
+    license_client: TestClient, licensing: Any
+) -> None:
+    """It is the way *out* of being unlicensed, so it cannot require a licence."""
+    from lpr.user_license import issue_key
+
+    key, _ = issue_key("bekci", 30, licensing)
+    response = license_client.post(
+        "/api/license/activate", json={"key": key}, headers=operator_auth()
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "active"
+
+
+def test_activating_someone_elses_key_is_refused(
+    license_client: TestClient, licensing: Any
+) -> None:
+    from lpr.user_license import issue_key
+
+    key, _ = issue_key("baskasi", 30, licensing)
+    response = license_client.post(
+        "/api/license/activate", json={"key": key}, headers=operator_auth()
+    )
+    assert response.status_code == 400
+
+
+def test_activation_unblocks_the_operator(
+    license_client: TestClient, licensing: Any
+) -> None:
+    from lpr.user_license import issue_key
+
+    assert license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+    ).status_code == 402
+
+    key, _ = issue_key("bekci", 30, licensing)
+    license_client.post("/api/license/activate", json={"key": key}, headers=operator_auth())
+
+    assert license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+    ).status_code == 201
+
+
+# -- admin-side generation ---------------------------------------------------
+
+
+def test_generating_a_licence_requires_admin(license_client: TestClient) -> None:
+    response = license_client.post(
+        "/api/users/bekci/license", json={"days": 30}, headers=operator_auth()
+    )
+    assert response.status_code == 403
+
+
+def test_an_admin_generates_a_key_and_gets_it_back(
+    license_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """Returned once so the admin can hand it over; also stored on the row."""
+    response = license_client.post(
+        "/api/users/bekci/license", json={"days": 90}, headers=admin_auth()
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["key"], "the admin has to be able to pass the key on"
+    assert body["status"] == "active"
+    assert 89 < body["days_remaining"] <= 90
+    assert users_repo.rows["bekci"]["license_key"] == body["key"]
+
+
+def test_generating_a_licence_for_an_admin_is_refused(
+    license_client: TestClient
+) -> None:
+    """A key that would never be checked is misleading to hand somebody."""
+    response = license_client.post(
+        "/api/users/mudur/license", json={"days": 30}, headers=admin_auth()
+    )
+    assert response.status_code == 400
+
+
+def test_generating_for_an_unknown_user_is_a_404(license_client: TestClient) -> None:
+    response = license_client.post(
+        "/api/users/yok/license", json={"days": 30}, headers=admin_auth()
+    )
+    assert response.status_code == 404
+
+
+def test_revoking_requires_admin(license_client: TestClient) -> None:
+    assert (
+        license_client.delete("/api/users/bekci/license", headers=operator_auth()).status_code
+        == 403
+    )
+
+
+def test_revoking_keeps_the_key_but_changes_the_status(
+    license_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """Keeping it lets an admin see what was revoked."""
+    license_client.post("/api/users/bekci/license", json={"days": 30}, headers=admin_auth())
+    issued = users_repo.rows["bekci"]["license_key"]
+
+    response = license_client.delete("/api/users/bekci/license", headers=admin_auth())
+    assert response.status_code == 200
+    assert response.json()["status"] == "revoked"
+    assert users_repo.rows["bekci"]["license_key"] == issued
+
+
+def test_the_user_listing_reports_live_licence_state(
+    license_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    license_client.post("/api/users/bekci/license", json={"days": 30}, headers=admin_auth())
+    rows = {row["username"]: row for row in license_client.get("/api/users", headers=admin_auth()).json()}
+
+    assert rows["mudur"]["license_status"] == "unlimited"
+    assert rows["bekci"]["license_status"] == "active"
+    assert rows["bekci"]["license_expires_at"]

@@ -43,7 +43,10 @@ __all__ = [
     "SystemEventOut",
     "SystemUpdateOut",
     "TokenOut",
+    "LicenseKeyIn",
     "UserCreateIn",
+    "UserLicenseIn",
+    "UserLicenseOut",
     "UserOut",
     "VersionOut",
     "normalize_plate",
@@ -765,6 +768,12 @@ class UserOut(BaseModel):
     #: Session length for this account in minutes; ``None`` means it inherits
     #: the policy for its role.
     token_ttl_min: int | None = Field(default=None, examples=[480])
+    #: Licence state, so the admin table can show it without a call per row.
+    license_status: str | None = Field(default=None, examples=["active"])
+    license_expires_at: str | None = Field(default=None)
+    #: The key itself, so an admin can hand it to the operator it was issued
+    #: for. Only ever returned to an admin -- this endpoint is admin-only.
+    license_key: str | None = Field(default=None)
 
 
 class VersionOut(BaseModel):
@@ -943,6 +952,67 @@ class UserCreateIn(BaseModel):
         if isinstance(value, str):
             return value.strip()
         return value
+
+
+class UserLicenseIn(BaseModel):
+    """Body of ``POST /api/users/{username}/license`` -- generate a key."""
+
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"examples": [{"days": 90}]}
+    )
+
+    #: Validity in days. The dashboard offers 30 / 90 / 365 and a free field.
+    days: int = Field(default=365, ge=1, le=3650, examples=[90])
+
+
+class LicenseKeyIn(BaseModel):
+    """Body of ``POST /api/license/activate`` -- an operator entering their key."""
+
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"examples": [{"key": "eyJhbGciOiJIUzI1NiJ9..."}]}
+    )
+
+    key: str = Field(min_length=16, max_length=4096)
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def _strip(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            # Pasted keys pick up wrapping whitespace from every mail client.
+            return "".join(value.split())
+        return value
+
+
+class UserLicenseOut(BaseModel):
+    """One account's licence state, as the badge and the gate both read it."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "status": "active",
+                    "username": "bekci",
+                    "expires_at": "2026-11-25T00:00:00+00:00",
+                    "days_remaining": 89.4,
+                    "valid": True,
+                    "unlimited": False,
+                    "detail": "Lisans geçerli",
+                }
+            ]
+        }
+    )
+
+    status: Literal["active", "expired", "missing", "revoked", "unlimited"] = "missing"
+    username: str | None = None
+    expires_at: str | None = None
+    days_remaining: float | None = None
+    valid: bool = False
+    #: True for administrators, who hold no key by design.
+    unlimited: bool = False
+    detail: str = ""
+    #: Returned only when an admin has just generated the key, so it can be
+    #: handed to the operator. Never included in a listing.
+    key: str | None = None
 
 
 class ErrorOut(BaseModel):

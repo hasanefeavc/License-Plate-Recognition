@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from lpr.config import get_settings
@@ -52,6 +52,7 @@ __all__ = [
     "current_user",
     "decode_token",
     "require_admin",
+    "require_license",
     "resolve_live_user",
     "token_ttl_seconds",
     "user_from_token",
@@ -210,11 +211,11 @@ def resolve_live_user(user: AuthUser, user_repo: Any = None) -> AuthUser:
     still valid, and a transient database error should not lock every operator
     out of a running gate.
     """
+    if user_repo is None:
+        # No repository to consult (no request context). The signature is still
+        # valid, so the token stands -- see the fail-open note above.
+        return user
     try:
-        if user_repo is None:
-            from lpr.db import UserRepository
-
-            user_repo = UserRepository()
         row = user_repo.get(user.username)
     except Exception:
         logger.warning(
@@ -230,7 +231,27 @@ def resolve_live_user(user: AuthUser, user_repo: Any = None) -> AuthUser:
     return user if role == user.role else AuthUser(username=user.username, role=role)
 
 
+def _request_user_repo(request: Request | None) -> Any:
+    """The app's user repository, or ``None``.
+
+    Routed through :mod:`lpr.api.deps` rather than constructing a repository
+    here so the app's cached instance (and any test override) is the one used
+    -- building our own would quietly reach past both, at the cost of a test
+    suite that talks to the developer's real database.
+    """
+    if request is None:
+        return None
+    try:
+        from lpr.api import deps
+
+        return deps.get_user_repository(request)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Kullanıcı deposu çözümlenemedi", exc_info=True)
+        return None
+
+
 async def current_user(
+    request: Request = None,  # type: ignore[assignment]
     credentials: Annotated[
         HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)
     ] = None,
@@ -241,7 +262,8 @@ async def current_user(
     if (credentials.scheme or "").lower() != "bearer":
         raise _unauthorized("Kimlik doğrulama gerekli")
     try:
-        return resolve_live_user(user_from_token(credentials.credentials))
+        user = user_from_token(credentials.credentials)
+        return resolve_live_user(user, _request_user_repo(request))
     except AuthError as exc:
         raise _unauthorized(str(exc)) from exc
 
@@ -258,5 +280,54 @@ async def require_admin(
     return user
 
 
+async def require_license(
+    user: Annotated[AuthUser, Depends(current_user)],
+    request: Request = None,  # type: ignore[assignment]
+) -> AuthUser:
+    """Like :func:`current_user`, but an operator must hold a live licence.
+
+    Administrators pass unconditionally -- see
+    :func:`lpr.user_license.requires_license` for why the account that issues
+    keys cannot be gated by one.
+
+    Refuses with **402 Payment Required** rather than 403. The distinction is
+    load-bearing for the dashboard: 403 means "not your role, nothing you can
+    do", while 402 means "your access lapsed, here is where you enter a key",
+    and the client opens the licence dialog on exactly this code.
+
+    A failure to *read* the licence lets the request through, for the same
+    reason the revocation check does: this sits on top of an already-valid
+    session, and a database hiccup must not close a working barrier.
+    """
+    from lpr.user_license import license_for, requires_license
+
+    if not requires_license(user.role):
+        return user
+
+    repo = _request_user_repo(request)
+    if repo is None:
+        return user
+    try:
+        row = repo.get(user.username)
+    except Exception:
+        logger.warning(
+            "Lisans okunamadı, istek kabul ediliyor: %s", user.username, exc_info=True
+        )
+        return user
+
+    state = license_for(user.role, row)
+    if state.valid:
+        return user
+
+    logger.info("Lisans engeli: %s (%s)", user.username, state.status)
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=state.detail or "Lisans süresi doldu",
+    )
+
+
 CurrentUser = Annotated[AuthUser, Depends(current_user)]
 AdminUser = Annotated[AuthUser, Depends(require_admin)]
+#: Authenticated *and* licensed. This is the dependency for anything that
+#: operates the site, as opposed to reading it or managing accounts.
+LicensedUser = Annotated[AuthUser, Depends(require_license)]
