@@ -1,541 +1,272 @@
 # LPR configuration.
-
 #
-
-# Precedence (lowest to highest): this file  <  environment variables
-
-# (LPR_ prefix, "__" for nesting, e.g. LPR_RELAY__PORT=/dev/ttyUSB0)  <
-
+# Precedence (lowest to highest): this file < environment variables
+# (LPR_ prefix, "__" for nesting, e.g. LPR_RELAY__PORT=/dev/ttyUSB0) <
 # explicit constructor args passed to lpr.config.Settings(...).
-
 #
-
 # See src/lpr/config.py for the full schema, validation rules, and the
-
 # per-field docstrings.
 
-
-
 app:
-
   name: lpr
-
   headless: true
-
   log_level: INFO
-
   data_dir: data
-
   models_dir: models
 
-
-
 cameras:
-
   entry:
-
     source: "/dev/video0"
-
     width: 1280
-
     height: 720
-
     fps_limit: 15
-
     reconnect_delay_s: 5.0
-
     queue_size: 2
-
   exit:
-
     source: "0"
-
     width: 1280
-
     height: 720
-
     fps_limit: 15
-
     reconnect_delay_s: 5.0
-
     queue_size: 2
-
   # Motion gating (applies to both cameras): a frame with nothing moving in
-
   # it never reaches YOLO. threshold is the largest moving contour's area in
-
   # full-frame pixels -- raise it if swaying trees or rain trigger inference,
-
   # lower it if a slowly approaching car is missed. heartbeat_s forces a
-
   # frame through even on a still scene, so tracker state still ages out.
-
   motion:
-
     enabled: true
-
     threshold: 5000
-
     heartbeat_s: 3.0
 
-
-
 detection:
-
   model_path: models/plate_yolov8n.pt
-
   confidence: 0.35
-
   iou: 0.5
-
   device: auto
-
   imgsz: 640
-
   frame_stride: 3
-
   # ByteTrack: gives every plate a stable id across frames, so the pipeline
-
   # can recognise a car once instead of once per frame. Set track: false to
-
   # go back to stateless per-frame detection.
-
   track: true
-
   tracker: bytetrack.yaml
-
   # Use models/plate_yolov8n.onnx instead of the .pt when it exists. Create it
-
   # with `python scripts/export_onnx.py`, which benchmarks both backends and
-
   # tells you whether ONNX is actually faster on your box -- it often is not.
-
   # The export is fixed at the imgsz it was built with and is verified at
-
   # startup, so a mismatched or broken file falls back to the .pt rather than
-
   # failing at the gate.
-
   prefer_onnx: true
 
-
-
 # Software-level image enhancement. None of this needs the model retrained --
-
 # it changes what the detector and the recogniser are shown, not what they
-
 # learned.
-
 preprocess:
-
   # Whole-frame CLAHE + unsharp, applied on the processing thread just before
-
   # detection. OFF by default, and the only setting here that can make things
-
   # worse: it changes what the *detector* sees, and unlike the OCR variants
-
   # below there is no "keep the best of several tries" fallback behind it -- a
-
   # frame the detector fails to fire on never reaches OCR at all. Mild CLAHE
-
   # usually helps at night and can cost recall in good light, so switch it on
-
   # only after comparing detection counts on your own footage.
-
   frame_enhance: false
-
   frame_clahe_clip: 2.0
-
   frame_unsharp_amount: 0.5
-
   # Unsharp strength inside the OCR crop pre-pass. This one is safe to leave
-
   # on: the recogniser reads several variants of every crop and keeps the best,
-
   # so a variant sharpening made worse simply loses. 0 disables it.
-
   crop_unsharp_amount: 0.6
-
   # Dynamic gamma + percentile contrast stretch on each crop, ahead of CLAHE.
-
   # This is the night-glare / deep-shadow rescue: a crop whose mean luminance
-
   # falls outside a healthy band is pulled back to the nearest edge of it, then
-
   # stretched across the full range. Both stages are self-limiting, so a
-
   # normally-exposed plate passes through untouched -- which is why it is safe
-
   # to leave on. Runs before CLAHE on purpose: CLAHE equalises contrast per
-
   # tile and will happily amplify the noise inside a black tile to full scale
-
   # if the crop arrives globally underexposed.
-
   normalize_lighting: true
-
   # When no variant of a crop produces a grammatical plate, retry on a
-
   # perspective-corrected copy: the plate's four corners are found and warped
-
   # back to a head-on rectangle. This is what reads a plate photographed from
-
   # the side, which deskew (rotation only) cannot fix. Costs one extra OCR
-
   # pass, and only on crops that already failed.
-
   rectify_perspective: true
 
-
-
 ocr:
-
   backend: easyocr
-
   gpu: false
-
   min_confidence: 0.5
-
   allowlist: "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
-
   # Extra OCR engines pooled into the per-frame ensemble vote alongside
-
   # `backend`. Empty by default: the ensemble already votes across the several
-
   # enhanced views of every crop, which is where most view-dependent glyph
-
   # confusions (0/O, 8/B) are recovered, and that costs no extra model. A
-
   # second *engine* adds a genuinely independent opinion but brings its own
-
   # memory footprint and warmup, so it is opt-in. Engines are queried in order
-
   # and the vote stops as soon as it holds a grammatical read, so the second
-
   # engine is a cost paid on hard crops only. Example: [paddleocr]
-
   ensemble_backends: []
 
-
-
 voting:
-
   window: 5
-
   min_votes: 3
-
   ttl_s: 4.0
-
   # How long a confirmed plate is suppressed on the same camera.
-
   #
-
   # THIS IS THE SLIDING-GATE SETTING. A sliding-gate motor (yana kayar kapi)
-
   # is driven by step-by-step pulse logic: pulse 1 opens, pulse 2 STOPS it
-
   # mid-travel, pulse 3 closes. A full cycle takes 15-25 seconds.
-
   #
-
   # A car waiting at the camera is re-read on every pass. If this cooldown is
-
   # shorter than the gate's travel time, the same plate confirms a second time
-
   # while the gate is still opening, a second pulse goes out, and the gate
-
   # stops halfway with the driver sitting under it.
-
   #
-
   # Time your own motor from closed to fully open and set this at or just
-
   # above that. Too short re-triggers mid-travel; too long merely delays a
-
   # genuine second entry by the same car, which is much the cheaper mistake.
-
   # An arm barrier has no such constraint (idempotent pulse, ~2 s cycle) and
-
   # can safely run at 3-5 s.
-
   cooldown_s: 20.0
-
   # Per-track OCR budget (only used when detection.track is on): a plate that
-
   # has been read this many times without confirming is muted for cooldown_s.
-
   max_track_attempts: 12
-
   track_ttl_s: 30.0
 
-
-
 relay:
-
   enabled: true
-
   port: auto
-
   baud: 9600
-
   open_byte: "A"
-
   close_byte: "a"
-
   # Momentary dry-contact closure length, in milliseconds. One pulse = one
-
   # press of the motor controller's own button. 1000 ms clears the debounce
-
   # window of every step-by-step controller in common use while staying short
-
   # enough not to be read as a held button.
-
   #
-
   # Raising this does NOT keep a sliding gate open longer -- the open duration
-
   # lives on the motor controller. Re-triggering is governed by
-
   # voting.cooldown_s above.
-
   pulse_ms: 1000
-
   mock: false
 
-
-
 # E-posta bildirimleri: yetkisiz veya kara listedeki araç için anlık görüntü
-
 # ekli uyarı.
-
 #
-
 # KAPALI GELİR. Açmak, servisin kendiliğinden dış bir posta sunucusuna
-
 # bağlanması ve mesaja BİR ARAÇ FOTOĞRAFI koyması demektir. İki noktaya dikkat:
-
 #
-
 #   * password'ü buraya yazmak yerine LPR_SMTP__PASSWORD ortam değişkenini
-
 #     kullanın; dosyadaki değeri ezer ve sırrı depodan/yedeklerden uzak tutar.
-
 #   * Anlık görüntü çoğu ülkede kişisel veridir. Site yöneticisinin kontrol
-
 #     ettiği bir kutuya gönderin ve to_emails listesini kısa tutun.
-
 smtp:
-
-  enabled: false
-
-  host: ""
-
+  enabled: true
+  host: "smtp.gmail.com"
   # 587 = STARTTLS (use_tls), 465 = örtük TLS (otomatik algılanır), 25 = düz.
-
   port: 587
-
-  user: ""
-
-  password: ""
-
+  user: "hasanefeavc@gmail.com"
+  password: "123456789"
   # Boşsa user kullanılır; çoğu sağlayıcı zaten bunu şart koşar.
-
-  from_email: ""
-
-  to_emails: []
-
+  from_email: "hasanefeavc@gmail.com"
+  to_emails: [hasanefeavc@gmail.com]
   # Listede hiç olmayan plaka.
-
   notify_on_unauthorized: true
-
   # Listede olan ama engellenmiş (blocked) plaka.
-
   notify_on_blacklisted: true
-
   use_tls: true
-
   timeout_s: 15.0
-
   queue_size: 64
-
 
 database:
-
   path: data/plates.db
-
   log_retention_days: 10
 
-
-
 # Event snapshots: one JPEG per gate decision, kept on a rolling window.
-
 # The images are the evidence trail for a disputed entry; the log row is only
-
 # the claim that it happened.
-
 snapshots:
-
   enabled: true
-
   # Empty = <app.data_dir>/snapshots. Point this at another disk if the
-
   # images outgrow the volume holding the database.
-
   dir: ""
-
   # Matched to database.log_retention_days so a row and its image expire
-
   # together. 10 days at ~200 KB/event is a few hundred MB for a busy lane.
-
   retention_days: 10
-
   jpeg_quality: 85
-
   # Frames waiting to be encoded. Past this the writer drops rather than let
-
   # a slow disk push back on the recognition threads.
-
   queue_size: 64
 
-
-
 # Site capacity for the dashboard's "vehicles inside / capacity" counter.
-
 # This is only the default: an admin can change it from the browser
-
 # (PUT /api/parking), which stores the value in the database so every tablet
-
 # on the site reads one number. 0 = unlimited.
-
 parking:
-
   capacity: 100
 
-
-
 api:
-
   host: 0.0.0.0
-
   port: 8000
-
   cors_origins:
-
     - "*"
-
   token_ttl_min: 720
-
   # Overridden via LPR_API__SECRET_KEY in any real deployment; enforced by
-
   # a validator in src/lpr/config.py when LPR_ENV=production.
-
   secret_key: change-me
 
-
-
 # Remote over-the-air update: git pull + docker compose rebuild, triggered by
-
 # an admin from the dashboard.
-
 #
-
 # OFF BY DEFAULT, AND READ THIS BEFORE TURNING IT ON. Enabling this means an
-
 # admin token can make this machine run whatever the configured git remote
-
 # currently contains, and rebuilding the stack from inside a container needs
-
 # /var/run/docker.sock mounted -- which is root on the host. Two consequences
-
 # worth being explicit about:
-
 #
-
 #   * Whoever controls the git remote controls every site running this.
-
 #   * Anyone who gets code execution in the API container owns the host.
-
 #
-
 # That is an acceptable trade for a fleet you control and a bad one for a
-
 # product shipped to sites you do not. Nothing here is settable per-request:
-
 # the remote, branch and compose file are operator configuration, so a stolen
-
 # admin token cannot redirect the update at somebody else's repository.
-
 system_update:
-
   enabled: true
-
   # Working directory for the git and compose commands (the repo root).
-
   repo_dir: "."
-
   git_remote: origin
-
   git_branch: main
-
   compose_file: docker/docker-compose.yml
-
   # Fetching is quick; building an image with the ML stack in it is not.
-
   git_timeout_s: 120.0
-
   build_timeout_s: 900.0
-
   # Where the outcome is left for the container that comes up after the
-
   # rebuild. Empty = <data_dir>/last_update.json.
-
   state_file: ""
-
   # --- Nightly check ---------------------------------------------------
-
   # Ask the remote once a night whether anything new has landed. On its own
-
   # this is READ-ONLY -- `git fetch` does not touch the working tree -- so it
-
   # is safe to leave on: it just records "an update is waiting" in the system
-
   # events an admin can read from the dashboard.
-
   nightly_check: true
-
   # Install what the nightly check finds, with nobody watching.
-
   #
-
   # This is a bigger risk than the manual button and has its own switch for
-
   # that reason. An admin pressing the button is watching the result and is
-
   # updating one site; this updates the whole fleet at 03:00 simultaneously,
-
   # so a bad commit is a fleet-wide outage you find out about by phone.
-
   # Requires `enabled` as well -- both must be true.
-
   auto_update: false
-
   # Local wall-clock time of the check. "Low traffic" is a property of the
-
   # site's clock, not of UTC: 03:00 UTC is 06:00 in Turkey, a shift change.
-
   check_hour: 3
-
   check_minute: 0
-
   # Retention for the system_events audit rows. Longer than the plate log:
-
   # it is a handful of rows a day, and "what did this machine do to itself
-
   # last quarter" outlives "which cars came through last week".
-
   event_retention_days: 90
 
-
 security:
-
   password_hasher: argon2
