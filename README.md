@@ -215,6 +215,7 @@ snapshots:
 | `POST /api/relay/trigger` · `/api/pipeline/pause` · `/resume` | admin | manual control |
 | `GET /api/license` · `POST /api/license` | user · admin | licence state; install a new key |
 | `GET /api/stream/{camera}` | bearer | MJPEG preview (capped ~10 fps) |
+| `GET /api/users` · `POST /api/users` · `DELETE /api/users/{username}` | admin | account management |
 | `GET /api/system/version` | user | deployed version (`git describe`), commit and branch |
 | `GET/POST /api/system/update` | admin | OTA update status; trigger an update (202) |
 | `GET /api/system/events` | admin | operational audit trail (nightly OTA activity) |
@@ -631,6 +632,83 @@ email, not one per frame.
 
 ---
 
+## Users and sessions
+
+### Session length follows the role
+
+The two roles are used differently, so they get different session lengths. An
+administrator works from their own machine, where being logged out mid-task is
+friction with no security payoff. An operator signs in on a shared terminal at
+the gate, where a session that outlives the shift is the actual risk.
+
+| Setting | Default | For |
+|---|---|---|
+| `api.admin_token_ttl_min` | 525600 (365 days) | Administrators — "stays logged in" |
+| `api.operator_token_ttl_min` | 480 (8 hours) | Operators — one shift |
+| `api.token_ttl_min` | 720 | Fallback for any other role |
+
+An admin can also set a per-account length when creating a user
+(`token_ttl_min`), which beats the role policy. Leaving it unset inherits the
+role default, so the policy stays retunable centrally.
+
+### Why deletion takes effect immediately
+
+These are stateless JWTs, and a year is long enough for a signed claim to go
+badly stale. Two things must not wait for expiry:
+
+- **Deletion.** If removing an account did not end its sessions, "delete user"
+  would be theatre — a dismissed operator would keep their access for the rest
+  of the token's life.
+- **Demotion.** An account moved from admin to operator carries a token that
+  still says `admin`.
+
+So `resolve_live_user()` re-reads the account behind every token: one indexed
+primary-key lookup per authenticated request, and the database role is the
+authoritative one. A *lookup failure* is deliberately not treated as deletion —
+it is logged and the token honoured, because this is a revocation layer over a
+signature that is still valid, and a transient database error should not lock
+every operator out of a running gate.
+
+**What this does not protect against.** A year-long admin token on a stolen
+laptop is valid for that year unless the account is deleted. Shorten
+`admin_token_ttl_min` if administrators sign in from machines you do not
+control.
+
+### Managing accounts
+
+**Kullanıcılar** in the navbar — admin only, and hidden outright for operators
+rather than opening a modal whose every request returns 403. The table shows
+the username, a role chip (**Yönetici** purple / **Operatör** teal), the
+session length, the creation date and a delete button.
+
+`DELETE /api/users/{username}` refuses two things, checked in this order:
+
+1. **The last admin.** There is no recovery path — with no admin left, nobody
+   can create one, and the installation needs its database edited by hand.
+   `POST /api/auth/register` will not help: it only bootstraps when the user
+   table is *entirely* empty.
+2. **Your own account.** The request would succeed and then invalidate the
+   token that made it, which reads as the dashboard breaking.
+
+The order matters. When the sole administrator deletes their own account both
+rules apply, and only the first says what to do about it — create another admin
+first. Answering "ask another admin" on an installation with no other admin
+would be useless.
+
+### Bootstrap
+
+`POST /api/auth/register` is unauthenticated for exactly one account: the first
+one on a fresh installation, which is always made an admin. After that it
+requires an admin token, and `POST /api/users` is the ordinary path.
+
+The login screen reads `setup_required` from the unauthenticated `/health` and
+only shows **Yönetici Oluştur** while the user table is empty. Leaving that
+button up permanently would advertise an action that can only fail, and read
+like open sign-up on a gate controller. It defaults to hidden and is revealed
+on proof — a server that cannot answer gets the sign-in form alone.
+
+---
+
 ## Dashboard: sessions and plate management
 
 ### Signing in
@@ -1025,17 +1103,17 @@ make fmt
 
 ### Test suite
 
-**742 passing tests** across 21 modules (744 collected: 742 pass, 1 skipped, 1 known
+**785 passing tests** across 22 modules (787 collected: 785 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 88 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_api.py` | 109 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
-| `test_web_ui.py` | 54 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
+| `test_web_ui.py` | 62 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
 | `test_pipeline.py` | 47 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
 | `test_db.py` | 42 | Repositories, migrations, retention, system-event trail, partial plate updates |
@@ -1050,13 +1128,14 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_parking.py` | 18 | Occupancy accounting |
 | `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
+| `test_auth_sessions.py` | 14 | Role-scoped session lengths, token revocation on delete/demote |
 | `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
 | `test_preprocess_pipeline.py` | 11 | Preprocessing wiring: escalation staging, frame-hook injection |
 | `test_config.py` | 10 | Shipped defaults: sliding-gate cooldown and pulse width |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 744 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 787 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

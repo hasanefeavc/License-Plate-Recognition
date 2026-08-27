@@ -418,10 +418,31 @@ class SystemUpdateConfig(BaseModel):
 
 
 class ApiConfig(BaseModel):
+    """The HTTP service, and how long the sessions it issues last.
+
+    Session length is per role because the two roles are used differently. An
+    administrator manages the site from their own machine, where being logged
+    out mid-task is friction with no security payoff; an operator logs in on a
+    shared terminal at the gate, where a session outliving the shift is the
+    actual risk.
+
+    Note what a long admin session costs. These are stateless JWTs, so the only
+    thing that ends one early is the account being deleted --
+    :func:`lpr.api.security.current_user` re-checks that on every request
+    precisely because ``admin_token_ttl_min`` defaults to a year. A stolen
+    laptop with a live token is otherwise good for that year, so shorten this
+    if administrators sign in from machines you do not control.
+    """
+
     host: str = "0.0.0.0"
     port: int = 8000
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    #: Fallback session length, for a role with no policy of its own.
     token_ttl_min: int = 720
+    #: Administrators: 365 days, i.e. "stays logged in".
+    admin_token_ttl_min: int = Field(default=525_600, ge=1, le=1_051_200)
+    #: Operators: 8 hours, i.e. one shift.
+    operator_token_ttl_min: int = Field(default=480, ge=1, le=1_051_200)
     secret_key: str = "change-me"
 
 

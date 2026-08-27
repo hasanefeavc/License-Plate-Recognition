@@ -22,7 +22,8 @@ from typing import Final
 #: v3 added ``system_events`` (operational audit trail: OTA updates).
 #: v4 added the resident columns on ``plates`` (owner, apartment, expires_at,
 #: blocked), applied to existing databases by ``PLATES_ADDED_COLUMNS``.
-SCHEMA_VERSION: Final[int] = 4
+#: v5 added ``users.token_ttl_min`` (per-account session length).
+SCHEMA_VERSION: Final[int] = 5
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -66,9 +67,20 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     role          TEXT NOT NULL DEFAULT 'operator',
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    token_ttl_min INTEGER
 )
 """
+
+#: Columns added to ``users`` after v4. Same additive migration as
+#: ``PLATES_ADDED_COLUMNS``; see :func:`lpr.db.connection.init_db`.
+#:
+#: NULL means "use the default for this account's role", which is what every
+#: pre-v5 row gets -- so an existing installation keeps working and simply
+#: inherits the role policy rather than needing a backfill.
+USERS_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
+    ("token_ttl_min", "ALTER TABLE users ADD COLUMN token_ttl_min INTEGER"),
+)
 
 CREATE_LOGS: Final[str] = """
 CREATE TABLE IF NOT EXISTS logs (
@@ -207,6 +219,15 @@ SELECT_PLATE_DETAIL: Final[str] = (
 )
 
 SELECT_PLATES_DETAIL: Final[str] = (
-    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked "
-    "FROM plates ORDER BY plate"
+    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked FROM plates ORDER BY plate"
 )
+
+SELECT_USERS: Final[str] = (
+    "SELECT username, role, created_at, token_ttl_min FROM users ORDER BY username"
+)
+
+SELECT_USER: Final[str] = (
+    "SELECT username, role, created_at, token_ttl_min FROM users WHERE username = ?"
+)
+
+COUNT_USERS_BY_ROLE: Final[str] = "SELECT COUNT(*) AS n FROM users WHERE role = ?"

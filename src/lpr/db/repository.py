@@ -533,17 +533,31 @@ class UserRepository:
         row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
         return int(row["n"])
 
-    def register(self, username: str, password: str, role: str = DEFAULT_ROLE) -> bool:
-        """Create an account. Returns False if the username is taken or invalid."""
+    def register(
+        self,
+        username: str,
+        password: str,
+        role: str = DEFAULT_ROLE,
+        token_ttl_min: int | None = None,
+    ) -> bool:
+        """Create an account. Returns False if the username is taken or invalid.
+
+        ``token_ttl_min`` is how long this account's sessions last. ``None``
+        means "use the default for the role", which is what every account
+        created before the column existed carries -- so the policy can be
+        retuned centrally without touching a single row.
+        """
         name = (username or "").strip()
         if not name or not password:
             return False
         digest = _password_hasher().hash(password)
+        ttl = int(token_ttl_min) if token_ttl_min else None
         with transaction() as conn:
             cur = conn.execute(
-                "INSERT OR IGNORE INTO users (username, password_hash, role, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (name, digest, role or DEFAULT_ROLE, utc_now_iso()),
+                "INSERT OR IGNORE INTO users "
+                "(username, password_hash, role, created_at, token_ttl_min) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, digest, role or DEFAULT_ROLE, utc_now_iso(), ttl),
             )
             created = cur.rowcount > 0
         if created:
@@ -637,10 +651,32 @@ class UserRepository:
     def list_users(self) -> list[dict[str, Any]]:
         """All accounts, without password material of any kind."""
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT username, role, created_at FROM users ORDER BY username"
-        ).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in conn.execute(schema.SELECT_USERS).fetchall()]
+
+    def get(self, username: str) -> dict[str, Any] | None:
+        """One account, or ``None``. Never returns password material.
+
+        Used on the authentication path to confirm the account behind a token
+        still exists, so this is deliberately a single indexed primary-key
+        lookup and selects no hash.
+        """
+        name = (username or "").strip()
+        if not name:
+            return None
+        conn = get_connection()
+        row = conn.execute(schema.SELECT_USER, (name,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def count_by_role(self, role: str) -> int:
+        """How many accounts hold ``role``.
+
+        Exists so deleting a user can refuse to remove the last admin, which
+        would otherwise lock everyone out of user management permanently --
+        there is no recovery path short of editing the database by hand.
+        """
+        conn = get_connection()
+        row = conn.execute(schema.COUNT_USERS_BY_ROLE, (role,)).fetchone()
+        return int(row["n"]) if row is not None else 0
 
     def needs_rehash(self, username: str) -> bool:
         """True while the stored hash is still the legacy SHA-256 form."""

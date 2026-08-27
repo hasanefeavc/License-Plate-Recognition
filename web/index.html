@@ -99,13 +99,19 @@
                 class="min-h-[48px] flex-1 rounded-lg bg-ok py-3 font-bold text-ground transition hover:brightness-110 disabled:opacity-50">
           Giriş Yap
         </button>
-        <!-- On a fresh installation there is nobody to log in as: the first
-             account may be created without auth, and becomes the admin. -->
-        <button id="login-register" type="button"
-                class="min-h-[48px] flex-1 rounded-lg border-2 border-line py-3 font-bold text-muted transition hover:border-accent hover:text-accent disabled:opacity-50">
-          Kaydol
+        <!-- Bootstrap only. On a fresh installation there is nobody to log in
+             as, so the first account may be created without auth and becomes
+             the admin. Once that account exists the endpoint requires an admin
+             token, so the button is hidden rather than left to fail — see
+             applySetupState(), which reads `setup_required` from /health. -->
+        <button id="login-register" type="button" hidden
+                class="min-h-[48px] flex-1 rounded-lg border-2 border-accent py-3 font-bold text-accent transition hover:bg-accent hover:text-ground disabled:opacity-50">
+          Yönetici Oluştur
         </button>
       </div>
+      <p id="login-hint" hidden class="text-center text-xs text-muted">
+        İlk kurulum: oluşturduğunuz hesap yönetici olur.
+      </p>
     </form>
   </div>
 </div>
@@ -267,6 +273,11 @@
     <button id="btn-history" type="button"
             class="min-h-[44px] flex-1 rounded-lg bg-line px-4 font-bold text-ink transition hover:brightness-125 sm:flex-none sm:px-5 sm:py-3">
       Geçmiş Kayıtlar
+    </button>
+    <!-- Admin-only; revealed by updateControls(). -->
+    <button id="btn-users" type="button" hidden
+            class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none sm:px-5 sm:py-3">
+      Kullanıcılar
     </button>
     <button id="btn-settings" type="button"
             class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none sm:px-5 sm:py-3">
@@ -500,6 +511,96 @@
 </div>
 
 <!-- Settings ------------------------------------------------------------ -->
+<!-- User management -------------------------------------------------------- -->
+<div id="modal-users" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
+  <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+
+  <div role="dialog" aria-modal="true" aria-labelledby="users-title"
+       class="relative flex h-full max-h-full w-full flex-col overflow-hidden border-line bg-card shadow-2xl sm:h-auto sm:max-h-[85vh] sm:max-w-2xl sm:rounded-xl sm:border">
+
+    <header class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-4 py-4 sm:px-6">
+      <div>
+        <h2 id="users-title" class="text-lg font-bold">Kullanıcı Yönetimi</h2>
+        <p class="mt-0.5 text-xs text-muted">
+          Yöneticiler sürekli oturumda kalır; operatör oturumu vardiya sonunda düşer.
+        </p>
+      </div>
+      <button type="button" data-close aria-label="Kapat"
+              class="-mr-2 -mt-1 min-h-[44px] min-w-[44px] rounded-lg text-2xl leading-none text-muted transition hover:bg-row hover:text-ink">
+        &times;
+      </button>
+    </header>
+
+    <form id="user-form" class="shrink-0 border-b border-line px-4 py-4 sm:px-6">
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div class="col-span-2 sm:col-span-1">
+          <label for="user-name" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">KULLANICI ADI *</label>
+          <input id="user-name" name="username" type="text" required minlength="3" maxlength="40"
+                 data-autofocus autocomplete="off" spellcheck="false" placeholder="bekci"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+        </div>
+        <div class="col-span-2 sm:col-span-1">
+          <label for="user-password" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">PAROLA *</label>
+          <input id="user-password" name="password" type="password" required minlength="8" maxlength="128"
+                 autocomplete="new-password" placeholder="en az 8 karakter"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+        </div>
+        <div>
+          <label for="user-role" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">ROL</label>
+          <select id="user-role" name="role"
+                  class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent">
+            <option value="operator">Operatör</option>
+            <option value="admin">Yönetici</option>
+          </select>
+        </div>
+        <div class="flex items-end gap-3">
+          <div class="flex-1">
+            <label for="user-ttl" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">OTURUM</label>
+            <select id="user-ttl" name="token_ttl_min"
+                    class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent">
+              <option value="">Rol varsayılanı</option>
+              <option value="480">8 saat (vardiya)</option>
+              <option value="720">12 saat</option>
+              <option value="1440">1 gün</option>
+              <option value="10080">1 hafta</option>
+              <option value="525600">1 yıl</option>
+            </select>
+          </div>
+          <button id="user-add" type="submit"
+                  class="min-h-[44px] rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+            Ekle
+          </button>
+        </div>
+      </div>
+    </form>
+
+    <div class="scroll-thin min-h-0 flex-1 overflow-auto">
+      <table class="w-full min-w-[34rem] border-collapse text-left">
+        <thead class="sticky top-0 z-10 bg-chrome">
+          <tr class="text-[11px] font-bold tracking-wider text-muted">
+            <th scope="col" class="px-4 py-2.5 sm:px-6">KULLANICI</th>
+            <th scope="col" class="w-32 px-3 py-2.5">ROL</th>
+            <th scope="col" class="w-32 px-3 py-2.5">OTURUM</th>
+            <th scope="col" class="w-32 px-3 py-2.5">OLUŞTURULMA</th>
+            <th scope="col" class="w-24 px-4 py-2.5 text-right sm:px-6">İŞLEM</th>
+          </tr>
+        </thead>
+        <tbody id="user-rows" class="divide-y divide-line/60"></tbody>
+      </table>
+      <p id="users-empty" hidden class="py-12 text-center text-sm text-muted">Kullanıcı yok.</p>
+    </div>
+
+    <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
+      <span id="users-count" class="shrink-0 font-mono text-sm font-bold text-accent">0</span>
+      <span id="users-status" class="flex-1 truncate text-sm font-semibold" role="status" aria-live="polite"></span>
+      <button type="button" data-close
+              class="min-h-[44px] rounded-lg bg-line px-5 font-bold text-ink transition hover:brightness-125">
+        Kapat
+      </button>
+    </footer>
+  </div>
+</div>
+
 <div id="modal-settings" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
   <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
 

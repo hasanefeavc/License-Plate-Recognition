@@ -149,7 +149,8 @@
   const el = {};
   [
     "login-screen", "login-form", "login-username", "login-password",
-    "login-error", "login-submit", "login-register", "dashboard", "banner",
+    "login-error", "login-submit", "login-register", "login-hint",
+    "dashboard", "banner",
     "cdn-warning",
     "uptime", "user-label", "conn-dot", "conn-label", "feed", "feed-empty",
     "feed-count", "activity", "stat-read", "stat-grant", "stat-deny",
@@ -166,6 +167,10 @@
     "history-csv", "history-rows", "history-empty", "history-count",
     "history-status",
     // Settings modal + capacity
+    // User management modal
+    "modal-users", "btn-users", "user-form", "user-name", "user-password",
+    "user-role", "user-ttl", "user-add", "user-rows", "users-empty",
+    "users-count", "users-status",
     "modal-settings", "btn-settings", "settings-form", "settings-save",
     "settings-status", "capacity-input", "capacity-hint", "quality-select",
     "capacity-section", "capacity-divider",
@@ -648,6 +653,9 @@
             ? "Lisans geçersiz"
             : (gateBusy ? "Kapı hareket hâlinde" : ""));
     }
+    // User management is admin-only server-side; hide the entry point rather
+    // than opening a modal whose every request returns 403.
+    if (el["btn-users"]) el["btn-users"].hidden = !isAdmin;
     if (el["btn-pause"]) {
       el["btn-pause"].disabled = !isAdmin;
       el["btn-pause"].textContent = state.paused ? "Devam Et" : "Duraklat";
@@ -1632,11 +1640,191 @@
   }
 
   // -----------------------------------------------------------------------
+  // User management (admin only)
+  // -----------------------------------------------------------------------
+
+  const ROLE_CHIPS = {
+    admin:    { label: "Yönetici", classes: "border-purple-400/50 bg-purple-400/10 text-purple-300" },
+    operator: { label: "Operatör", classes: "border-teal-400/50 bg-teal-400/10 text-teal-300" },
+  };
+
+  function roleChip(role) {
+    const spec = ROLE_CHIPS[role] || ROLE_CHIPS.operator;
+    const chip = document.createElement("span");
+    chip.className =
+      `inline-block rounded-full border px-2.5 py-0.5 text-xs font-bold ${spec.classes}`;
+    chip.textContent = spec.label;
+    return chip;
+  }
+
+  /** Minutes -> "8 saat" / "1 gün"; blank falls back to the role's policy. */
+  function formatSession(minutes, role) {
+    if (!minutes) {
+      return role === "admin" ? "365 gün (rol)" : "8 saat (rol)";
+    }
+    if (minutes % 1440 === 0) return `${minutes / 1440} gün`;
+    if (minutes % 60 === 0) return `${minutes / 60} saat`;
+    return `${minutes} dk`;
+  }
+
+  /** `2026-08-27T09:14:02+00:00` -> `27.08.2026`. */
+  function formatDate(value) {
+    if (!value) return "—";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(parsed.getDate())}.${pad(parsed.getMonth() + 1)}.${parsed.getFullYear()}`;
+  }
+
+  function renderUsers(rows) {
+    const body = el["user-rows"];
+    body.textContent = "";
+
+    rows.forEach((row) => {
+      const username = String(row.username || "");
+      const role = String(row.role || "operator");
+      const isSelf = username === state.username;
+
+      const tr = document.createElement("tr");
+      tr.className = "text-sm";
+
+      const name = document.createElement("td");
+      name.className = "px-4 py-2.5 font-semibold text-ink sm:px-6";
+      name.textContent = username;
+      if (isSelf) {
+        const you = document.createElement("span");
+        you.className = "ml-2 text-xs font-normal text-muted";
+        you.textContent = "(siz)";
+        name.append(you);
+      }
+
+      const roleCell = document.createElement("td");
+      roleCell.className = "px-3 py-2.5";
+      roleCell.append(roleChip(role));
+
+      const session = document.createElement("td");
+      session.className = "px-3 py-2.5 font-mono text-xs text-muted";
+      session.textContent = formatSession(row.token_ttl_min, role);
+
+      const created = document.createElement("td");
+      created.className = "px-3 py-2.5 font-mono text-xs text-muted";
+      created.textContent = formatDate(row.created_at);
+
+      const actions = document.createElement("td");
+      actions.className = "px-4 py-2.5 text-right sm:px-6";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className =
+        "rounded-md border border-bad/50 px-2.5 py-1 text-xs font-bold text-bad transition " +
+        "hover:bg-bad hover:text-white disabled:cursor-not-allowed disabled:opacity-40";
+      remove.textContent = "Sil";
+      remove.dataset.username = username;
+      // Deleting yourself would invalidate the token making the request, so
+      // the server refuses it. Say so here rather than collecting a 400.
+      if (isSelf) {
+        remove.disabled = true;
+        remove.title = "Kendi hesabınızı silemezsiniz";
+      }
+      actions.append(remove);
+
+      tr.append(name, roleCell, session, created, actions);
+      body.append(tr);
+    });
+
+    el["users-empty"].hidden = rows.length > 0;
+    setText(el["users-count"], String(rows.length));
+  }
+
+  async function loadUsers() {
+    modalStatus(el["users-status"], "Yükleniyor...", "muted");
+    try {
+      renderUsers(await api("/api/users"));
+      modalStatus(el["users-status"], "");
+    } catch (err) {
+      modalStatus(el["users-status"], err.message, "bad");
+    }
+  }
+
+  async function addUser(event) {
+    event.preventDefault();
+    const username = el["user-name"].value.trim();
+    const password = el["user-password"].value;
+    if (!username || !password) return;
+
+    const body = { username, password, role: el["user-role"].value };
+    const ttl = Number(el["user-ttl"].value);
+    if (Number.isFinite(ttl) && ttl > 0) body.token_ttl_min = ttl;
+
+    el["user-add"].disabled = true;
+    modalStatus(el["users-status"], "Ekleniyor...", "muted");
+    try {
+      const created = await api("/api/users", { method: "POST", body: JSON.stringify(body) });
+      el["user-form"].reset();
+      await loadUsers();
+      modalStatus(el["users-status"], `${created.username} eklendi.`, "ok");
+    } catch (err) {
+      modalStatus(el["users-status"], err.message, "bad");
+    } finally {
+      el["user-add"].disabled = false;
+      el["user-name"].focus();
+    }
+  }
+
+  async function removeUser(username) {
+    if (!window.confirm(`${username} kullanıcısı silinecek.\n\nDevam edilsin mi?`)) return;
+
+    modalStatus(el["users-status"], "Siliniyor...", "muted");
+    try {
+      await api(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" });
+      await loadUsers();
+      modalStatus(el["users-status"], `${username} silindi.`, "ok");
+    } catch (err) {
+      modalStatus(el["users-status"], err.message, "bad");
+    }
+  }
+
+  function openUsers() {
+    openModal("modal-users");
+    el["user-form"].reset();
+    loadUsers();
+  }
+
+  // -----------------------------------------------------------------------
   // Session
   // -----------------------------------------------------------------------
 
+  /** Show or hide the bootstrap "Kaydol" button.
+   *
+   *  Public registration only ever applies to the *first* account on a fresh
+   *  installation — after that `POST /api/auth/register` requires an admin
+   *  token. Leaving the button on screen advertises an action that can only
+   *  fail, and reads like an open sign-up on a gate controller. `/health` is
+   *  unauthenticated and reports `setup_required`, which is exactly this
+   *  question. */
+  async function applySetupState() {
+    const button = el["login-register"];
+    if (!button) return;
+
+    // Hidden until proven otherwise: a fresh install shows it, and a server
+    // that cannot answer should not be advertising registration.
+    button.hidden = true;
+    const hint = el["login-hint"];
+    if (hint) hint.hidden = true;
+
+    try {
+      const health = await (await fetch("/health")).json();
+      if (!health || !health.setup_required) return;
+    } catch (_) {
+      return;  // unreachable server: offer sign-in only
+    }
+
+    button.hidden = false;
+    if (hint) hint.hidden = false;
+  }
+
   function showLogin(message) {
     el["login-screen"].hidden = false;
+    applySetupState();
     el.dashboard.hidden = true;
     setText(el["login-error"], message || "");
     setLoginBusy(false);
@@ -1769,12 +1957,14 @@
     el["btn-pause"].addEventListener("click", togglePause);
     el["btn-plates"].addEventListener("click", openPlates);
     el["btn-history"].addEventListener("click", openHistory);
+    if (el["btn-users"]) el["btn-users"].addEventListener("click", openUsers);
     el["btn-settings"].addEventListener("click", openSettings);
     if (el["update-run"]) el["update-run"].addEventListener("click", runUpdate);
     el["btn-logout"].addEventListener("click", () => logout(""));
 
     wireModal("modal-plates");
     wireModal("modal-history");
+    wireModal("modal-users");
     wireModal("modal-settings");
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && state.openModal) closeModal();
@@ -1794,6 +1984,14 @@
     });
 
     if (el["plate-search"]) el["plate-search"].addEventListener("input", refreshPlateTable);
+
+    if (el["user-form"]) el["user-form"].addEventListener("submit", addUser);
+    if (el["user-rows"]) {
+      el["user-rows"].addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-username]");
+        if (button && !button.disabled) removeUser(button.dataset.username);
+      });
+    }
 
     el["history-refresh"].addEventListener("click", loadHistory);
     el["history-day"].addEventListener("change", loadHistory);
