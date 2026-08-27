@@ -20,7 +20,9 @@ from typing import Final
 #: Bumped whenever ``ALL_DDL`` changes shape. Stored in ``schema_meta``.
 #: v2 added ``system_meta`` (licence token + anti-rollback clock).
 #: v3 added ``system_events`` (operational audit trail: OTA updates).
-SCHEMA_VERSION: Final[int] = 3
+#: v4 added the resident columns on ``plates`` (owner, apartment, expires_at,
+#: blocked), applied to existing databases by ``PLATES_ADDED_COLUMNS``.
+SCHEMA_VERSION: Final[int] = 4
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -31,11 +33,33 @@ LEGACY_IMPORT_KEY: Final[str] = "legacy_import_completed_at"
 
 CREATE_PLATES: Final[str] = """
 CREATE TABLE IF NOT EXISTS plates (
-    plate    TEXT PRIMARY KEY,
-    added_at TEXT NOT NULL,
-    note     TEXT
+    plate      TEXT PRIMARY KEY,
+    added_at   TEXT NOT NULL,
+    note       TEXT,
+    owner      TEXT,
+    apartment  TEXT,
+    expires_at TEXT,
+    blocked    INTEGER NOT NULL DEFAULT 0
 )
 """
+
+#: Columns added to ``plates`` after v2 shipped, as ``(name, DDL fragment)``.
+#:
+#: ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists,
+#: so a database created before v4 would silently keep the three-column
+#: ``plates`` and every query naming ``owner`` would fail. ``init_db`` walks
+#: this list against ``PRAGMA table_info`` and issues the missing
+#: ``ALTER TABLE ADD COLUMN`` statements.
+#:
+#: Additive only, and every column nullable or defaulted -- SQLite can add such
+#: a column to a populated table without rewriting it, and an older build
+#: reading the same file still works because it never names them.
+PLATES_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
+    ("owner", "ALTER TABLE plates ADD COLUMN owner TEXT"),
+    ("apartment", "ALTER TABLE plates ADD COLUMN apartment TEXT"),
+    ("expires_at", "ALTER TABLE plates ADD COLUMN expires_at TEXT"),
+    ("blocked", "ALTER TABLE plates ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"),
+)
 
 CREATE_USERS: Final[str] = """
 CREATE TABLE IF NOT EXISTS users (
@@ -165,3 +189,24 @@ SELECT_SYSTEM_EVENTS_BY_SOURCE: Final[str] = (
 )
 
 DELETE_SYSTEM_EVENTS_OLDER_THAN: Final[str] = "DELETE FROM system_events WHERE ts < ?"
+
+#: Columns of ``plates`` in the order the CSV export writes them.
+PLATE_COLUMNS: Final[tuple[str, ...]] = (
+    "plate",
+    "owner",
+    "apartment",
+    "note",
+    "expires_at",
+    "blocked",
+    "added_at",
+)
+
+SELECT_PLATE_DETAIL: Final[str] = (
+    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked "
+    "FROM plates WHERE plate = ?"
+)
+
+SELECT_PLATES_DETAIL: Final[str] = (
+    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked "
+    "FROM plates ORDER BY plate"
+)

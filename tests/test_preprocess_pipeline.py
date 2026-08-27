@@ -204,7 +204,13 @@ def test_the_original_frame_is_what_gets_published_and_photographed(
         tmp_settings,
         frame_preprocessor=lambda _frame: np.full((80, 160, 3), 7, dtype=np.uint8),
     )
-    pipeline._snapshots.submit = lambda plate, frame, camera=None: captured.append(frame)
+    # Signature mirrors SnapshotWriter.submit, including the on_saved hook the
+    # notifier uses, so this stub keeps failing loudly if that contract moves.
+    def fake_submit(plate, frame, *, camera=None, when=None, on_saved=None):
+        captured.append(frame)
+        return True
+
+    pipeline._snapshots.submit = fake_submit
 
     pipeline.process_frame("entry", original)
     assert captured, "the decision should have queued a snapshot"

@@ -56,7 +56,6 @@
   /** The API caps /api/logs at 1000 rows per call; the export asks for all of
    *  them so the CSV is not silently a truncated view of the day. */
   const HISTORY_LIMIT = 1000;
-  const CSV_FILENAME = "otopark_gecmis.csv";
   /** Cooldown events are the same plate re-confirming while a car idles under
    *  the camera. The backend keeps them out of the log table; we keep them out
    *  of the feed for the same reason. */
@@ -156,6 +155,7 @@
     // Plate-management modal
     "modal-plates", "btn-plates", "plate-form", "plate-input", "note-input",
     "plate-add", "plate-rows", "plates-empty", "plates-count", "plates-status",
+    "plates-io", "plate-import-file", "plate-import-overwrite", "plate-export",
     // History modal
     "modal-history", "history-day", "history-camera", "history-refresh",
     "history-csv", "history-rows", "history-empty", "history-count",
@@ -248,6 +248,50 @@
       throw error;
     }
     return payload;
+  }
+
+  /** Download a file from an authenticated endpoint.
+   *
+   *  A plain <a href> cannot carry the bearer header, so the body is fetched,
+   *  turned into a blob and handed to a synthetic link. The server's
+   *  Content-Disposition filename is preferred over the caller's guess so the
+   *  saved file keeps the timestamp the server stamped on it. */
+  async function downloadFromApi(path, fallbackName) {
+    const headers = {};
+    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+
+    const response = await fetch(path, { headers });
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        if (payload && payload.error && payload.error.detail) detail = payload.error.detail;
+      } catch (_) { /* a CSV error body is not JSON */ }
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filenameFromResponse(response) || fallbackName;
+    // Firefox only fires the download for a link that is in the document.
+    link.style.display = "none";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    // Revoked on the next tick: revoking synchronously can cancel the download
+    // in some browsers before they have read the blob.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  /** Pull the filename out of a Content-Disposition header, if there is one. */
+  function filenameFromResponse(response) {
+    const header = response.headers.get("Content-Disposition") || "";
+    const match = /filename="?([^";]+)"?/i.exec(header);
+    return match ? match[1] : "";
   }
 
   function streamUrl(role) {
@@ -1062,6 +1106,9 @@
     const reason = isAdmin ? "" : "Plaka eklemek/silmek için yönetici yetkisi gerekli";
     el["plate-add"].disabled = !isAdmin;
     el["plate-add"].title = reason;
+    // Both bulk operations are admin-only server-side; hide the whole row for
+    // an operator rather than showing controls that only collect 403s.
+    if (el["plates-io"]) el["plates-io"].hidden = !isAdmin;
     el["plate-input"].disabled = !isAdmin;
     el["note-input"].disabled = !isAdmin;
     el["plate-rows"].querySelectorAll("button[data-plate]").forEach((button) => {
@@ -1252,55 +1299,108 @@
   // CSV export
   // -----------------------------------------------------------------------
 
-  /** RFC 4180 field: quote when it contains a delimiter, quote or newline,
-   *  and double any embedded quote. Without this a note containing a comma
-   *  silently shifts every later column. */
-  function csvField(value) {
-    const text = value === null || value === undefined ? "" : String(value);
-    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  }
 
-  function toCsv(rows) {
-    const header = ["ID", "Zaman (UTC)", "Kamera", "Plaka", "Durum", "Güven (%)"];
-    const lines = [header.map(csvField).join(",")];
-    rows.forEach((row) => {
-      const camera = String(row.camera || "");
-      const action = String(row.action || "");
-      const confidence = Number(row.confidence);
-      lines.push([
-        row.id ?? "",
-        String(row.ts || "").replace("T", " ").replace("+00:00", ""),
-        CAMERA_LABELS[camera] || camera,
-        String(row.plate || ""),
-        ACTION_LABELS[action] || action.toUpperCase(),
-        Number.isFinite(confidence) ? Math.round(confidence * 100) : "",
-      ].map(csvField).join(","));
-    });
-    // CRLF per RFC 4180, and a UTF-8 BOM so Excel reads "İZİN VERİLDİ" as
-    // Turkish rather than mojibake.
-    return "﻿" + lines.join("\r\n") + "\r\n";
-  }
-
-  function downloadCsv() {
-    const rows = state.historyRows;
-    if (!rows.length) {
-      modalStatus(el["history-status"], "Dışa aktarılacak kayıt yok.", "warn");
-      return;
+  /** Export the history from the server, using the filters on screen.
+   *
+   *  Built server-side rather than from `state.historyRows`, which holds only
+   *  the page currently rendered: an operator asking for a month of history
+   *  wants the month, not the two hundred rows the table happens to show. */
+  async function downloadCsv() {
+    const params = new URLSearchParams();
+    const day = el["history-day"] && el["history-day"].value;
+    if (day) {
+      params.set("since", `${day}T00:00:00+00:00`);
+      params.set("until", `${day}T23:59:59+00:00`);
     }
-    const blob = new Blob([toCsv(rows)], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = CSV_FILENAME;
-    // Firefox only fires the download for a link that is in the document.
-    link.style.display = "none";
-    document.body.append(link);
-    link.click();
-    link.remove();
-    // Revoked on the next tick: revoking synchronously can cancel the
-    // download in some browsers before it has read the blob.
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    modalStatus(el["history-status"], `${rows.length} kayıt indirildi.`, "ok");
+    const camera = el["history-camera"] && el["history-camera"].value;
+    if (camera) params.set("camera", camera);
+
+    el["history-csv"].disabled = true;
+    modalStatus(el["history-status"], "Dışa aktarılıyor...", "muted");
+    try {
+      await downloadFromApi(`/api/events/export?${params.toString()}`, "kayitlar.csv");
+      modalStatus(el["history-status"], "Kayıtlar indirildi.", "ok");
+    } catch (err) {
+      modalStatus(el["history-status"], err.message, "bad");
+    } finally {
+      el["history-csv"].disabled = false;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Plate list: bulk import / export
+  // -----------------------------------------------------------------------
+
+  /** Upload the chosen CSV and report what the server made of it.
+   *
+   *  The input is cleared afterwards so re-picking the same file fires
+   *  `change` again -- without that, correcting the spreadsheet and choosing
+   *  it a second time does nothing. */
+  async function importPlates(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    if (!file) return;
+
+    const overwrite = Boolean(el["plate-import-overwrite"] && el["plate-import-overwrite"].checked);
+    modalStatus(el["plates-status"], `${file.name} yükleniyor...`, "muted");
+
+    const body = new FormData();
+    body.append("file", file);
+
+    try {
+      // No Content-Type header: the browser must set the multipart boundary.
+      const headers = {};
+      if (state.token) headers.Authorization = `Bearer ${state.token}`;
+      const response = await fetch(
+        `/api/plates/import?overwrite=${overwrite ? "true" : "false"}`,
+        { method: "POST", headers, body }
+      );
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(
+          (payload && payload.error && payload.error.detail) || `HTTP ${response.status}`
+        );
+      }
+      reportImport(payload);
+      await loadPlates();
+    } catch (err) {
+      modalStatus(el["plates-status"], err.message, "bad");
+    } finally {
+      input.value = "";
+    }
+  }
+
+  /** Turn the per-row counts into one sentence an operator can act on. */
+  function reportImport(report) {
+    if (!report) return;
+    const parts = [];
+    if (report.added) parts.push(`${report.added} eklendi`);
+    if (report.updated) parts.push(`${report.updated} güncellendi`);
+    if (report.skipped) parts.push(`${report.skipped} atlandı`);
+    if (report.invalid) parts.push(`${report.invalid} geçersiz`);
+
+    const summary = parts.length ? parts.join(", ") : "değişiklik yok";
+    const tone = report.invalid ? "warn" : "ok";
+    modalStatus(el["plates-status"], `İçe aktarma: ${summary}.`, tone);
+
+    // The first failing row is worth surfacing; the rest are in the response
+    // for anyone who wants them, but a toast is not a log viewer.
+    if (report.errors && report.errors.length) {
+      toast(report.errors[0], "warn");
+    }
+  }
+
+  async function exportPlates() {
+    if (el["plate-export"]) el["plate-export"].disabled = true;
+    modalStatus(el["plates-status"], "Dışa aktarılıyor...", "muted");
+    try {
+      await downloadFromApi("/api/plates/export", "plakalar.csv");
+      modalStatus(el["plates-status"], "Plaka listesi indirildi.", "ok");
+    } catch (err) {
+      modalStatus(el["plates-status"], err.message, "bad");
+    } finally {
+      if (el["plate-export"]) el["plate-export"].disabled = false;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -1465,6 +1565,9 @@
     el["history-day"].addEventListener("change", loadHistory);
     el["history-camera"].addEventListener("change", loadHistory);
     el["history-csv"].addEventListener("click", downloadCsv);
+
+    if (el["plate-import-file"]) el["plate-import-file"].addEventListener("change", importPlates);
+    if (el["plate-export"]) el["plate-export"].addEventListener("click", exportPlates);
 
     el["settings-form"].addEventListener("submit", saveSettings);
 

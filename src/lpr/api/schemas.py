@@ -34,6 +34,7 @@ __all__ = [
     "PipelineStateOut",
     "RegisterIn",
     "RelayTriggerOut",
+    "PlateImportOut",
     "StatsOut",
     "SystemEventOut",
     "SystemUpdateOut",
@@ -721,6 +722,41 @@ class SystemEventOut(BaseModel):
     level: Literal["info", "warning", "error"] = Field(examples=["warning"])
     message: str = Field(examples=["Gecelik denetim: sistem güncel."])
     detail: str | None = Field(default=None)
+
+
+class PlateImportOut(BaseModel):
+    """Result of ``POST /api/plates/import``, counted per row.
+
+    Rows are processed independently: one bad plate in a 400-row resident list
+    does not reject the other 399. The counts are what the operator needs to
+    decide whether to re-upload, and ``errors`` names the rows to fix by their
+    line number in the original file.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "added": 12,
+                    "updated": 3,
+                    "skipped": 1,
+                    "invalid": 1,
+                    "total": 17,
+                    "errors": ["Satır 9: plaka okunamadı."],
+                }
+            ]
+        }
+    )
+
+    added: int = Field(default=0, examples=[12])
+    updated: int = Field(default=0, examples=[3])
+    #: Already present, and the request asked not to overwrite.
+    skipped: int = Field(default=0, examples=[1])
+    invalid: int = Field(default=0, examples=[1])
+    total: int = Field(default=0, examples=[17])
+    #: Capped at 50 entries so a wholly broken file cannot produce a response
+    #: larger than the upload.
+    errors: list[str] = Field(default_factory=list)
 
 
 class ErrorOut(BaseModel):

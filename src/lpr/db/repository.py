@@ -76,11 +76,46 @@ class PlateRepository:
     __slots__ = ()
 
     def is_registered(self, plate: str) -> bool:
+        """True when ``plate`` may open the gate right now.
+
+        Three things can make a listed plate *not* count, and all three are
+        access decisions rather than bookkeeping:
+
+        * ``blocked`` -- on the list deliberately, to be refused. A resident
+          who has moved out stays visible (and auditable) instead of being
+          deleted and silently re-addable by the next import.
+        * ``expires_at`` in the past -- a temporary permit that has run out.
+        * absent -- never registered.
+
+        Evaluated in SQL rather than in Python so the gate decision stays one
+        indexed primary-key lookup on the recognition path.
+        """
         key = normalise_plate(plate)
         if not key:
             return False
         conn = get_connection()
-        row = conn.execute("SELECT 1 FROM plates WHERE plate = ?", (key,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM plates WHERE plate = ? "
+            "AND COALESCE(blocked, 0) = 0 "
+            "AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)",
+            (key, utc_now_iso()),
+        ).fetchone()
+        return row is not None
+
+    def is_blocked(self, plate: str) -> bool:
+        """True when ``plate`` is on the list *and* flagged blocked.
+
+        Distinct from "not registered": an unknown car is unauthorised, a
+        blocked one was listed and then barred, and the two justify different
+        notifications.
+        """
+        key = normalise_plate(plate)
+        if not key:
+            return False
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM plates WHERE plate = ? AND COALESCE(blocked, 0) = 1", (key,)
+        ).fetchone()
         return row is not None
 
     def add(self, plate: str, note: str | None = None) -> bool:
@@ -115,10 +150,58 @@ class PlateRepository:
         if not key:
             return None
         conn = get_connection()
-        row = conn.execute(
-            "SELECT plate, added_at, note FROM plates WHERE plate = ?", (key,)
-        ).fetchone()
+        row = conn.execute(schema.SELECT_PLATE_DETAIL, (key,)).fetchone()
         return dict(row) if row is not None else None
+
+    def upsert(
+        self,
+        plate: str,
+        owner: str | None = None,
+        apartment: str | None = None,
+        note: str | None = None,
+        expires_at: str | None = None,
+        blocked: bool = False,
+        overwrite: bool = True,
+    ) -> str:
+        """Insert or update one resident record. Returns what it did.
+
+        Returns ``"added"``, ``"updated"``, ``"skipped"`` (already present and
+        ``overwrite`` is off) or ``"invalid"`` (the plate normalises to
+        nothing). The CSV importer reports those counts back to the operator,
+        which is the whole reason they are distinguished.
+
+        ``overwrite=False`` is the safe import mode: an existing row is left
+        exactly as it is rather than having its owner and expiry quietly
+        replaced by whatever a spreadsheet happened to contain.
+        """
+        key = normalise_plate(plate)
+        if not key:
+            return "invalid"
+
+        with transaction() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM plates WHERE plate = ?", (key,)
+            ).fetchone()
+            if existing is not None and not overwrite:
+                return "skipped"
+
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO plates "
+                    "(plate, added_at, note, owner, apartment, expires_at, blocked) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (key, utc_now_iso(), note, owner, apartment, expires_at, int(blocked)),
+                )
+                return "added"
+
+            # added_at is deliberately untouched: it records when the plate was
+            # first admitted, not when a spreadsheet last mentioned it.
+            conn.execute(
+                "UPDATE plates SET note = ?, owner = ?, apartment = ?, "
+                "expires_at = ?, blocked = ? WHERE plate = ?",
+                (note, owner, apartment, expires_at, int(blocked), key),
+            )
+            return "updated"
 
     def all(self) -> list[str]:
         conn = get_connection()
@@ -127,9 +210,7 @@ class PlateRepository:
 
     def all_detailed(self) -> list[dict[str, Any]]:
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT plate, added_at, note FROM plates ORDER BY plate"
-        ).fetchall()
+        rows = conn.execute(schema.SELECT_PLATES_DETAIL).fetchall()
         return [dict(row) for row in rows]
 
     def count(self) -> int:

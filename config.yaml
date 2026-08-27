@@ -304,6 +304,61 @@ relay:
 
 
 
+# E-posta bildirimleri: yetkisiz veya kara listedeki araç için anlık görüntü
+
+# ekli uyarı.
+
+#
+
+# KAPALI GELİR. Açmak, servisin kendiliğinden dış bir posta sunucusuna
+
+# bağlanması ve mesaja BİR ARAÇ FOTOĞRAFI koyması demektir. İki noktaya dikkat:
+
+#
+
+#   * password'ü buraya yazmak yerine LPR_SMTP__PASSWORD ortam değişkenini
+
+#     kullanın; dosyadaki değeri ezer ve sırrı depodan/yedeklerden uzak tutar.
+
+#   * Anlık görüntü çoğu ülkede kişisel veridir. Site yöneticisinin kontrol
+
+#     ettiği bir kutuya gönderin ve to_emails listesini kısa tutun.
+
+smtp:
+
+  enabled: false
+
+  host: ""
+
+  # 587 = STARTTLS (use_tls), 465 = örtük TLS (otomatik algılanır), 25 = düz.
+
+  port: 587
+
+  user: ""
+
+  password: ""
+
+  # Boşsa user kullanılır; çoğu sağlayıcı zaten bunu şart koşar.
+
+  from_email: ""
+
+  to_emails: []
+
+  # Listede hiç olmayan plaka.
+
+  notify_on_unauthorized: true
+
+  # Listede olan ama engellenmiş (blocked) plaka.
+
+  notify_on_blacklisted: true
+
+  use_tls: true
+
+  timeout_s: 15.0
+
+  queue_size: 64
+
+
 database:
 
   path: data/plates.db

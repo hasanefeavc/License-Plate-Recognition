@@ -35,6 +35,7 @@ import queue
 import re
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -192,21 +193,35 @@ class SnapshotWriter:
         *,
         camera: str | None = None,
         when: datetime | None = None,
+        on_saved: Callable[[Path | None], None] | None = None,
     ) -> bool:
         """Queue one frame to be saved. Never blocks; returns False if dropped.
 
         A full queue means the disk cannot keep up with the gate. Dropping is
         the deliberate choice: the alternative is stalling the camera thread
         that produced this decision.
+
+        ``on_saved`` is called once per accepted frame, **on the writer
+        thread**, with the finished path -- or with ``None`` when the write
+        failed. It exists so the e-mail notifier can attach the very file this
+        writer produced rather than encoding a second copy of the same frame,
+        and it fires on failure too so an alert is never lost to a full disk.
+        An exception from it is logged and swallowed: a broken consumer must
+        not take down the writer or cost the next snapshot.
         """
         if not self.enabled or frame is None:
+            return False
+        if not self.running:
+            # Nothing would ever drain the queue, so the ``on_saved`` consumer
+            # would wait forever. Saying no lets the caller fall back.
+            logger.debug("Snapshot writer is not running; %s not queued", plate)
             return False
         name = snapshot_filename(plate, when)
         with self._inflight_lock:
             self._inflight += 1
             self._idle.clear()
         try:
-            self._queue.put_nowait((name, frame, camera))
+            self._queue.put_nowait((name, frame, camera, on_saved))
         except queue.Full:
             self._mark_done()
             self._dropped += 1
@@ -232,14 +247,30 @@ class SnapshotWriter:
                 # Everything queued before the sentinel has been written: the
                 # queue is FIFO, so there is nothing left ahead of us.
                 return
-            name, frame, camera = item
+            name, frame, camera, on_saved = item
             try:
-                self._write(name, frame, camera)
+                path = self._write(name, frame, camera)
+                if on_saved is not None:
+                    # Announced even when the write failed (``path`` is None).
+                    # The consumer is the e-mail notifier, and an alert about a
+                    # refused vehicle must not be lost because the disk was
+                    # full -- it goes out without the photograph instead.
+                    self._announce(on_saved, path)
             except Exception:  # pragma: no cover - never kill the writer
                 self._failed += 1
                 logger.exception("Could not save snapshot %s", name)
             finally:
                 self._mark_done()
+
+    @staticmethod
+    def _announce(callback: Callable[[Path | None], None], path: Path | None) -> None:
+        """Hand the outcome to a consumer without trusting it."""
+        try:
+            callback(path)
+        except Exception:
+            logger.warning(
+                "Snapshot callback failed for %s", path.name if path else "-", exc_info=True
+            )
 
     def _mark_done(self) -> None:
         with self._inflight_lock:

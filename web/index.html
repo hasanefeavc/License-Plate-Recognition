@@ -306,6 +306,10 @@
       </button>
     </header>
 
+    <p id="plate-import-hint" class="sr-only">
+      CSV sütunları: plate, owner, apartment, notes, expires_at
+    </p>
+
     <form id="plate-form" class="shrink-0 border-b border-line px-4 py-4 sm:px-6">
       <div class="flex flex-wrap items-end gap-3">
         <div class="min-w-[8rem] flex-1">
@@ -343,6 +347,28 @@
 
     <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
       <span id="plates-count" class="font-mono text-sm font-bold text-accent">0</span>
+      <!-- Bulk transfer. Admin-only, and hidden outright for an operator so
+           nobody is offered a button that can only ever return 403. -->
+      <div id="plates-io" hidden class="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+        <!-- The real input is offscreen, not display:none: a hidden input
+             cannot be focused, which breaks keyboard access to the label. -->
+        <input id="plate-import-file" type="file" accept=".csv,text/csv"
+               class="sr-only" aria-describedby="plate-import-hint">
+        <label for="plate-import-file"
+               class="min-h-[44px] cursor-pointer rounded-lg border-2 border-accent px-4 py-2.5 text-sm font-bold text-accent transition hover:bg-accent hover:text-ground">
+          İçe Aktar (CSV)
+        </label>
+        <label class="flex cursor-pointer items-center gap-1.5 text-xs text-muted">
+          <input id="plate-import-overwrite" type="checkbox"
+                 class="h-4 w-4 rounded border-line bg-void accent-accent">
+          Mevcutları güncelle
+        </label>
+        <button id="plate-export" type="button"
+                class="min-h-[44px] rounded-lg bg-line px-4 text-sm font-bold text-ink transition hover:brightness-125 disabled:cursor-not-allowed disabled:opacity-40">
+          Dışa Aktar (CSV)
+        </button>
+      </div>
+
       <span id="plates-status" class="flex-1 truncate text-sm font-semibold" role="status" aria-live="polite"></span>
       <button type="button" data-close
               class="min-h-[44px] rounded-lg bg-line px-5 font-bold text-ink transition hover:brightness-125">
@@ -391,9 +417,11 @@
               class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none">
         Yenile
       </button>
+      <!-- Exports the whole filtered range from the server, not just the page
+           currently rendered in the table. -->
       <button id="history-csv" type="button"
               class="min-h-[44px] flex-1 rounded-lg bg-ok px-5 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 sm:ml-auto sm:flex-none">
-        CSV İndir
+        Dışa Aktar (CSV)
       </button>
     </div>
 

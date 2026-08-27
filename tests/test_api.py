@@ -1153,3 +1153,169 @@ def test_the_audit_trail_rejects_an_absurd_limit(
         events_client.get("/api/system/events?limit=99999", headers=auth(admin_token)).status_code
         == 422
     )
+
+
+# ---------------------------------------------------------------------------
+# CSV import / export
+# ---------------------------------------------------------------------------
+
+
+class ImportablePlateRepository(FakePlateRepository):
+    """Adds the resident columns the CSV importer writes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.details: dict[str, dict[str, Any]] = {}
+
+    def upsert(
+        self,
+        plate: str,
+        owner: str | None = None,
+        apartment: str | None = None,
+        note: str | None = None,
+        expires_at: str | None = None,
+        blocked: bool = False,
+        overwrite: bool = True,
+    ) -> str:
+        existing = plate in self.details
+        if existing and not overwrite:
+            return "skipped"
+        self.details[plate] = {
+            "plate": plate,
+            "owner": owner,
+            "apartment": apartment,
+            "note": note,
+            "expires_at": expires_at,
+            "blocked": int(blocked),
+            "added_at": "2026-08-27T00:00:00+00:00",
+        }
+        self._plates[plate] = note
+        return "updated" if existing else "added"
+
+    def all_detailed(self) -> list[dict[str, Any]]:
+        return [self.details[key] for key in sorted(self.details)]
+
+
+@pytest.fixture()
+def csv_repo() -> ImportablePlateRepository:
+    return ImportablePlateRepository()
+
+
+@pytest.fixture()
+def csv_client(api_app: Any, csv_repo: ImportablePlateRepository) -> TestClient:
+    api_app.dependency_overrides[deps.get_plate_repository] = lambda: csv_repo
+    return TestClient(api_app)
+
+
+def upload(client: TestClient, token: str, body: bytes, query: str = "") -> Any:
+    return client.post(
+        f"/api/plates/import{query}",
+        headers=auth(token),
+        files={"file": ("residents.csv", body, "text/csv")},
+    )
+
+
+def test_plate_import_requires_admin(csv_client: TestClient, operator_token: str) -> None:
+    response = upload(csv_client, operator_token, b"plate\n34ABC123\n")
+    assert response.status_code == 403
+
+
+def test_plate_import_reports_counts_per_row(
+    csv_client: TestClient, admin_token: str, csv_repo: ImportablePlateRepository
+) -> None:
+    body = "plaka;sahibi;daire\r\n34ABC123;Ali Şen;A-12\r\n???;Bozuk;\r\n".encode("utf-8-sig")
+    response = upload(csv_client, admin_token, body)
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["added"] == 1
+    assert report["invalid"] == 1
+    assert report["errors"], "a rejected row must say which one it was"
+    assert csv_repo.details["34ABC123"]["owner"] == "Ali Şen"
+
+
+def test_plate_import_skips_existing_by_default(
+    csv_client: TestClient, admin_token: str
+) -> None:
+    body = b"plate,owner\r\n34ABC123,Ali\r\n"
+    assert upload(csv_client, admin_token, body).json()["added"] == 1
+
+    again = upload(csv_client, admin_token, b"plate,owner\r\n34ABC123,Baska\r\n").json()
+    assert again["skipped"] == 1
+    assert again["updated"] == 0
+
+
+def test_plate_import_overwrites_when_asked(csv_client: TestClient, admin_token: str) -> None:
+    upload(csv_client, admin_token, b"plate,owner\r\n34ABC123,Ali\r\n")
+    again = upload(
+        csv_client, admin_token, b"plate,owner\r\n34ABC123,Yeni\r\n", "?overwrite=true"
+    ).json()
+    assert again["updated"] == 1
+
+
+def test_plate_import_rejects_a_file_without_a_plate_column(
+    csv_client: TestClient, admin_token: str
+) -> None:
+    report = upload(csv_client, admin_token, b"owner,apartment\r\nAli,A-12\r\n").json()
+    assert report["added"] == 0
+    assert report["errors"]
+
+
+def test_plate_export_requires_admin(csv_client: TestClient, operator_token: str) -> None:
+    """The resident list is names and apartment numbers, not just plates."""
+    assert csv_client.get("/api/plates/export", headers=auth(operator_token)).status_code == 403
+
+
+def test_plate_export_returns_a_downloadable_csv(
+    csv_client: TestClient, admin_token: str
+) -> None:
+    upload(csv_client, admin_token, "plate,owner\r\n34ABC123,Ali Şen\r\n".encode())
+    response = csv_client.get("/api/plates/export", headers=auth(admin_token))
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment" in response.headers["content-disposition"]
+    assert ".csv" in response.headers["content-disposition"]
+    body = response.content.decode("utf-8-sig")
+    assert "34ABC123" in body and "Ali Şen" in body
+
+
+def test_event_export_requires_authentication(api_client: TestClient) -> None:
+    assert api_client.get("/api/events/export").status_code == 401
+
+
+def test_event_export_is_readable_by_an_operator(
+    api_client: TestClient, operator_token: str, log_repo: FakeLogRepository
+) -> None:
+    """An operator on the gate is exactly who needs the shift's history."""
+    log_repo.events.append(
+        LprEvent(ts=utc_now_iso(), camera="entry", plate="34ABC123", action="denied", id=1)
+    )
+    response = api_client.get("/api/events/export", headers=auth(operator_token))
+
+    assert response.status_code == 200
+    body = response.content.decode("utf-8-sig")
+    assert "id,ts,camera,plate,action,confidence" in body
+    assert "34ABC123" in body
+
+
+def test_event_export_passes_the_filters_through(
+    api_client: TestClient, operator_token: str, log_repo: FakeLogRepository
+) -> None:
+    """The download must match what the operator is looking at on screen."""
+    api_client.get(
+        "/api/events/export?camera=entry&plate=34+abc+123&limit=5",
+        headers=auth(operator_token),
+    )
+    assert log_repo.last_query is not None, "the export must actually query"
+    assert log_repo.last_query["camera"] == "entry"
+    assert log_repo.last_query["plate"] == "34ABC123", "the plate filter must be normalised"
+
+
+def test_event_export_rejects_an_absurd_limit(
+    api_client: TestClient, operator_token: str
+) -> None:
+    assert (
+        api_client.get("/api/events/export?limit=999999", headers=auth(operator_token)).status_code
+        == 422
+    )

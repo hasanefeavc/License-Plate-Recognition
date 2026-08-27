@@ -77,13 +77,21 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
     # orchestrator gets whole-frame enhancement without importing cv2 itself.
     frame_preprocessor = build_frame_preprocessor(settings)
 
+    # Never raises: a misconfigured mail server yields a disabled notifier and
+    # a warning, not a pipeline that refuses to start.
+    from lpr.notify import build_notifier
+
+    notifier = build_notifier(settings)
+
     logger.info(
-        "Pipeline built (detector=%s, recognizer=%s, voter=%s, relay=%s, frame_enhance=%s)",
+        "Pipeline built (detector=%s, recognizer=%s, voter=%s, relay=%s, "
+        "frame_enhance=%s, email=%s)",
         type(detector).__name__,
         type(recognizer).__name__,
         type(voter).__name__,
         type(relay).__name__,
         frame_preprocessor is not None,
+        notifier.enabled,
     )
     return PipelineOrchestrator(
         settings=settings,
@@ -92,4 +100,5 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
         voter=voter,
         relay=relay,
         frame_preprocessor=frame_preprocessor,
+        notifier=notifier,
     )

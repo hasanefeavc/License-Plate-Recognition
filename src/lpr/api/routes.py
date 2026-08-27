@@ -19,8 +19,19 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
@@ -40,6 +51,7 @@ from lpr.api.schemas import (
     PipelineStateOut,
     PlateIn,
     PlateListOut,
+    PlateImportOut,
     PlateOut,
     RegisterIn,
     RelayTriggerOut,
@@ -1007,3 +1019,154 @@ async def system_events(
     repo = deps.get_system_event_repository(request)
     rows = await _in_thread(repo.recent, limit, source)
     return [SystemEventOut.model_validate(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# CSV import / export
+#
+# Exports are returned as a whole body rather than streamed: a resident list is
+# a few hundred rows and a filtered log page is capped at EXPORT_MAX_ROWS, so
+# the largest response here is a couple of megabytes -- well inside what a
+# single Response can carry, and it keeps the Content-Length header that makes
+# a browser show a real download progress bar.
+# ---------------------------------------------------------------------------
+
+#: Upper bound on rows in one log export. Higher than the UI's page size on
+#: purpose (an export is meant to cover a shift, not a screen), but bounded so
+#: one request cannot pull a year of history into memory.
+EXPORT_MAX_ROWS = 50_000
+
+
+def _csv_response(payload: bytes, filename: str) -> Response:
+    """A CSV body with the headers that make a browser save it as a file."""
+    return Response(
+        content=payload,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _export_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+
+
+@router.post(
+    "/api/plates/import",
+    response_model=PlateImportOut,
+    tags=["plates"],
+    summary="Plakaları CSV ile içe aktar",
+)
+async def import_plates(
+    _: AdminUser,
+    plate_repo: deps.PlateRepo,
+    file: Annotated[
+        UploadFile,
+        File(description="CSV sütunları: plate, owner, apartment, notes, expires_at"),
+    ],
+    overwrite: Annotated[bool, Query()] = False,
+) -> PlateImportOut:
+    """Bulk-load a resident list from a spreadsheet export.
+
+    ``overwrite=false`` (the default) **skips** plates that already exist;
+    ``overwrite=true`` updates them in place. Skipping is the default because
+    re-uploading last month's list is a normal thing for a site manager to do,
+    and it should not silently overwrite owner and expiry data that has been
+    corrected in the meantime.
+
+    Excel's habits are handled rather than rejected: a UTF-8 BOM, a semicolon
+    delimiter on a Turkish locale, cp1254 encoding, and Turkish column headers
+    (``plaka``, ``sahibi``, ``daire``) all parse. Only ``plate`` is required.
+    """
+    from lpr.csvio import MAX_IMPORT_BYTES, parse_plate_csv
+
+    raw = await file.read()
+    if len(raw) > MAX_IMPORT_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Dosya çok büyük (en fazla {MAX_IMPORT_BYTES // (1024 * 1024)} MB)",
+        )
+
+    report = await _in_thread(parse_plate_csv, raw, overwrite, plate_repo)
+    logger.info(
+        "CSV içe aktarma (%s): %d eklendi, %d güncellendi, %d atlandı, %d geçersiz",
+        file.filename,
+        report.added,
+        report.updated,
+        report.skipped,
+        report.invalid,
+    )
+    return PlateImportOut(**report.to_dict())
+
+
+@router.get(
+    "/api/plates/export",
+    tags=["plates"],
+    summary="Plakaları CSV olarak indir",
+    response_class=Response,
+    responses={200: {"content": {"text/csv": {}}}},
+)
+async def export_plates(_: AdminUser, plate_repo: deps.PlateRepo) -> Response:
+    """The whole plate list as CSV, in the same column order the importer reads.
+
+    Round-trips: downloading, editing in Excel and re-uploading with
+    ``overwrite=true`` is a supported way to bulk-edit residents.
+    """
+    from lpr.csvio import export_plates_csv
+
+    rows = await _in_thread(plate_repo.all_detailed)
+    payload = await _in_thread(export_plates_csv, rows)
+    return _csv_response(payload, f"plakalar-{_export_stamp()}.csv")
+
+
+@router.get(
+    "/api/events/export",
+    tags=["logs"],
+    summary="Kayıtları CSV olarak indir",
+    response_class=Response,
+    responses={200: {"content": {"text/csv": {}}}},
+)
+async def export_events(
+    _: CurrentUser,
+    log_repo: deps.LogRepo,
+    since: Annotated[str | None, Query(max_length=32)] = None,
+    until: Annotated[str | None, Query(max_length=32)] = None,
+    camera: Annotated[str | None, Query(max_length=16)] = None,
+    plate: Annotated[str | None, Query(max_length=16)] = None,
+    limit: Annotated[int, Query(ge=1, le=EXPORT_MAX_ROWS)] = 10_000,
+) -> Response:
+    """Filtered access history as CSV.
+
+    Takes the same filters as ``GET /api/logs`` so the download matches what
+    the operator is looking at on screen, rather than being a second query with
+    its own idea of the date range.
+    """
+    from lpr.csvio import export_events_csv
+
+    # Deliberately not routed through LogQuery: that model caps `limit` at the
+    # UI's page size (1000), whereas an export is meant to cover a shift rather
+    # than a screen. The bounds that apply here are on the parameters above.
+    events = await _in_thread(
+        log_repo.query,
+        since or None,
+        until or None,
+        _camera_role(camera) if camera else None,
+        normalize_plate(plate) if plate else None,
+        limit,
+        0,
+    )
+    rows = [
+        {
+            "id": event.id,
+            "ts": event.ts,
+            "camera": event.camera,
+            "plate": event.plate,
+            "action": event.action,
+            "confidence": round(float(event.confidence), 4),
+        }
+        for event in events
+    ]
+    payload = await _in_thread(export_events_csv, rows)
+    return _csv_response(payload, f"kayitlar-{_export_stamp()}.csv")
