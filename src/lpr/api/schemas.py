@@ -43,6 +43,7 @@ __all__ = [
     "SystemEventOut",
     "SystemUpdateOut",
     "TokenOut",
+    "UserCreateIn",
     "UserOut",
     "VersionOut",
     "normalize_plate",
@@ -578,6 +579,12 @@ class HealthOut(BaseModel):
         default_factory=dict, examples=[{"entry": True, "exit": False}]
     )
     detail: str | None = Field(default=None, examples=[None])
+    #: True only while no account exists at all. The login screen reads this to
+    #: decide whether to offer "Kaydol" (which creates the bootstrap admin) or
+    #: just the sign-in form. Safe to expose unauthenticated: an installation
+    #: with no accounts is open by construction, and saying so is what lets the
+    #: UI stop advertising public registration once it is not.
+    setup_required: bool = Field(default=False, examples=[False])
 
 
 class PipelineStateOut(BaseModel):
@@ -755,6 +762,9 @@ class UserOut(BaseModel):
     username: str = Field(examples=["admin"])
     role: str = Field(default="operator", examples=["admin"])
     created_at: str | None = Field(default=None, examples=["2026-05-01"])
+    #: Session length for this account in minutes; ``None`` means it inherits
+    #: the policy for its role.
+    token_ttl_min: int | None = Field(default=None, examples=[480])
 
 
 class VersionOut(BaseModel):
@@ -900,6 +910,39 @@ class PlateImportOut(BaseModel):
     #: Capped at 50 entries so a wholly broken file cannot produce a response
     #: larger than the upload.
     errors: list[str] = Field(default_factory=list)
+
+
+class UserCreateIn(BaseModel):
+    """Body of ``POST /api/users`` -- an admin creating an account."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "username": "bekci",
+                    "password": "en-az-8-karakter",
+                    "role": "operator",
+                    "token_ttl_min": 480,
+                }
+            ]
+        },
+    )
+
+    username: str = Field(min_length=3, max_length=40, examples=["bekci"])
+    password: str = Field(min_length=8, max_length=128)
+    role: Literal["admin", "operator"] = Field(default="operator")
+    #: Session length for this account, in minutes. ``None`` inherits the
+    #: policy for the role (365 days for an admin, one 8-hour shift for an
+    #: operator), which is what makes the policy retunable centrally.
+    token_ttl_min: int | None = Field(default=None, ge=1, le=1_051_200)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _clean_username(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class ErrorOut(BaseModel):

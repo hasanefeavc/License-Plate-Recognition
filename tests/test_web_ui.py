@@ -213,6 +213,7 @@ def test_the_script_targets_endpoints_the_api_actually_exposes() -> None:
         "/api/plates/import",
         "/api/plates/export",
         "/api/events/export",
+        "/api/users",
     ):
         assert path in script, f"{path} not referenced by app.js"
         assert path in known, f"{path} is not a real route"
@@ -600,12 +601,23 @@ def test_the_session_is_restored_from_local_storage_and_verified() -> None:
 
 
 def test_the_login_form_takes_credentials_not_a_token() -> None:
-    """Nobody should ever be asked to paste a JWT."""
+    """Nobody should ever be asked to paste a JWT.
+
+    Checked as "no input collects a token" rather than "the word token does not
+    appear": the markup legitimately explains the bootstrap flow in a comment,
+    and a substring search on prose is not the claim being made.
+    """
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    form = html[html.index('id="login-form"') : html.index("</form>")]
+
     assert 'id="login-username"' in html
     assert 'id="login-password"' in html
     assert 'type="password"' in html
-    assert "token" not in html[html.index('id="login-form"') : html.index("</form>")].lower()
+
+    inputs = re.findall(r"<input[^>]*>", form)
+    assert inputs, "the login form should have inputs"
+    for tag in inputs:
+        assert "token" not in tag.lower(), f"an input collects a token: {tag}"
 
 
 def test_the_owner_column_reads_as_a_name_with_the_flat_in_brackets() -> None:
@@ -626,3 +638,83 @@ def test_the_logout_button_is_labelled_for_the_operator() -> None:
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     button = html[html.index('id="btn-logout"') :]
     assert "Çıkış Yap" in button[: button.index("</button>")]
+
+
+# ---------------------------------------------------------------------------
+# User management
+# ---------------------------------------------------------------------------
+
+
+def test_the_users_button_starts_hidden() -> None:
+    """It is revealed only for an admin; every endpoint behind it is 403 to others."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    button = html[html.index('id="btn-users"') :]
+    assert "hidden" in button[: button.index(">")]
+
+
+def test_the_users_button_is_revealed_only_for_an_admin() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function updateControls") :]
+    body = body[: body.index("\n  }\n")]
+    assert 'el["btn-users"].hidden = !isAdmin' in body
+
+
+def test_the_role_chips_are_visually_distinct() -> None:
+    """Purple for Yönetici, teal for Operatör — the brief's own vocabulary."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    block = script[script.index("const ROLE_CHIPS") :]
+    block = block[: block.index("\n  };")]
+
+    assert "Yönetici" in block and "purple" in block
+    assert "Operatör" in block and "teal" in block
+
+
+def test_the_user_table_shows_the_session_length() -> None:
+    """The whole point of the role split is visible here or it is invisible."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "OTURUM" in html
+    body = script[script.index("function formatSession") :]
+    body = body[: body.index("\n  }\n")]
+    assert "365 gün" in body and "8 saat" in body, "a blank TTL must name the role default"
+
+
+def test_the_add_user_form_offers_both_roles_and_a_session_choice() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    form = html[html.index('id="user-form"') : html.index("</form>", html.index('id="user-form"'))]
+    assert 'value="operator"' in form and 'value="admin"' in form
+    assert 'id="user-ttl"' in form
+    assert 'minlength="8"' in form, "the password floor the API enforces"
+
+
+def test_deleting_a_user_asks_first() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function removeUser") :]
+    body = body[: body.index("\n  }\n")]
+    assert body.index("window.confirm") < body.index('method: "DELETE"')
+
+
+def test_the_delete_button_is_disabled_on_your_own_row() -> None:
+    """The server refuses it; saying so beats collecting a 400."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderUsers") :]
+    body = body[: body.index("\n  }\n")]
+    assert "isSelf" in body and "remove.disabled = true" in body
+
+
+def test_the_bootstrap_button_is_hidden_until_the_server_asks_for_setup() -> None:
+    """Public registration applies to the first account only.
+
+    Leaving the button up advertises an action that can only fail, and reads
+    like open sign-up on a gate controller.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    button = html[html.index('id="login-register"') :]
+    assert "hidden" in button[: button.index(">")]
+
+    body = script[script.index("async function applySetupState") :]
+    body = body[: body.index("\n  }\n")]
+    assert "setup_required" in body and "/health" in body
+    assert "button.hidden = true;" in body, "default to hidden, reveal on proof"

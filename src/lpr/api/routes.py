@@ -61,6 +61,7 @@ from lpr.api.schemas import (
     SystemEventOut,
     SystemUpdateOut,
     TokenOut,
+    UserCreateIn,
     UserOut,
     VersionOut,
     normalize_plate,
@@ -166,8 +167,23 @@ async def _in_thread_kw(func: Any, *args: Any, **kwargs: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _setup_required(user_repo: Any) -> bool:
+    """True while the installation has no accounts at all.
+
+    Read on the unauthenticated health probe, so it must never raise: a
+    database that cannot be reached reports ``False``, which makes the login
+    screen offer sign-in rather than advertising public registration on a
+    system whose user table it simply could not read.
+    """
+    try:
+        return bool(user_repo.is_first_user())
+    except Exception:
+        logger.debug("Kurulum durumu okunamadı", exc_info=True)
+        return False
+
+
 @router.get("/health", response_model=HealthOut, tags=["health"], summary="Servis sağlığı")
-async def health(request: Request) -> HealthOut:
+async def health(request: Request, user_repo: deps.UserRepo) -> HealthOut:
     """Unauthenticated liveness/readiness probe.
 
     Answers 200 even when the pipeline never started -- the Docker HEALTHCHECK
@@ -184,8 +200,10 @@ async def health(request: Request) -> HealthOut:
             pipeline_running=False,
             cameras={role.value: False for role in CameraRole},
             detail=str(detail) if detail else "İşlem hattı başlatılamadı",
+            setup_required=_setup_required(user_repo),
         )
 
+    setup_required = _setup_required(user_repo)
     try:
         running = bool(getattr(pipeline, "running", False))
         cameras = {
@@ -203,6 +221,7 @@ async def health(request: Request) -> HealthOut:
             pipeline_running=False,
             cameras={role.value: False for role in CameraRole},
             detail="İstatistikler okunamadı",
+            setup_required=setup_required,
         )
 
     healthy = running and any(cameras.values())
@@ -212,6 +231,7 @@ async def health(request: Request) -> HealthOut:
         pipeline_running=running,
         cameras=cameras,
         detail=None if healthy else "Kamera bağlantısı yok",
+        setup_required=setup_required,
     )
 
 
@@ -234,12 +254,29 @@ async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
             detail="Kullanıcı adı veya parola hatalı",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    # Session length follows the account: an admin stays signed in, an operator
+    # gets a shift. A per-account override on the row beats both.
+    ttl_min = await _account_ttl(user_repo, user.username)
     return TokenOut(
-        access_token=create_token(user.username, user.role),
-        expires_in=token_ttl_seconds(),
+        access_token=create_token(user.username, user.role, ttl_min),
+        expires_in=token_ttl_seconds(user.role, ttl_min),
         username=user.username,
         role=user.role,
     )
+
+
+async def _account_ttl(user_repo: Any, username: str) -> int | None:
+    """The per-account session override, or ``None`` to use the role policy."""
+    getter = getattr(user_repo, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        row = await _in_thread(getter, username)
+    except Exception:  # pragma: no cover - repository failure
+        logger.debug("Oturum süresi okunamadı: %s", username, exc_info=True)
+        return None
+    value = (row or {}).get("token_ttl_min")
+    return int(value) if value else None
 
 
 @router.post(
@@ -252,9 +289,7 @@ async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
 async def register(
     payload: RegisterIn,
     user_repo: deps.UserRepo,
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None, Depends(_optional_bearer)
-    ] = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> TokenOut:
     """Create an account.
 
@@ -299,7 +334,7 @@ async def register(
     logger.info("Yeni kullanıcı oluşturuldu: %s (%s)", payload.username, role)
     return TokenOut(
         access_token=create_token(payload.username, role),
-        expires_in=token_ttl_seconds(),
+        expires_in=token_ttl_seconds(role),
         username=payload.username,
         role=role,
     )
@@ -317,15 +352,148 @@ async def whoami(user: CurrentUser) -> UserOut:
     summary="Kullanıcıları listele",
 )
 async def list_users(_: AdminUser, user_repo: deps.UserRepo) -> list[UserOut]:
+    """Every account. Admin only, and never carries password material."""
     rows = await _in_thread(user_repo.list_users)
-    return [
-        UserOut(
-            username=str(row.get("username", "")),
-            role=str(row.get("role") or "operator"),
-            created_at=(str(row["created_at"]) if row.get("created_at") else None),
+    return [_user_out(row) for row in rows]
+
+
+def _user_out(row: dict[str, Any]) -> UserOut:
+    ttl = row.get("token_ttl_min")
+    return UserOut(
+        username=str(row.get("username", "")),
+        role=str(row.get("role") or "operator"),
+        created_at=(str(row["created_at"]) if row.get("created_at") else None),
+        token_ttl_min=int(ttl) if ttl else None,
+    )
+
+
+@router.post(
+    "/api/users",
+    response_model=UserOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["auth"],
+    summary="Kullanıcı oluştur",
+)
+async def create_user(payload: UserCreateIn, _: AdminUser, user_repo: deps.UserRepo) -> UserOut:
+    """Create an account. Admin only.
+
+    Separate from ``POST /api/auth/register``, which exists for the one
+    unauthenticated case: the very first account on a fresh installation. This
+    endpoint is the ordinary path and always requires an admin token, so the
+    bootstrap hole stays exactly one account wide.
+
+    ``token_ttl_min`` sets how long this account's sessions last; leaving it
+    unset inherits the policy for the role.
+    """
+    created = await _in_thread_kw(
+        user_repo.register,
+        payload.username,
+        payload.password,
+        payload.role,
+        token_ttl_min=payload.token_ttl_min,
+    )
+    if not created:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Kullanıcı adı zaten kayıtlı: {payload.username}",
         )
-        for row in rows
-    ]
+
+    logger.info(
+        "Kullanıcı oluşturuldu: %s (rol=%s, oturum=%s dk)",
+        payload.username,
+        payload.role,
+        payload.token_ttl_min or "rol varsayılanı",
+    )
+    row = await _in_thread(user_repo.get, payload.username) if hasattr(user_repo, "get") else None
+    return _user_out(
+        row
+        or {
+            "username": payload.username,
+            "role": payload.role,
+            "token_ttl_min": payload.token_ttl_min,
+        }
+    )
+
+
+@router.delete(
+    "/api/users/{username}",
+    response_model=UserOut,
+    tags=["auth"],
+    summary="Kullanıcı sil",
+)
+async def delete_user(
+    user: AdminUser,
+    user_repo: deps.UserRepo,
+    username: Annotated[str, Path(min_length=1, max_length=40, examples=["bekci"])],
+) -> UserOut:
+    """Delete an account. Admin only, with two refusals, checked in this order.
+
+    **You cannot delete the last admin.** There is no recovery path: with no
+    admin account left nobody can create one, and the installation needs its
+    database edited by hand. ``POST /api/auth/register`` will not help --
+    it only bootstraps when the user table is *entirely* empty.
+
+    **You cannot delete yourself.** The request would succeed and then
+    immediately invalidate the token that made it, which reads as the dashboard
+    breaking. Ask another admin.
+
+    The last-admin check comes first because when both apply -- the sole
+    administrator deleting their own account -- it is the one that says what to
+    do next.
+
+    Deletion takes effect immediately rather than at token expiry: every
+    request re-checks the account behind its token (see
+    :func:`lpr.api.security.resolve_live_user`), which is what makes this
+    meaningful against an admin session that lasts a year.
+    """
+    name = username.strip()
+    existing = await _in_thread(user_repo.get, name) if hasattr(user_repo, "get") else None
+    if existing is None:
+        # Fall back to the list for a repository without get(), so the 404
+        # below is still accurate rather than a blind delete.
+        rows = await _in_thread(user_repo.list_users)
+        existing = next((r for r in rows if str(r.get("username")) == name), None)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Kullanıcı bulunamadı: {name}",
+        )
+
+    # Order matters. When the last admin tries to delete themselves both rules
+    # apply, and "you cannot remove the last administrator" is the one that
+    # tells them what to do about it -- create another admin first. Checking
+    # self-deletion first would answer with "ask another admin" on an
+    # installation where there is no other admin to ask.
+    if str(existing.get("role")) == ADMIN_ROLE and await _last_admin(user_repo):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Son yönetici hesabı silinemez. Önce başka bir yönetici oluşturun.",
+        )
+
+    if name == user.username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Kendi hesabınızı silemezsiniz. Başka bir yöneticiden isteyin.",
+        )
+
+    removed = await _in_thread(user_repo.delete, name)
+    if not removed:  # pragma: no cover - raced with another delete
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Kullanıcı bulunamadı: {name}",
+        )
+
+    logger.warning("Kullanıcı silindi: %s (silen: %s)", name, user.username)
+    return _user_out(existing)
+
+
+async def _last_admin(user_repo: Any) -> bool:
+    """True when exactly one admin account remains."""
+    counter = getattr(user_repo, "count_by_role", None)
+    if callable(counter):
+        return int(await _in_thread(counter, ADMIN_ROLE)) <= 1
+    rows = await _in_thread(user_repo.list_users)
+    return sum(1 for row in rows if str(row.get("role")) == ADMIN_ROLE) <= 1
 
 
 # ---------------------------------------------------------------------------
@@ -846,9 +1014,7 @@ async def submit_license(
         activated = await _in_thread(guard.activate, payload.key)
     except LicenseError as exc:
         logger.warning("Lisans anahtarı reddedildi (kullanıcı: %s): %s", user.username, exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     deps.apply_license_state(request.app, activated.valid)
     logger.info(
@@ -931,9 +1097,7 @@ async def trigger_relay(
 
 async def stream_user(
     token: Annotated[str | None, Query(description="Bearer token (tarayıcı <img> için)")] = None,
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None, Depends(_optional_bearer)
-    ] = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> AuthUser:
     """Auth for the MJPEG endpoint.
 

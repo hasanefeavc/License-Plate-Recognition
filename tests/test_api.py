@@ -422,7 +422,11 @@ def test_login_returns_token_that_authorises_calls(
 
     me = api_client.get("/api/auth/me", headers=auth(token))
     assert me.status_code == 200
-    assert me.json() == {"username": "mudur", "role": "admin", "created_at": None}
+    body = me.json()
+    # Field-wise: UserOut gained token_ttl_min, and an exact match would turn
+    # every additive field into a breakage.
+    assert body["username"] == "mudur"
+    assert body["role"] == "admin"
 
 
 def test_login_with_wrong_password_is_401(
@@ -1502,3 +1506,281 @@ def test_a_patch_rejects_unknown_fields(detail_client: TestClient, admin_token: 
         "/api/plates/34ABC123", headers=auth(admin_token), json={"blokked": True}
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# User management and role-scoped sessions
+# ---------------------------------------------------------------------------
+
+
+class ManagedUserRepository:
+    """A user repository with the schema-v5 surface the routes use.
+
+    Self-contained rather than subclassing ``FakeUserRepository``: that one
+    stores ``(password, role)`` tuples, and the routes under test want rows
+    carrying ``created_at`` and ``token_ttl_min`` too.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.passwords: dict[str, str] = {}
+
+    def is_first_user(self) -> bool:
+        return not self.rows
+
+    def exists(self, username: str) -> bool:
+        return (username or "").strip() in self.rows
+
+    def verify(self, username: str, password: str) -> bool:
+        return self.passwords.get((username or "").strip()) == password
+
+    def register(
+        self,
+        username: str,
+        password: str,
+        role: str = "operator",
+        token_ttl_min: int | None = None,
+    ) -> bool:
+        name = (username or "").strip()
+        if not name or name in self.rows:
+            return False
+        self.rows[name] = {
+            "username": name,
+            "role": role,
+            "created_at": "2026-08-27T00:00:00+00:00",
+            "token_ttl_min": token_ttl_min,
+        }
+        self.passwords[name] = password
+        return True
+
+    def get(self, username: str) -> dict[str, Any] | None:
+        return self.rows.get((username or "").strip())
+
+    def list_users(self) -> list[dict[str, Any]]:
+        return [self.rows[key] for key in sorted(self.rows)]
+
+    def count_by_role(self, role: str) -> int:
+        return sum(1 for row in self.rows.values() if row["role"] == role)
+
+    def delete(self, username: str) -> bool:
+        name = (username or "").strip()
+        self.passwords.pop(name, None)
+        return self.rows.pop(name, None) is not None
+
+
+@pytest.fixture()
+def users_repo() -> ManagedUserRepository:
+    repo = ManagedUserRepository()
+    repo.register("mudur", "parola1234", "admin")
+    repo.register("bekci", "parola1234", "operator")
+    return repo
+
+
+@pytest.fixture()
+def users_client(api_app: Any, users_repo: ManagedUserRepository) -> TestClient:
+    api_app.dependency_overrides[deps.get_user_repository] = lambda: users_repo
+    return TestClient(api_app)
+
+
+def admin_auth() -> dict[str, str]:
+    return auth(create_token("mudur", "admin"))
+
+
+# -- listing ----------------------------------------------------------------
+
+
+def test_listing_users_requires_admin(
+    users_client: TestClient, operator_token: str
+) -> None:
+    assert users_client.get("/api/users").status_code == 401
+    assert users_client.get("/api/users", headers=auth(operator_token)).status_code == 403
+
+
+def test_listing_users_never_returns_password_material(
+    users_client: TestClient
+) -> None:
+    """A leaked hash is an offline cracking target; it must not leave the box."""
+    response = users_client.get("/api/users", headers=admin_auth())
+    assert response.status_code == 200
+    body = response.text.lower()
+    assert "password" not in body and "hash" not in body
+
+
+def test_listing_users_reports_the_session_length(users_client: TestClient) -> None:
+    rows = users_client.get("/api/users", headers=admin_auth()).json()
+    assert {row["username"] for row in rows} == {"mudur", "bekci"}
+    assert all("token_ttl_min" in row for row in rows)
+
+
+# -- creation ---------------------------------------------------------------
+
+
+def test_creating_a_user_requires_admin(
+    users_client: TestClient, operator_token: str
+) -> None:
+    payload = {"username": "yeni", "password": "parola1234"}
+    assert users_client.post("/api/users", json=payload).status_code == 401
+    assert (
+        users_client.post("/api/users", json=payload, headers=auth(operator_token)).status_code
+        == 403
+    )
+
+
+def test_an_admin_creates_an_operator(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    response = users_client.post(
+        "/api/users",
+        headers=admin_auth(),
+        json={"username": "yeni", "password": "parola1234", "role": "operator"},
+    )
+    assert response.status_code == 201
+    assert response.json()["role"] == "operator"
+    assert users_repo.rows["yeni"]["role"] == "operator"
+
+
+def test_a_per_account_session_length_is_stored(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    users_client.post(
+        "/api/users",
+        headers=admin_auth(),
+        json={"username": "gece", "password": "parola1234", "token_ttl_min": 60},
+    )
+    assert users_repo.rows["gece"]["token_ttl_min"] == 60
+
+
+def test_a_duplicate_username_is_a_conflict(users_client: TestClient) -> None:
+    response = users_client.post(
+        "/api/users", headers=admin_auth(), json={"username": "bekci", "password": "parola1234"}
+    )
+    assert response.status_code == 409
+
+
+def test_a_short_password_is_rejected(users_client: TestClient) -> None:
+    """8 characters is the floor; the form says so and the API enforces it."""
+    response = users_client.post(
+        "/api/users", headers=admin_auth(), json={"username": "yeni", "password": "kisa"}
+    )
+    assert response.status_code == 422
+
+
+def test_an_unknown_role_is_rejected(users_client: TestClient) -> None:
+    response = users_client.post(
+        "/api/users",
+        headers=admin_auth(),
+        json={"username": "yeni", "password": "parola1234", "role": "superuser"},
+    )
+    assert response.status_code == 422
+
+
+# -- deletion ---------------------------------------------------------------
+
+
+def test_deleting_a_user_requires_admin(
+    users_client: TestClient, operator_token: str
+) -> None:
+    assert users_client.delete("/api/users/bekci").status_code == 401
+    assert (
+        users_client.delete("/api/users/bekci", headers=auth(operator_token)).status_code == 403
+    )
+
+
+def test_an_admin_deletes_an_operator(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    response = users_client.delete("/api/users/bekci", headers=admin_auth())
+    assert response.status_code == 200
+    assert "bekci" not in users_repo.rows
+
+
+def test_deleting_an_unknown_user_is_a_404(users_client: TestClient) -> None:
+    assert users_client.delete("/api/users/yok", headers=admin_auth()).status_code == 404
+
+
+def test_an_admin_cannot_delete_their_own_account(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """The request would succeed and then invalidate the token that made it."""
+    users_repo.register("mudur2", "parola1234", "admin")  # so the last-admin rule does not apply
+    response = users_client.delete("/api/users/mudur", headers=admin_auth())
+    assert response.status_code == 400
+    assert "mudur" in users_repo.rows
+
+
+def test_the_last_admin_cannot_be_deleted(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """There is no recovery: with no admin left, nobody can create one."""
+    response = users_client.delete("/api/users/mudur", headers=admin_auth())
+    assert response.status_code == 409
+    assert "yönetici" in response.json()["error"]["detail"].lower()
+    assert users_repo.count_by_role("admin") == 1
+
+
+def test_the_last_admin_rule_is_checked_before_the_self_rule(
+    users_client: TestClient
+) -> None:
+    """When both apply, the last-admin message is the one that says what to do.
+
+    "Ask another admin" is unhelpful on an installation with no other admin.
+    """
+    response = users_client.delete("/api/users/mudur", headers=admin_auth())
+    assert response.status_code == 409, "409 is the last-admin refusal, 400 the self one"
+
+
+def test_an_admin_can_be_deleted_while_another_remains(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    users_repo.register("mudur2", "parola1234", "admin")
+    assert users_client.delete("/api/users/mudur2", headers=admin_auth()).status_code == 200
+
+
+# -- session length ---------------------------------------------------------
+
+
+def test_an_admin_login_issues_a_long_session(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    response = users_client.post(
+        "/api/auth/login", json={"username": "mudur", "password": "parola1234"}
+    )
+    assert response.status_code == 200
+    assert response.json()["expires_in"] >= 300 * 86400, "an admin should stay signed in"
+
+
+def test_an_operator_login_issues_a_shift_session(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    response = users_client.post(
+        "/api/auth/login", json={"username": "bekci", "password": "parola1234"}
+    )
+    assert response.json()["expires_in"] == 8 * 3600
+
+
+def test_a_per_account_override_beats_the_role_policy(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    users_repo.register("gece", "parola1234", "operator", token_ttl_min=60)
+    response = users_client.post(
+        "/api/auth/login", json={"username": "gece", "password": "parola1234"}
+    )
+    assert response.json()["expires_in"] == 3600
+
+
+# -- bootstrap signalling ---------------------------------------------------
+
+
+def test_health_reports_setup_required_on_an_empty_installation(
+    api_app: Any
+) -> None:
+    """The login screen reads this to decide whether to offer bootstrap."""
+    empty = ManagedUserRepository()
+    api_app.dependency_overrides[deps.get_user_repository] = lambda: empty
+    assert TestClient(api_app).get("/health").json()["setup_required"] is True
+
+
+def test_health_stops_advertising_setup_once_an_account_exists(
+    users_client: TestClient
+) -> None:
+    assert users_client.get("/health").json()["setup_required"] is False

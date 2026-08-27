@@ -264,7 +264,8 @@ def init_db(force: bool = False) -> None:
         with transaction() as tx:
             for statement in schema.ALL_DDL:
                 tx.execute(statement)
-            _add_missing_plate_columns(tx)
+            _add_missing_columns(tx, "plates", schema.PLATES_ADDED_COLUMNS)
+            _add_missing_columns(tx, "users", schema.USERS_ADDED_COLUMNS)
             tx.execute(
                 schema.UPSERT_SCHEMA_META,
                 (schema.SCHEMA_VERSION_KEY, str(schema.SCHEMA_VERSION)),
@@ -278,32 +279,33 @@ def init_db(force: bool = False) -> None:
         hide_file(path)
 
 
-def _add_missing_plate_columns(tx: Any) -> None:
-    """Bring a pre-v4 ``plates`` table up to the current shape.
+def _add_missing_columns(tx: Any, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+    """Bring a table created by an older build up to the current shape.
 
     ``CREATE TABLE IF NOT EXISTS`` is a no-op on a table that already exists,
-    so a database created by an older build keeps its three-column ``plates``
-    and every query naming ``owner`` fails at runtime. This closes that gap the
-    only way SQLite allows: ``ALTER TABLE ADD COLUMN``, one column at a time.
+    so a database created before a column was introduced keeps the old shape
+    and every query naming that column fails at runtime. This closes the gap
+    the only way SQLite allows: ``ALTER TABLE ADD COLUMN``, one at a time.
 
     Safe to run on every start. It reads the live column list first and issues
     nothing when the table is already current, so the common path costs one
-    ``PRAGMA``.
+    ``PRAGMA``. ``table`` is a module constant, never anything a caller
+    supplied, which is what makes the interpolation below safe.
     """
     try:
-        existing = {str(row[1]) for row in tx.execute("PRAGMA table_info(plates)")}
+        existing = {str(row[1]) for row in tx.execute(f"PRAGMA table_info({table})")}  # noqa: S608
     except Exception:  # pragma: no cover - table always exists by this point
-        logger.debug("Could not inspect the plates table", exc_info=True)
+        logger.debug("Could not inspect the %s table", table, exc_info=True)
         return
 
-    for column, statement in schema.PLATES_ADDED_COLUMNS:
+    for column, statement in columns:
         if column in existing:
             continue
         try:
             tx.execute(statement)
-            logger.info("Migrated plates: added column %s", column)
+            logger.info("Migrated %s: added column %s", table, column)
         except Exception:  # pragma: no cover - raced with another process
-            logger.warning("Could not add plates.%s", column, exc_info=True)
+            logger.warning("Could not add %s.%s", table, column, exc_info=True)
 
 
 def schema_version() -> int:
