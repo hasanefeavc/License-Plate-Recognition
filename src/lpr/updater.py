@@ -282,30 +282,77 @@ class SystemUpdater:
     def version(self) -> VersionInfo:
         """What is deployed right now.
 
-        Falls back to the packaged version string whenever git is unavailable
-        (no binary, not a checkout, image built from a tarball), because a
-        container that cannot introspect its own commit must still be able to
-        answer "what am I running".
-        """
-        from lpr.api.routes import app_version
+        ``version`` is the string a human reads. It comes from
+        ``git describe --tags --always``, which returns the most meaningful
+        name the repository can offer for this exact commit:
 
-        base = app_version()
+        ==========================  ===========================================
+        Repository state            ``version``
+        ==========================  ===========================================
+        HEAD is tagged              ``v1.0.0``
+        two commits past a tag      ``v1.0.0-2-g6845136``
+        no tags anywhere            ``6845136``  (``--always``, a bare hash)
+        no git / not a checkout     the packaged version, e.g. ``0.1.0``
+        ==========================  ===========================================
+
+        A release build therefore shows ``v1.0.0`` instead of a hash, and a
+        build between releases still shows *which* release it is ahead of --
+        far more use to somebody reading it over the phone than ``6845136``.
+
+        The raw hashes stay available in ``commit`` and ``short_commit``.
+        They are facts about identity rather than labels for display, and two
+        things depend on that distinction: support wants the exact hash, and
+        the dashboard detects that an OTA update actually replaced the process
+        by watching ``commit`` change. A describe string is the wrong signal
+        for that -- tagging an already-deployed commit changes the describe
+        output without deploying anything.
+
+        Every step degrades independently: no tags still yields a hash, no git
+        still yields the packaged version. There is no repository state in
+        which this raises or returns an empty ``version``.
+        """
+        base = self._package_version()
         if not self._git_available():
             return VersionInfo(version=base)
 
         commit = self._git_value(["git", "rev-parse", "HEAD"])
         if commit is None:
+            # Not a checkout, or a repository with no commits yet.
             return VersionInfo(version=base)
+
         short = self._git_value(["git", "rev-parse", "--short", "HEAD"]) or commit[:7]
         branch = self._git_value(["git", "rev-parse", "--abbrev-ref", "HEAD"])
         dirty = self._git_value(["git", "status", "--porcelain"])
+
+        # --tags so lightweight tags count (a release tagged with `git tag
+        # v1.0.0` is not annotated, and plain --describe would ignore it);
+        # --always so a repository that has never been tagged degrades to a
+        # hash instead of failing.
+        described = self._git_value(["git", "describe", "--tags", "--always"])
+
         return VersionInfo(
-            version=base,
+            version=described or short or base,
             commit=commit,
             short_commit=short,
             branch=branch,
             dirty=bool(dirty),
         )
+
+    @staticmethod
+    def _package_version() -> str:
+        """Version from the installed package metadata; ``0.1.0`` in a checkout.
+
+        Imported from the API layer lazily and behind a broad except: this
+        module is below the API in the dependency order, and a version string
+        is never worth an ImportError at startup.
+        """
+        try:
+            from lpr.api.routes import app_version
+
+            return app_version()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Paket sürümü okunamadı", exc_info=True)
+            return "0.1.0"
 
     def _git_available(self) -> bool:
         return shutil.which("git") is not None

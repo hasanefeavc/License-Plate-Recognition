@@ -933,9 +933,9 @@ class FakeUpdater:
     def version(self) -> Any:
         return types.SimpleNamespace(
             to_dict=lambda: {
-                "version": "0.1.0",
-                "commit": "e46933f0c2a1b8d4",
-                "short_commit": "e46933f",
+                "version": "v1.0.0-2-g6845136",
+                "commit": "6845136fc5071a3e0bdd11d1",
+                "short_commit": "6845136",
                 "branch": "main",
                 "dirty": False,
             }
@@ -990,7 +990,10 @@ def test_version_is_readable_by_an_operator(
     response = update_client.get("/api/system/version", headers=auth(operator_token))
     assert response.status_code == 200
     body = response.json()
-    assert body["short_commit"] == "e46933f"
+    # A readable tag for the eye, the raw hash for identity -- both surfaced.
+    assert body["version"] == "v1.0.0-2-g6845136"
+    assert body["short_commit"] == "6845136"
+    assert body["commit"] == "6845136fc5071a3e0bdd11d1"
     assert body["branch"] == "main"
     assert body["update_enabled"] is True
 

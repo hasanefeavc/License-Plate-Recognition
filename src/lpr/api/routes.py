@@ -741,7 +741,7 @@ async def submit_license(
     "/api/relay/trigger",
     response_model=RelayTriggerOut,
     tags=["relay"],
-    summary="Bariyeri elle aç",
+    summary="Kapıyı elle aç",
 )
 async def trigger_relay(
     request: Request,
@@ -792,7 +792,7 @@ async def trigger_relay(
     except Exception:  # pragma: no cover - logging must not fail the action
         logger.exception("Elle açma kaydı yazılamadı")
 
-    logger.info("Bariyer elle açıldı (kullanıcı: %s)", user.username)
+    logger.info("Kapı elle açıldı (kullanıcı: %s)", user.username)
     return RelayTriggerOut(triggered=True, plate=event.plate, ts=event.ts, detail=None)
 
 

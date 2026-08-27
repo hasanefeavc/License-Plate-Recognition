@@ -635,7 +635,7 @@ class LprApp:
             view.set_paused(self._paused)
         elif kind == "gate_opened":
             view.set_banner(False)
-            logger.info("Bariyer elle açıldı")
+            logger.info("Kapı elle açıldı")
         elif kind == "source_applied":
             view.set_cameras([dict(payload)] if isinstance(payload, dict) else [])
         elif kind == "toast":

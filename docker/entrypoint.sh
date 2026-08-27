@@ -3,6 +3,10 @@
 # POSIX sh (not bash) so it stays portable across minimal base images.
 set -eu
 
+# Mark the mounted repo safe for git operations inside the container
+# to prevent "detected dubious ownership in repository at '/repo'" errors.
+git config --global --add safe.directory /repo 2>/dev/null || true
+
 DATA_DIR="${LPR_APP__DATA_DIR:-/app/data}"
 MODELS_DIR="${LPR_APP__MODELS_DIR:-/app/models}"
 MODEL_FILE="${MODELS_DIR}/plate_yolov8n.pt"

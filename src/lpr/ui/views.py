@@ -20,7 +20,7 @@ frames. Five grid rows, top to bottom::
     row 1  banner         offline / licence warning (gridded on demand)
     row 2  body           camera cards (3fr) | live plate feed (1fr)
     row 3  telemetry      activity line | counters | licence summary
-    row 4  control panel  Bariyeri Aç, Plaka Girişi, Geçmiş, ...
+    row 4  control panel  Kapıyı Aç, Plaka Girişi, Geçmiş, ...
 
 Colours come from :data:`COL_*` and are applied to plain ``tk`` chrome
 (frames and labels) so the dark palette holds even when the ttkbootstrap
@@ -118,7 +118,7 @@ TXT_PLATES_HINT = (
 TXT_PAUSE = "Duraklat"
 TXT_RESUME = "Devam Et"
 TXT_FULLSCREEN = "Tam Ekran (F11)"
-TXT_OPEN_GATE = "Bariyeri Aç"
+TXT_OPEN_GATE = "Kapıyı Aç"
 TXT_LOGOUT = "Oturumu Kapat"
 TXT_UPTIME = "Çalışma Süresi"
 TXT_SOURCE = "Kaynak"

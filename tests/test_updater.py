@@ -117,9 +117,29 @@ def run_to_completion(updater: SystemUpdater) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def test_the_updater_is_disabled_by_default(tmp_settings: Any) -> None:
-    """Shipping a live self-update endpoint by default would be indefensible."""
-    assert SystemUpdater(tmp_settings).enabled is False
+def test_the_updater_is_disabled_by_default() -> None:
+    """Shipping a live self-update endpoint by default would be indefensible.
+
+    Asserted against the config *model*, not against a ``Settings`` built by
+    the fixture. ``Settings`` reads the developer's ``config.yaml`` through its
+    YAML source, so going via the fixture would make this test pass or fail
+    depending on whether whoever ran it happens to have OTA switched on -- and
+    a deployment that legitimately enables the feature would fail its own test
+    suite. The claim here is about the shipped default, so it is the default
+    that gets asserted.
+    """
+    from lpr.config import SystemUpdateConfig
+
+    assert SystemUpdateConfig().enabled is False
+    assert SystemUpdateConfig().auto_update is False
+
+
+def test_the_updater_honours_the_configured_flag(tmp_settings: Any, repo: Path) -> None:
+    """And the flag on Settings is what the updater actually reads."""
+    tmp_settings.system_update.enabled = True
+    assert SystemUpdater(tmp_settings, runner=ScriptedRunner()).enabled is True
+    tmp_settings.system_update.enabled = False
+    assert SystemUpdater(tmp_settings, runner=ScriptedRunner()).enabled is False
 
 
 def test_a_disabled_updater_refuses_to_start(tmp_settings: Any, repo: Path) -> None:
@@ -354,33 +374,92 @@ def test_a_corrupt_state_file_is_ignored(tmp_settings: Any, repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def version_runner(describe: CommandResult | None = None, **extra: CommandResult) -> ScriptedRunner:
+    """A runner answering the four git calls ``version()`` makes."""
+    responses = {
+        "rev-parse --short HEAD": ok("6845136"),
+        "rev-parse --abbrev-ref": ok("main"),
+        "rev-parse HEAD": ok("6845136fc5071a3e0bdd11d1"),
+        "status --porcelain": ok(""),
+        "describe": describe if describe is not None else ok("v1.0.0-2-g6845136"),
+    }
+    responses.update(extra)
+    return ScriptedRunner(responses)
+
+
 def test_version_reports_the_commit_and_branch(tmp_settings: Any, repo: Path) -> None:
-    runner = ScriptedRunner(
-        {
-            "rev-parse --short HEAD": ok("e46933f"),
-            "rev-parse --abbrev-ref": ok("main"),
-            "rev-parse HEAD": ok("e46933f0c2a1b8d4"),
-            "status --porcelain": ok(""),
-        }
-    )
-    info = build(tmp_settings, repo, runner).version()
-    assert info.commit == "e46933f0c2a1b8d4"
-    assert info.short_commit == "e46933f"
+    info = build(tmp_settings, repo, version_runner()).version()
+    assert info.commit == "6845136fc5071a3e0bdd11d1"
+    assert info.short_commit == "6845136"
     assert info.branch == "main"
     assert info.dirty is False
 
 
+def test_version_prefers_a_readable_tag_over_a_raw_hash(tmp_settings: Any, repo: Path) -> None:
+    """The point of the whole exercise: `v1.0.0` reads, `6845136` does not."""
+    info = build(tmp_settings, repo, version_runner(describe=ok("v1.0.0"))).version()
+    assert info.version == "v1.0.0"
+
+
+def test_version_describes_a_build_between_releases(tmp_settings: Any, repo: Path) -> None:
+    """Still says *which* release it is ahead of, and by how much."""
+    info = build(tmp_settings, repo, version_runner()).version()
+    assert info.version == "v1.0.0-2-g6845136"
+
+
+def test_version_asks_git_to_include_lightweight_tags(tmp_settings: Any, repo: Path) -> None:
+    """A release cut with plain `git tag v1.0.0` is not annotated.
+
+    Without --tags, `git describe` ignores it and the UI silently goes back to
+    showing a hash on exactly the builds that were supposed to be readable.
+    """
+    runner = version_runner()
+    build(tmp_settings, repo, runner).version()
+    assert runner.ran("git describe --tags --always")
+
+
+def test_version_falls_back_to_the_hash_when_nothing_is_tagged(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """`--always` yields a bare hash, which is honest rather than empty."""
+    info = build(tmp_settings, repo, version_runner(describe=ok("6845136"))).version()
+    assert info.version == "6845136"
+
+
+def test_version_falls_back_to_the_short_commit_when_describe_fails(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """An empty repository, or a git too old for the flags, must not blank out."""
+    runner = version_runner(describe=fail(128, "fatal: bad revision"))
+    info = build(tmp_settings, repo, runner).version()
+    assert info.version == "6845136"
+    assert info.commit == "6845136fc5071a3e0bdd11d1"
+
+
+def test_version_is_never_empty(tmp_settings: Any, repo: Path) -> None:
+    """Whatever git does, the UI always has something to print."""
+    runner = ScriptedRunner({"git": fail(1, "everything is broken")})
+    assert build(tmp_settings, repo, runner).version().version
+
+
 def test_version_flags_a_dirty_checkout(tmp_settings: Any, repo: Path) -> None:
     """A dirty tree is exactly what will make the --ff-only pull fail."""
-    runner = ScriptedRunner(
-        {
-            "rev-parse --short HEAD": ok("e46933f"),
-            "rev-parse --abbrev-ref": ok("main"),
-            "rev-parse HEAD": ok("e46933f0"),
-            "status --porcelain": ok(" M src/lpr/config.py"),
-        }
-    )
+    runner = version_runner(**{"status --porcelain": ok(" M src/lpr/config.py")})
     assert build(tmp_settings, repo, runner).version().dirty is True
+
+
+def test_the_version_label_is_not_the_build_identity(tmp_settings: Any, repo: Path) -> None:
+    """Tagging an already-deployed commit changes the label, not the build.
+
+    The dashboard detects a completed OTA update by watching ``commit``. If it
+    watched ``version`` instead, adding a tag to a running deployment would
+    look like a successful update that never happened.
+    """
+    before = build(tmp_settings, repo, version_runner(describe=ok("v1.0.0-2-g6845136")))
+    after = build(tmp_settings, repo, version_runner(describe=ok("v2.0.0")))
+
+    assert before.version().version != after.version().version
+    assert before.version().commit == after.version().commit
 
 
 def test_version_falls_back_when_git_says_nothing(tmp_settings: Any, repo: Path) -> None:
@@ -396,9 +475,7 @@ def test_version_falls_back_when_git_says_nothing(tmp_settings: Any, repo: Path)
 # ---------------------------------------------------------------------------
 
 
-def test_the_check_fetches_without_touching_the_working_tree(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_the_check_fetches_without_touching_the_working_tree(tmp_settings: Any, repo: Path) -> None:
     """It runs on a schedule against a live site, so it must be read-only."""
     runner = ScriptedRunner({"rev-list": ok("0")})
     build(tmp_settings, repo, runner).check_for_updates()
@@ -411,9 +488,7 @@ def test_the_check_fetches_without_touching_the_working_tree(
         assert "merge" not in command
 
 
-def test_the_check_counts_commits_rather_than_parsing_status(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_the_check_counts_commits_rather_than_parsing_status(tmp_settings: Any, repo: Path) -> None:
     """Porcelain status text is localised and shifts between git versions."""
     runner = ScriptedRunner({"rev-list": ok("3")})
     state = build(tmp_settings, repo, runner).check_for_updates()
@@ -442,9 +517,7 @@ def test_a_failed_fetch_is_distinguishable_from_being_current(
     assert "ağ" in state.detail.lower()
 
 
-def test_the_check_uses_the_configured_remote_branch(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_the_check_uses_the_configured_remote_branch(tmp_settings: Any, repo: Path) -> None:
     runner = ScriptedRunner({"rev-list": ok("1")})
     build(
         tmp_settings, repo, runner, git_remote="upstream", git_branch="stable"
@@ -461,9 +534,7 @@ def test_the_check_declines_outside_a_checkout(tmp_settings: Any, tmp_path: Path
     assert state.checked is False
 
 
-def test_an_unparseable_count_is_not_treated_as_an_update(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_an_unparseable_count_is_not_treated_as_an_update(tmp_settings: Any, repo: Path) -> None:
     runner = ScriptedRunner({"rev-list": ok("not-a-number")})
     state = build(tmp_settings, repo, runner).check_for_updates()
     assert state.checked is False
