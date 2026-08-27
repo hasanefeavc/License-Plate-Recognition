@@ -9,7 +9,8 @@ The OCR pre-pass (:func:`enhance_plate`) is where a large share of the
 recognition accuracy comes from. Plate crops out of a 720p frame are often
 20-30 px tall, low contrast at night and washed out in daylight; feeding that
 straight to a recogniser wastes most of the model's capability. Upscaling to a
-sane character height, equalising local contrast with CLAHE, sharpening the
+sane character height, normalising the exposure of a crop shot under a
+headlight or in deep shadow, equalising local contrast with CLAHE, sharpening the
 stroke edges back up with an unsharp mask and offering a binarised variant
 alongside the grayscale one gives the recogniser several very different shots
 at the same crop.
@@ -31,6 +32,7 @@ here it changes what the *detector* sees.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -41,13 +43,17 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "EnhancedCrop",
     "LetterboxResult",
+    "apply_gamma",
+    "auto_gamma",
     "crop_with_padding",
     "deskew",
     "enhance_frame",
     "enhance_plate",
     "letterbox",
+    "normalize_lighting",
     "rectify_perspective",
     "sharpness",
+    "stretch_contrast",
     "unsharp_mask",
 ]
 
@@ -86,6 +92,41 @@ UNSHARP_THRESHOLD = 4
 FRAME_CLAHE_CLIP_LIMIT = 2.0
 FRAME_CLAHE_TILE_GRID = (8, 8)
 FRAME_UNSHARP_AMOUNT = 0.5
+
+#: Healthy mean-luminance band for a plate crop, normalised to 0..1.
+#:
+#: Deliberately *not* a single mid-grey target. A plate is bimodal by
+#: construction -- dark glyphs on a light field -- so a correctly exposed one
+#: sits around 0.7, and its exact mean says more about how many characters it
+#: carries than about its exposure. Driving that to mid grey would "correct"
+#: every well-lit plate in the country. Instead the band marks the range in
+#: which no correction is needed at all; only a crop outside it is pulled back
+#: to the nearest edge, which keeps the intervention minimal and directional.
+GAMMA_HEALTHY_LOW = 0.35
+GAMMA_HEALTHY_HIGH = 0.78
+
+#: Gamma is bounded. Outside this range the exponent is no longer correcting an
+#: exposure, it is inventing detail in pixels that were clipped to 0 or 255 at
+#: the sensor -- and a plate blown out that badly is better recovered from the
+#: next frame than from arithmetic.
+MIN_GAMMA = 0.4
+MAX_GAMMA = 2.5
+
+#: Percentiles used by :func:`stretch_contrast`. Plain min/max scaling is
+#: hostage to a single specular highlight or one dead pixel; clipping a couple
+#: of percent off each end is what makes the stretch robust on a muddy plate
+#: with a bright rivet in the corner.
+CONTRAST_LOW_PERCENTILE = 2.0
+CONTRAST_HIGH_PERCENTILE = 98.0
+
+#: Don't stretch a crop whose usable range is already this wide -- there is
+#: nothing to gain, and amplifying it only amplifies noise with it.
+MIN_STRETCH_RANGE = 200
+
+#: Below this spread between the percentiles the crop carries no recoverable
+#: contrast at all (a uniform grey wall, a fully blown-out plate). Stretching
+#: it would multiply sensor noise up into fake structure.
+MIN_USABLE_RANGE = 8
 
 #: Perspective rectification bounds. A quadrilateral covering less than this
 #: fraction of the crop is a glyph or a mounting bolt, not the plate outline.
@@ -264,6 +305,7 @@ def enhance_plate(
     crop: np.ndarray,
     target_height: int = TARGET_CROP_HEIGHT,
     unsharp_amount: float = UNSHARP_AMOUNT,
+    normalize_light: bool = True,
 ) -> EnhancedCrop:
     """Prepare a plate crop for OCR.
 
@@ -274,10 +316,14 @@ def enhance_plate(
     and keeps the better read -- binarisation wins on clean high-contrast
     plates and loses badly on shadowed ones, so neither can be the only option.
 
-    The step order is load-bearing. CLAHE first, because sharpening a crop
-    whose characters are still buried in shadow only sharpens the shadow.
-    Denoise second, so the unsharp mask has no isolated hot pixels left to
-    amplify. Sharpen third, which puts back the stroke edges the bilateral
+    The step order is load-bearing. Global exposure first
+    (:func:`normalize_lighting`: dynamic gamma, then a percentile contrast
+    stretch), because everything downstream assumes a sanely-exposed crop --
+    CLAHE in particular works per tile and will amplify the noise inside a
+    black tile to full scale if the crop arrives underexposed. CLAHE second,
+    for the local contrast that separates a character from a dirty plate.
+    Denoise third, so the unsharp mask has no isolated hot pixels left to
+    amplify. Sharpen fourth, which puts back the stroke edges the bilateral
     filter softened. Binarise last, off the sharpened image, because a crisper
     edge is exactly what makes the adaptive threshold land on the glyph
     boundary instead of a few pixels inside it.
@@ -299,6 +345,10 @@ def enhance_plate(
                 new_w = max(1, int(round(gray.shape[1] * factor)))
                 new_h = max(1, int(round(height * factor)))
                 gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+        # Global exposure before local contrast -- see the docstring.
+        if normalize_light:
+            gray = normalize_lighting(gray)
 
         clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
         gray = clahe.apply(gray)
@@ -627,3 +677,135 @@ def rectify_perspective(crop: np.ndarray) -> np.ndarray | None:
     except Exception:
         logger.debug("rectify_perspective failed", exc_info=True)
         return None
+
+
+def auto_gamma(
+    image: np.ndarray,
+    low: float = GAMMA_HEALTHY_LOW,
+    high: float = GAMMA_HEALTHY_HIGH,
+) -> float:
+    """Gamma exponent that would pull ``image`` back into a healthy exposure band.
+
+    A crop whose mean luminance already lies inside ``[low, high]`` needs no
+    correction and gets ``1.0``. One that falls outside is pulled back to the
+    *nearest edge* of the band -- not to the middle of it -- by solving
+    ``mean ** gamma == target`` for gamma, i.e.
+    ``gamma = log(target) / log(mean)`` on the mean normalised to 0..1.
+
+    Below 1 the curve brightens a crop shot in deep shadow; above 1 it pulls
+    back one blown out by a headlight or a low winter sun. Correcting only to
+    the band edge keeps the intervention as small as the problem: a plate at
+    0.80 is nudged, a plate at 0.95 is rescued, and the two do not get the same
+    treatment just because both are "too bright".
+
+    Returns ``1.0`` for an unusable image and for the degenerate means (0.0 and
+    1.0) where the logarithm has no answer -- a crop clipped to solid black or
+    solid white has no exposure left to recover.
+    """
+    if not _is_image(image):
+        return 1.0
+    try:
+        gray = to_gray(image)
+        if gray.size == 0:
+            return 1.0
+        mean = float(gray.mean()) / 255.0
+        if low <= mean <= high:
+            return 1.0
+        # log(0) and log(1) are where this stops being solvable at all.
+        if mean <= 0.01 or mean >= 0.99:
+            return 1.0
+
+        target = low if mean < low else high
+        gamma = math.log(max(1e-6, min(1.0 - 1e-6, target))) / math.log(mean)
+        return float(max(MIN_GAMMA, min(MAX_GAMMA, gamma)))
+    except Exception:
+        logger.debug("auto_gamma failed, reporting 1.0", exc_info=True)
+        return 1.0
+
+
+def apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
+    """Apply a gamma curve to ``image`` through a 256-entry lookup table.
+
+    A LUT rather than per-pixel ``pow``: the input is uint8, so there are only
+    256 possible answers, and computing them once turns the correction into a
+    single ``cv2.LUT`` pass. Returns a new array, and returns the input
+    unchanged for a gamma of (effectively) 1.
+    """
+    if not _is_image(image) or abs(float(gamma) - 1.0) < 1e-3:
+        return image
+    try:
+        safe_gamma = max(MIN_GAMMA, min(MAX_GAMMA, float(gamma)))
+        table = np.array(
+            [((value / 255.0) ** safe_gamma) * 255.0 for value in range(256)],
+            dtype=np.float32,
+        )
+        return cv2.LUT(image, np.clip(table, 0, 255).astype(np.uint8))
+    except Exception:
+        logger.debug("apply_gamma failed, returning input unchanged", exc_info=True)
+        return image
+
+
+def stretch_contrast(
+    image: np.ndarray,
+    low_percentile: float = CONTRAST_LOW_PERCENTILE,
+    high_percentile: float = CONTRAST_HIGH_PERCENTILE,
+) -> np.ndarray:
+    """Rescale ``image`` so its percentile range spans the full 0..255.
+
+    Percentile-based rather than min/max: a single specular highlight off a
+    rivet, or one dead pixel, pins a min/max stretch to the extremes and
+    achieves nothing. Clipping a couple of percent off each end makes the
+    scaling reflect the bulk of the crop instead.
+
+    Returns the input unchanged when the range is already wide enough to gain
+    nothing (:data:`MIN_STRETCH_RANGE`), and when it is so narrow that there is
+    no signal to recover (:data:`MIN_USABLE_RANGE`) -- stretching a flat grey
+    crop only multiplies its sensor noise into fake structure.
+    """
+    if not _is_image(image):
+        return image
+    try:
+        gray = to_gray(image)
+        low = float(np.percentile(gray, low_percentile))
+        high = float(np.percentile(gray, high_percentile))
+        spread = high - low
+        if spread < MIN_USABLE_RANGE or spread >= MIN_STRETCH_RANGE:
+            return image
+
+        scale = 255.0 / spread
+        return cv2.convertScaleAbs(image, alpha=scale, beta=-low * scale)
+    except Exception:
+        logger.debug("stretch_contrast failed, returning input unchanged", exc_info=True)
+        return image
+
+
+def normalize_lighting(
+    image: np.ndarray,
+    low: float = GAMMA_HEALTHY_LOW,
+    high: float = GAMMA_HEALTHY_HIGH,
+) -> np.ndarray:
+    """Normalise exposure on a crop shot in extreme light.
+
+    Two global corrections, in order: dynamic gamma to move the crop's mean
+    luminance towards mid grey, then a percentile contrast stretch to spread
+    what is left across the full range.
+
+    This runs *before* CLAHE rather than instead of it, and the split is the
+    point. CLAHE equalises contrast **locally**, inside each 8x8 tile, which is
+    exactly the wrong tool for a crop that is globally too dark or globally
+    blown out -- it will happily amplify the noise inside a black tile to full
+    scale. Fixing the global exposure first means CLAHE's clip limit then
+    operates on a sanely-exposed image and does the job it is good at.
+
+    Both stages are self-limiting (see :data:`GAMMA_HEALTHY_LOW` /
+    :data:`GAMMA_HEALTHY_HIGH` and :data:`MIN_STRETCH_RANGE`), so a normally-lit
+    plate passes through untouched. Returns the input unchanged on any failure.
+    """
+    if not _is_image(image):
+        return image
+    try:
+        corrected = apply_gamma(image, auto_gamma(image, low, high))
+        return stretch_contrast(corrected)
+    except Exception:
+        logger.debug("normalize_lighting failed, returning input unchanged", exc_info=True)
+        return image

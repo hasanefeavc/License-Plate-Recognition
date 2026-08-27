@@ -15,13 +15,17 @@ cv2 = pytest.importorskip("cv2", reason="opencv is required for detection tests"
 np = pytest.importorskip("numpy", reason="numpy is required for detection tests")
 
 from lpr.detect.preprocess import (  # noqa: E402  (must follow the skip guards)
+    apply_gamma,
+    auto_gamma,
     crop_with_padding,
     deskew,
     enhance_frame,
     enhance_plate,
     letterbox,
+    normalize_lighting,
     rectify_perspective,
     sharpness,
+    stretch_contrast,
     unsharp_mask,
 )
 from lpr.detect.yolo import plausible_box  # noqa: E402
@@ -348,6 +352,152 @@ def test_enhance_frame_never_raises_on_junk() -> None:
     assert enhance_frame(None) is None  # type: ignore[arg-type]
     empty = np.zeros((0, 0, 3), dtype=np.uint8)
     assert enhance_frame(empty) is empty
+
+
+# ---------------------------------------------------------------------------
+# Dynamic lighting: auto_gamma / apply_gamma / stretch_contrast
+# ---------------------------------------------------------------------------
+
+
+def make_lit_plate(scale: float = 1.0, offset: int = 0) -> "np.ndarray":
+    """A plate crop re-exposed: ``scale`` for shadow, ``offset`` for glare."""
+    base = cv2.cvtColor(make_plate_crop(60, 240), cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return np.clip(base * scale + offset, 0, 255).astype(np.uint8)
+
+
+def test_auto_gamma_leaves_a_well_exposed_plate_alone() -> None:
+    """A plate is bimodal and legitimately bright; that is not a fault to correct."""
+    assert auto_gamma(make_lit_plate()) == pytest.approx(1.0)
+
+
+def test_auto_gamma_brightens_a_crop_shot_in_deep_shadow() -> None:
+    assert auto_gamma(make_lit_plate(scale=0.18)) < 1.0
+
+
+def test_auto_gamma_darkens_a_crop_blown_out_by_glare() -> None:
+    assert auto_gamma(make_lit_plate(offset=150)) > 1.0
+
+
+def test_auto_gamma_corrects_proportionally_to_the_problem() -> None:
+    """A slightly bright plate must not get the same treatment as a blown one."""
+    mild = auto_gamma(make_lit_plate(offset=90))
+    severe = auto_gamma(make_lit_plate(offset=150))
+    assert 1.0 < mild < severe
+
+
+def test_auto_gamma_stays_within_its_bounds() -> None:
+    for image in (make_lit_plate(scale=0.02), make_lit_plate(offset=250)):
+        assert 0.4 <= auto_gamma(image) <= 2.5
+
+
+def test_auto_gamma_declines_on_a_fully_clipped_crop() -> None:
+    """Solid black and solid white have no exposure left to recover."""
+    assert auto_gamma(np.zeros((40, 160), dtype=np.uint8)) == pytest.approx(1.0)
+    assert auto_gamma(np.full((40, 160), 255, dtype=np.uint8)) == pytest.approx(1.0)
+
+
+def test_auto_gamma_never_raises() -> None:
+    assert auto_gamma(None) == 1.0  # type: ignore[arg-type]
+    assert auto_gamma(np.zeros((0, 0), dtype=np.uint8)) == 1.0
+
+
+def test_apply_gamma_brightens_below_one_and_darkens_above() -> None:
+    crop = make_lit_plate(scale=0.4)
+    assert apply_gamma(crop, 0.5).mean() > crop.mean()
+    assert apply_gamma(crop, 2.0).mean() < crop.mean()
+
+
+def test_apply_gamma_of_one_is_the_identity() -> None:
+    crop = make_lit_plate()
+    assert apply_gamma(crop, 1.0) is crop
+
+
+def test_apply_gamma_does_not_modify_its_input() -> None:
+    crop = make_lit_plate(scale=0.3)
+    before = crop.copy()
+    apply_gamma(crop, 0.5)
+    assert np.array_equal(crop, before)
+
+
+def test_apply_gamma_never_raises() -> None:
+    assert apply_gamma(None, 0.5) is None  # type: ignore[arg-type]
+
+
+def test_stretch_contrast_expands_a_narrow_histogram() -> None:
+    narrow = make_lit_plate(scale=0.25)
+    assert float(stretch_contrast(narrow).std()) > float(narrow.std())
+
+
+def test_stretch_contrast_ignores_an_already_wide_histogram() -> None:
+    """Nothing to gain, and amplifying it would amplify the noise too."""
+    wide = make_lit_plate()
+    assert stretch_contrast(wide) is wide
+
+
+def test_stretch_contrast_refuses_a_crop_with_no_signal() -> None:
+    """A flat grey crop would otherwise have its sensor noise blown up to full scale."""
+    flat = np.full((60, 240), 128, dtype=np.uint8)
+    assert stretch_contrast(flat) is flat
+
+
+def test_stretch_contrast_survives_a_single_hot_pixel() -> None:
+    """Percentiles, not min/max: one specular highlight must not pin the scale."""
+    narrow = make_lit_plate(scale=0.25)
+    spiked = narrow.copy()
+    spiked[0, 0] = 255
+    assert float(stretch_contrast(spiked).std()) > float(spiked.std())
+
+
+def test_stretch_contrast_never_raises() -> None:
+    assert stretch_contrast(None) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# normalize_lighting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("scale", "offset", "label"),
+    [
+        (0.18, 0, "deep shadow"),
+        (0.45, 0, "underexposed"),
+        (1.0, 90, "glare"),
+        (1.0, 150, "blown out by a headlight"),
+    ],
+)
+def test_normalize_lighting_recovers_contrast_at_the_extremes(
+    scale: float, offset: int, label: str
+) -> None:
+    crop = make_lit_plate(scale=scale, offset=offset)
+    assert float(normalize_lighting(crop).std()) > float(crop.std()), label
+
+
+def test_normalize_lighting_leaves_a_well_exposed_plate_untouched() -> None:
+    """Self-limiting: the common case must not pay for the rescue path."""
+    crop = make_lit_plate()
+    assert normalize_lighting(crop) is crop
+
+
+def test_normalize_lighting_does_not_modify_its_input() -> None:
+    crop = make_lit_plate(scale=0.2)
+    before = crop.copy()
+    normalize_lighting(crop)
+    assert np.array_equal(crop, before)
+
+
+def test_normalize_lighting_never_raises() -> None:
+    assert normalize_lighting(None) is None  # type: ignore[arg-type]
+    empty = np.zeros((0, 0), dtype=np.uint8)
+    assert normalize_lighting(empty) is empty
+
+
+def test_enhance_plate_recovers_a_night_crop_better_with_normalisation() -> None:
+    """The end-to-end effect of the lighting stage inside the OCR pre-pass."""
+    night = cv2.cvtColor(make_lit_plate(scale=0.15), cv2.COLOR_GRAY2BGR)
+    with_norm = enhance_plate(night, normalize_light=True).gray
+    without = enhance_plate(night, normalize_light=False).gray
+    assert float(with_norm.std()) > float(without.std())
 
 
 # ---------------------------------------------------------------------------
