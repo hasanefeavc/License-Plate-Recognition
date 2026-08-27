@@ -641,7 +641,7 @@ email, not one per frame.
 | | Operator | Admin |
 |---|---|---|
 | Plates: add, edit, block, delete, import, export | ✅ | ✅ |
-| Gate, pause/resume, camera source | ✅ | ✅ |
+| Gate (`/api/relay/trigger`), pause/resume, camera source | ✅ | ✅ |
 | Parking capacity, stream quality | ✅ | ✅ |
 | OTA: status **and trigger** | ✅ | ✅ |
 | **Kullanıcılar** (accounts, licences) | ❌ | ✅ |
@@ -657,11 +657,42 @@ an operator's job — they are the ones standing at the barrier.
 
 ### Per-operator licences
 
-Distinct from the deployment licence: that one is RS256 from the vendor and
-decides whether this *installation* may run. These are HS256 keys the server
-issues to its own operators and decide *who* may drive it. They cannot be
-confused — different algorithm, different key material, and a `typ` claim
-checked on the way in.
+Access control is **entirely** the per-user model. The deployment licence
+(`lpr.license`, RS256 from a vendor public key) is still read and still
+reported by `GET /api/license`, but it no longer halts the pipeline, refuses
+the gate, or appears in the header. An installation-wide expiry that leaves an
+administrator standing at their own barrier unable to restart it is an outage,
+not a commercial control. Re-enabling the hold is one edit in
+`deps.apply_license_state`.
+
+These are HS256 keys the server issues to its own operators. They cannot be
+confused with the deployment licence — different algorithm, different key
+material, and a `typ` claim checked on the way in.
+
+### Generation and activation are separate events
+
+A key encodes a **duration**, not a deadline: `duration_days` plus the username
+it was issued to, and no `exp`.
+
+| | Generation (admin) | Activation (operator) |
+|---|---|---|
+| Endpoint | `POST /api/users/{username}/license` | `POST /api/license/activate` |
+| Writes to the account | **nothing** | key, expiry, duration, `activated_at` |
+| Status after | unchanged (`pending_activation`) | `active` |
+| Countdown | not started | starts *now* |
+
+An admin can cut a 365-day key on Friday for a Monday start and the operator
+still gets a full year. Starting the clock at generation would burn the weekend
+— and the days it spends in an inbox — off the licence.
+
+Once activated the **database** holds the expiry, and `license_for()` reads it
+from there. Re-deriving it from the key on each request would restart the
+countdown every time and the licence would never run out.
+
+The trade-off worth knowing: an un-activated key does not go stale. It is bound
+to one account and grants exactly the span written into it, but it stays usable
+until somebody uses it. Treat a generated key like the password it effectively
+is until the operator has activated it.
 
 **Administrators are exempt by construction.** The account that issues keys
 cannot sensibly be locked out by one: an admin holding an expired key could not
@@ -673,17 +704,22 @@ to sign with and every operator passes. That is deliberate rather than
 fail-closed — an upgrade that silently locked every operator out of a working
 barrier, at a site never told to set a new secret, is the worse failure.
 
-| State | Meaning |
-|---|---|
-| `unlimited` | An administrator, or enforcement switched off |
-| `active` | Key verifies and has not expired |
-| `expired` | Key verifies but its date has passed |
-| `revoked` | Withdrawn by an admin — beats a key that still verifies |
-| `missing` | No key, or one that does not verify |
+| State | Header badge | Meaning |
+|---|---|---|
+| `unlimited` | **Yönetici (Sınırsız)** | An administrator, or enforcement switched off |
+| `active` | **Lisanslı (XX gün kaldı)** | Activated and still within its span |
+| `pending_activation` | **Lisans Bekliyor** | A new account, or a key not yet entered |
+| `expired` | **Lisans Süresi Doldu** | The recorded expiry has passed |
+| `revoked` | **Lisans İptal Edildi** | Withdrawn by an admin |
 
-Revocation keeps the key on the row and changes the *status*. A signed key
+A new operator starts at `pending_activation` — named for what it is waiting
+on, because a new hire on their first morning is not an error. Clicking any
+non-unlimited badge opens the activation dialog, as does the first 402.
+
+Revocation keeps the key and the dates and changes the *status*. A signed key
 cannot be un-signed, so the status flag is the only thing that can actually
-withdraw it — and keeping the key lets an admin see what was revoked.
+withdraw it — and keeping the rest lets an admin see what was revoked and when
+it had been due to end.
 
 Keys are bound to the account they were issued to. Without that, any operator
 could activate a colleague's key and inherit its validity.
@@ -707,8 +743,9 @@ database hiccup must not close a working barrier.
 ### Issuing a key
 
 **Kullanıcılar → Lisans Üret**, with 30 / 90 / 365 days or a custom span. The
-key is shown once so the admin can pass it on, and stored on the account. The
-operator pastes it into **Lisans Anahtarı Girin**.
+key is shown once, for the admin to copy and send — it is *not* stored, because
+the account is untouched until the operator activates it. The operator pastes it
+into **Lisans Anahtarı Girin**, and that is when the countdown starts.
 
 ---
 
@@ -1183,16 +1220,16 @@ make fmt
 
 ### Test suite
 
-**835 passing tests** across 23 modules (837 collected: 835 pass, 1 skipped, 1 known
+**849 passing tests** across 23 modules (851 collected: 849 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 129 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_api.py` | 131 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
-| `test_web_ui.py` | 71 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
+| `test_web_ui.py` | 76 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
 | `test_pipeline.py` | 47 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
@@ -1200,10 +1237,10 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
 | `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
+| `test_user_license.py` | 28 | Key issue/verify, binding, expiry, revocation precedence |
 | `test_notify.py` | 27 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
-| `test_user_license.py` | 21 | Key issue/verify, binding, expiry, revocation precedence |
 | `test_secrets.py` | 20 | No credentials in tracked templates; `.env*` ignore rules |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
@@ -1216,7 +1253,7 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 837 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 851 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

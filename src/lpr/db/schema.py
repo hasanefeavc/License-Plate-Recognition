@@ -24,7 +24,10 @@ from typing import Final
 #: blocked), applied to existing databases by ``PLATES_ADDED_COLUMNS``.
 #: v5 added ``users.token_ttl_min`` (per-account session length).
 #: v6 added the per-operator licence columns on ``users``.
-SCHEMA_VERSION: Final[int] = 6
+#: v7 split generation from activation: ``license_duration_days`` and
+#: ``license_activated_at``, so the countdown starts when the operator enters
+#: the key rather than when the admin cuts it.
+SCHEMA_VERSION: Final[int] = 7
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -70,9 +73,11 @@ CREATE TABLE IF NOT EXISTS users (
     role          TEXT NOT NULL DEFAULT 'operator',
     created_at    TEXT NOT NULL,
     token_ttl_min INTEGER,
-    license_key        TEXT,
-    license_expires_at TEXT,
-    license_status     TEXT
+    license_key           TEXT,
+    license_expires_at    TEXT,
+    license_status        TEXT,
+    license_duration_days INTEGER,
+    license_activated_at  TEXT
 )
 """
 
@@ -87,6 +92,11 @@ USERS_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
     ("license_key", "ALTER TABLE users ADD COLUMN license_key TEXT"),
     ("license_expires_at", "ALTER TABLE users ADD COLUMN license_expires_at TEXT"),
     ("license_status", "ALTER TABLE users ADD COLUMN license_status TEXT"),
+    (
+        "license_duration_days",
+        "ALTER TABLE users ADD COLUMN license_duration_days INTEGER",
+    ),
+    ("license_activated_at", "ALTER TABLE users ADD COLUMN license_activated_at TEXT"),
 )
 
 CREATE_LOGS: Final[str] = """
@@ -233,7 +243,8 @@ SELECT_PLATES_DETAIL: Final[str] = (
 #: admin has to be able to hand it to the operator it was issued for.
 _USER_COLUMNS: Final[str] = (
     "username, role, created_at, token_ttl_min, "
-    "license_key, license_expires_at, license_status"
+    "license_key, license_expires_at, license_status, "
+    "license_duration_days, license_activated_at"
 )
 
 SELECT_USERS: Final[str] = f"SELECT {_USER_COLUMNS} FROM users ORDER BY username"
@@ -241,8 +252,8 @@ SELECT_USERS: Final[str] = f"SELECT {_USER_COLUMNS} FROM users ORDER BY username
 SELECT_USER: Final[str] = f"SELECT {_USER_COLUMNS} FROM users WHERE username = ?"
 
 UPDATE_USER_LICENSE: Final[str] = (
-    "UPDATE users SET license_key = ?, license_expires_at = ?, license_status = ? "
-    "WHERE username = ?"
+    "UPDATE users SET license_key = ?, license_expires_at = ?, license_status = ?, "
+    "license_duration_days = ?, license_activated_at = ? WHERE username = ?"
 )
 
 COUNT_USERS_BY_ROLE: Final[str] = "SELECT COUNT(*) AS n FROM users WHERE role = ?"

@@ -771,9 +771,11 @@ class UserOut(BaseModel):
     #: Licence state, so the admin table can show it without a call per row.
     license_status: str | None = Field(default=None, examples=["active"])
     license_expires_at: str | None = Field(default=None)
-    #: The key itself, so an admin can hand it to the operator it was issued
-    #: for. Only ever returned to an admin -- this endpoint is admin-only.
+    #: The activated key, present only once the operator has entered it.
+    #: Admin-only, like this whole endpoint.
     license_key: str | None = Field(default=None)
+    license_activated_at: str | None = Field(default=None)
+    license_duration_days: int | None = Field(default=None)
 
 
 class VersionOut(BaseModel):
@@ -1002,16 +1004,25 @@ class UserLicenseOut(BaseModel):
         }
     )
 
-    status: Literal["active", "expired", "missing", "revoked", "unlimited"] = "missing"
+    status: Literal[
+        "active", "expired", "pending_activation", "revoked", "unlimited"
+    ] = "pending_activation"
     username: str | None = None
+    #: Set at activation, not at generation. ``None`` until the operator enters
+    #: their key -- which is what ``pending_activation`` means.
     expires_at: str | None = None
     days_remaining: float | None = None
     valid: bool = False
     #: True for administrators, who hold no key by design.
     unlimited: bool = False
     detail: str = ""
-    #: Returned only when an admin has just generated the key, so it can be
-    #: handed to the operator. Never included in a listing.
+    #: When the operator entered the key that started the countdown.
+    activated_at: str | None = None
+    #: The span the key granted, in days.
+    duration_days: int | None = None
+    #: Returned only by the generation endpoint, so an admin can hand it to the
+    #: operator. Shown once and never stored: the account is untouched until
+    #: the operator activates it, so there is nothing to read back.
     key: str | None = None
 
 

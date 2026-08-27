@@ -249,7 +249,10 @@
         <div class="text-[10px] font-bold tracking-widest text-muted">RET</div>
       </div>
     </div>
-    <span id="license-label" class="truncate font-mono text-xs text-muted"></span>
+    <!-- The deployment-licence ticker used to live here. It is gone: the
+         header now shows only the *user's own* licence, in #license-badge next
+         to the username. The installation-wide licence is still readable at
+         GET /api/license but no longer gates anything. -->
   </div>
 
   <!-- Control panel ------------------------------------------------------ -->
@@ -555,6 +558,10 @@
 
     <form id="license-form" class="space-y-4 px-4 py-5 sm:px-6">
       <p id="license-state" class="rounded-lg border border-line bg-void px-3 py-2.5 text-sm"></p>
+      <p class="text-xs text-muted">
+        Süre, anahtarı girdiğiniz anda başlar &mdash; yöneticiniz anahtarı ne zaman
+        ürettiyse üretsin.
+      </p>
       <div>
         <label for="license-key" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">LİSANS ANAHTARI</label>
         <textarea id="license-key" name="key" rows="4" required data-autofocus

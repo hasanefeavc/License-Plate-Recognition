@@ -159,7 +159,7 @@
     "cdn-warning",
     "uptime", "user-label", "conn-dot", "conn-label", "feed", "feed-empty",
     "feed-count", "activity", "stat-read", "stat-grant", "stat-deny",
-    "license-label", "btn-gate", "btn-gate-label", "gate-spinner",
+    "btn-gate", "btn-gate-label", "gate-spinner",
     "btn-pause", "btn-history", "btn-logout",
     "toast", "cam-entry", "cam-exit",
     // Plate-management modal
@@ -570,24 +570,22 @@
     return `${camera}: ${plate} okundu${suffix}`;
   }
 
-  function applyLicense(license) {
-    state.licenceValid = Boolean(license.valid);
-    const detail = String(license.detail || "");
-    if (state.licenceValid) {
-      const parts = ["Lisans"];
-      if (license.client) parts.push(String(license.client));
-      if (typeof license.days_remaining === "number") {
-        parts.push(`${Math.round(license.days_remaining)} gün kaldı`);
-      }
-      setText(el["license-label"], parts.join(" - "));
-      el["license-label"].className = "font-mono text-xs text-muted";
-      setBanner("");
-    } else {
-      setText(el["license-label"], detail || "Lisans geçersiz");
-      el["license-label"].className = "font-mono text-xs font-bold text-bad";
-      setBanner("Lisans geçersiz - görüntü işleme durduruldu. Yeni bir lisans anahtarı girin.");
-    }
-    updateControls();
+  /** The deployment licence no longer drives anything in the header.
+   *
+   *  It used to own a ticker ("Lisans - Toki 1. Etap - 42 gün kaldı") and a
+   *  banner that announced the pipeline had stopped. Both are gone: the server
+   *  no longer halts recognition or refuses the gate on it, so a warning about
+   *  either would be describing something that does not happen.
+   *
+   *  Kept as a no-op rather than deleted because the WebSocket still pushes a
+   *  `license` payload and `refreshLicense()` still polls it; silently
+   *  dropping the message here is clearer than removing the plumbing on both
+   *  sides at once. The header badge is `renderLicenseBadge`, and it reads the
+   *  *user's* licence. */
+  function applyLicense(_license) {
+    // Nothing to display, and nothing to block: `state.licenceValid` stays
+    // true so no control is disabled on the deployment licence's account.
+    state.licenceValid = true;
   }
 
   // -----------------------------------------------------------------------
@@ -1663,11 +1661,11 @@
   // -----------------------------------------------------------------------
 
   const LICENSE_BADGES = {
-    unlimited: { label: "Sınırsız Yönetici Lisansı", classes: "border-accent/50 bg-accent/10 text-accent" },
-    active:    { label: "Lisans Aktif",              classes: "border-ok/50 bg-ok/10 text-ok" },
-    expired:   { label: "Lisans Süresi Doldu",       classes: "border-bad/50 bg-bad/10 text-bad" },
-    revoked:   { label: "Lisans İptal Edildi",       classes: "border-bad/50 bg-bad/10 text-bad" },
-    missing:   { label: "Lisans Gerekli",            classes: "border-warn/50 bg-warn/10 text-warn" },
+    unlimited:          { label: "Yönetici (Sınırsız)",  classes: "border-accent/50 bg-accent/10 text-accent" },
+    active:             { label: "Lisanslı",             classes: "border-ok/50 bg-ok/10 text-ok" },
+    expired:            { label: "Lisans Süresi Doldu",  classes: "border-bad/50 bg-bad/10 text-bad" },
+    revoked:            { label: "Lisans İptal Edildi",  classes: "border-bad/50 bg-bad/10 text-bad" },
+    pending_activation: { label: "Lisans Bekliyor",      classes: "border-warn/50 bg-warn/10 text-warn" },
   };
 
   function renderLicenseBadge() {
@@ -1677,20 +1675,24 @@
     const state_ = state.license;
     if (!state_) { badge.hidden = true; return; }
 
-    const spec = LICENSE_BADGES[state_.status] || LICENSE_BADGES.missing;
+    const spec = LICENSE_BADGES[state_.status] || LICENSE_BADGES.pending_activation;
     let label = spec.label;
-    // Remaining days are the useful half for an operator; an admin has none.
-    if (state_.status === "active" && state_.days_remaining !== null) {
-      label = `Lisans: ${Math.max(0, Math.ceil(state_.days_remaining))} gün`;
+    // An operator wants the number; an admin has none to want.
+    if (state_.status === "active" && typeof state_.days_remaining === "number") {
+      label = `Lisanslı (${Math.max(0, Math.ceil(state_.days_remaining))} gün kaldı)`;
     }
 
     badge.hidden = false;
     badge.textContent = label;
     badge.className =
       `rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider transition ${spec.classes}`;
-    // An admin has nothing to enter, so the badge is inert for them.
+    // An admin has nothing to enter, so the badge is inert for them. For an
+    // operator it is the way into the activation dialog, whatever the state --
+    // including "active", so they can see when it runs out.
     badge.disabled = Boolean(state_.unlimited);
-    badge.title = state_.unlimited ? state_.detail : "Lisans anahtarı girin";
+    badge.title = state_.unlimited
+      ? state_.detail
+      : (state_.valid ? "Lisans durumu" : "Lisans anahtarı girin");
   }
 
   /** The caller's *own* licence, for the navbar badge.
@@ -1872,8 +1874,10 @@
   /** Licence state for one row, with the key exposed for copying. */
   function licenseCell(row, role) {
     const wrap = document.createElement("div");
-    const status = String(row.license_status || (role === "admin" ? "unlimited" : "missing"));
-    const spec = LICENSE_BADGES[status] || LICENSE_BADGES.missing;
+    const status = String(
+      row.license_status || (role === "admin" ? "unlimited" : "pending_activation")
+    );
+    const spec = LICENSE_BADGES[status] || LICENSE_BADGES.pending_activation;
 
     const badge = document.createElement("span");
     badge.className =
@@ -1912,7 +1916,8 @@
       await loadUsers();
       modalStatus(
         el["users-status"],
-        `${username}: ${days} günlük lisans üretildi. Anahtarı kopyalayıp iletin.`,
+        `${username}: ${days} günlük anahtar üretildi. ` +
+        "Süre, operatör anahtarı girdiğinde başlar.",
         "ok"
       );
       // Shown rather than silently stored: the admin has to pass it on, and a

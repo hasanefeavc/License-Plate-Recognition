@@ -552,12 +552,19 @@ class UserRepository:
             return False
         digest = _password_hasher().hash(password)
         ttl = int(token_ttl_min) if token_ttl_min else None
+        # A new operator is waiting for a key, not missing one. Admins get no
+        # licence row at all -- they are exempt, and a status on their row
+        # would only be something to keep in sync with a rule that ignores it.
+        from lpr.user_license import STATUS_PENDING, requires_license
+
+        assigned_role = role or DEFAULT_ROLE
+        status = STATUS_PENDING if requires_license(assigned_role) else None
         with transaction() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO users "
-                "(username, password_hash, role, created_at, token_ttl_min) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, digest, role or DEFAULT_ROLE, utc_now_iso(), ttl),
+                "(username, password_hash, role, created_at, token_ttl_min, license_status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, digest, assigned_role, utc_now_iso(), ttl, status),
             )
             created = cur.rowcount > 0
         if created:
@@ -673,24 +680,38 @@ class UserRepository:
         key: str | None,
         expires_at: str | None,
         status: str,
+        duration_days: int | None = None,
+        activated_at: str | None = None,
     ) -> bool:
-        """Store (or clear) one account's licence. Returns False if unknown.
+        """Store one account's licence state. Returns False if unknown.
 
-        Revocation keeps the key on the row rather than deleting it. The key is
-        signed and cannot be un-signed, so ``license_status`` is the only thing
-        that can actually withdraw it -- and keeping the key means an admin can
-        still see *what* was revoked.
+        Written only at *activation* and at revocation -- generating a key
+        touches nothing here, because a key that nobody has entered yet says
+        nothing about the account it names.
+
+        Revocation keeps the key and the dates and changes the status. The key
+        is signed and cannot be un-signed, so ``license_status`` is the only
+        thing that can actually withdraw it -- and keeping the rest lets an
+        admin see what was revoked and when it had been due to end.
         """
         name = (username or "").strip()
         if not name:
             return False
         with transaction() as conn:
             cur = conn.execute(
-                schema.UPDATE_USER_LICENSE, (key, expires_at, status, name)
+                schema.UPDATE_USER_LICENSE,
+                (
+                    key,
+                    expires_at,
+                    status,
+                    int(duration_days) if duration_days else None,
+                    activated_at,
+                    name,
+                ),
             )
             changed = cur.rowcount > 0
         if changed:
-            logger.info("Lisans güncellendi: %s (%s)", name, status)
+            logger.info("Lisans güncellendi: %s (%s, bitiş %s)", name, status, expires_at)
         return changed
 
     def count_by_role(self, role: str) -> int:

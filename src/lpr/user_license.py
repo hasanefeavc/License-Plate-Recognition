@@ -11,6 +11,22 @@ material, and a ``typ`` claim checked on the way in, so neither a deployment
 licence nor an API session token validates here and a key issued here validates
 nowhere else.
 
+Generation and activation are separate events
+--------------------------------------------
+A key encodes a **duration**, not a deadline: ``duration_days`` plus the
+username it was issued to. Nothing about the account changes when one is
+generated -- an admin can cut a 365-day key on Monday and hand it over in
+March, and the operator still gets a full year.
+
+The countdown starts at :func:`activate`, which is the only place
+``license_expires_at`` is ever computed. That is what makes the two halves
+honest: generation produces a bearer artefact, activation binds it to a clock.
+
+The consequence worth knowing is that an un-activated key does not go stale. It
+is a credential for exactly one account and grants exactly the span written into
+it, but it stays usable until somebody uses it -- treat a generated key like the
+password it effectively is until the operator has activated it.
+
 Who needs one
 -------------
 Only operators. An administrator is exempt by construction: the account that
@@ -47,14 +63,17 @@ __all__ = [
     "LICENSE_TYP",
     "STATUS_ACTIVE",
     "STATUS_EXPIRED",
-    "STATUS_MISSING",
+    "STATUS_PENDING",
     "STATUS_REVOKED",
     "STATUS_UNLIMITED",
     "UserLicense",
+    "KeyInfo",
+    "activate",
     "enforcement_enabled",
+    "inspect_key",
     "issue_key",
+    "license_for",
     "requires_license",
-    "verify_key",
 ]
 
 ALGORITHM = "HS256"
@@ -65,7 +84,10 @@ LICENSE_TYP = "lpr-user-license"
 
 STATUS_ACTIVE = "active"
 STATUS_EXPIRED = "expired"
-STATUS_MISSING = "missing"
+#: A fresh operator account, or one whose key has not been entered yet. Named
+#: for what it is waiting on rather than for what it lacks: "missing" reads as
+#: an error, and a new hire on their first morning is not an error.
+STATUS_PENDING = "pending_activation"
 STATUS_REVOKED = "revoked"
 #: Administrators. Not a licence -- the absence of one.
 STATUS_UNLIMITED = "unlimited"
@@ -76,14 +98,27 @@ MAX_DAYS = 3650
 
 
 @dataclass(frozen=True, slots=True)
+class KeyInfo:
+    """What one licence key says, before it has been bound to a clock."""
+
+    valid: bool = False
+    username: str | None = None
+    duration_days: int = 0
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class UserLicense:
     """The result of checking one account's licence."""
 
-    status: str = STATUS_MISSING
+    status: str = STATUS_PENDING
     username: str | None = None
     expires_at: str | None = None
     days_remaining: float | None = None
     detail: str = ""
+    #: When the operator entered their key. ``None`` until they do.
+    activated_at: str | None = None
+    duration_days: int | None = None
 
     @property
     def valid(self) -> bool:
@@ -104,6 +139,8 @@ class UserLicense:
             "valid": self.valid,
             "unlimited": self.unlimited,
             "detail": self.detail,
+            "activated_at": self.activated_at,
+            "duration_days": self.duration_days,
         }
 
 
@@ -137,11 +174,20 @@ def issue_key(
     days: int,
     settings: "Settings | None" = None,
     now: datetime | None = None,
-) -> tuple[str, str]:
-    """Sign a licence key for ``username``. Returns ``(key, expires_at)``.
+) -> str:
+    """Sign a licence key granting ``days`` of access to ``username``.
 
-    Raises ``RuntimeError`` when no secret is configured -- generating a key
-    that nothing can verify would look like success and fail at activation.
+    Returns the key alone. Nothing else happens: no row is written, no
+    countdown starts, the operator's status does not change. The key is an
+    artefact the admin hands over, and it is worth exactly ``days`` from
+    whenever it is activated.
+
+    Deliberately carries no ``exp``. An expiry here would be a deadline for
+    *collecting* the key rather than for using the access, and an admin who
+    generated one on Friday for a Monday start would find it dead on arrival.
+
+    Raises ``RuntimeError`` when no secret is configured -- a key nothing can
+    verify would look like success and fail at activation.
     """
     secret = _secret(settings)
     if not secret:
@@ -153,88 +199,106 @@ def issue_key(
     span = max(MIN_DAYS, min(MAX_DAYS, int(days)))
 
     issued = now or datetime.now(timezone.utc)
-    expires = issued + timedelta(days=span)
     token = jwt.encode(
         {
             "typ": LICENSE_TYP,
             "sub": name,
+            "duration_days": span,
             "iat": int(issued.timestamp()),
-            "exp": int(expires.timestamp()),
         },
         secret,
         algorithm=ALGORITHM,
     )
     if isinstance(token, bytes):  # pragma: no cover - PyJWT 1.x
         token = token.decode("utf-8")
-    logger.info("Lisans anahtarı üretildi: %s (%d gün)", name, span)
-    return token, expires.replace(microsecond=0).isoformat()
+    logger.info("Lisans anahtarı üretildi: %s (%d gün, henüz etkinleştirilmedi)", name, span)
+    return token
 
 
-def verify_key(
+def inspect_key(
     key: str,
     username: str | None = None,
     settings: "Settings | None" = None,
-    now: datetime | None = None,
-) -> UserLicense:
-    """Check one licence key. Never raises.
+) -> KeyInfo:
+    """Read one key without activating it. Never raises.
 
-    ``username`` binds the key to an account: a key is issued *to* somebody,
-    and without this check any operator could activate a colleague's key and
-    inherit its validity.
+    ``username`` binds the key to an account. A key is issued *to* somebody,
+    and without this check any operator could enter a colleague's key and help
+    themselves to its duration.
     """
     secret = _secret(settings)
     if not secret:
-        return UserLicense(status=STATUS_MISSING, detail="Lisans doğrulaması yapılandırılmamış")
+        return KeyInfo(detail="Lisans doğrulaması yapılandırılmamış")
 
     raw = (key or "").strip()
     if not raw:
-        return UserLicense(status=STATUS_MISSING, detail="Lisans anahtarı girilmedi")
+        return KeyInfo(detail="Lisans anahtarı girilmedi")
 
     try:
         claims: dict[str, Any] = jwt.decode(
             raw,
             secret,
-            # A single algorithm, never a list: accepting more than one is how
-            # a verifier gets talked into checking a signature it should not.
+            # One algorithm, never a list: accepting several is how a verifier
+            # gets talked into checking a signature it should not.
             algorithms=[ALGORITHM],
-            options={"require": ["exp", "sub"]},
-        )
-    except jwt.ExpiredSignatureError:
-        stale = _unverified(raw)
-        return UserLicense(
-            status=STATUS_EXPIRED,
-            username=str(stale.get("sub") or "") or None,
-            expires_at=_iso(stale.get("exp")),
-            days_remaining=0.0,
-            detail="Lisans süresi doldu",
+            options={"require": ["sub"]},
         )
     except jwt.InvalidTokenError:
-        return UserLicense(status=STATUS_MISSING, detail="Lisans anahtarı geçersiz")
+        return KeyInfo(detail="Lisans anahtarı geçersiz")
 
     if str(claims.get("typ")) != LICENSE_TYP:
-        # Something else signed with this secret. Not a licence.
-        return UserLicense(status=STATUS_MISSING, detail="Lisans anahtarı geçersiz")
+        # Something else signed with this secret. Not a licence key.
+        return KeyInfo(detail="Lisans anahtarı geçersiz")
 
     subject = str(claims.get("sub") or "")
     if username is not None and subject != (username or "").strip():
         logger.warning(
             "Lisans anahtarı başka bir kullanıcıya ait: %s (sunulan: %s)", subject, username
         )
-        return UserLicense(
-            status=STATUS_MISSING,
-            username=subject or None,
-            detail="Lisans anahtarı bu kullanıcıya ait değil",
-        )
+        return KeyInfo(username=subject or None, detail="Lisans anahtarı bu kullanıcıya ait değil")
+
+    try:
+        duration = int(claims.get("duration_days") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if duration < MIN_DAYS:
+        return KeyInfo(username=subject or None, detail="Lisans anahtarı geçersiz süre taşıyor")
+
+    return KeyInfo(
+        valid=True,
+        username=subject or None,
+        duration_days=min(MAX_DAYS, duration),
+        detail=f"{duration} günlük lisans anahtarı",
+    )
+
+
+def activate(
+    key: str,
+    username: str,
+    settings: "Settings | None" = None,
+    now: datetime | None = None,
+) -> UserLicense:
+    """Bind a key to the clock. This is where the countdown starts.
+
+    The single place ``license_expires_at`` is ever computed: ``now`` plus the
+    duration the key carries. Returns an invalid :class:`UserLicense` (status
+    unchanged, no expiry) when the key does not check out, so the caller can
+    report the reason without having written anything.
+    """
+    info = inspect_key(key, username, settings)
+    if not info.valid:
+        return UserLicense(status=STATUS_PENDING, username=username, detail=info.detail)
 
     moment = now or datetime.now(timezone.utc)
-    expires_ts = float(claims["exp"])
-    remaining = (expires_ts - moment.timestamp()) / 86400.0
+    expires = moment + timedelta(days=info.duration_days)
     return UserLicense(
         status=STATUS_ACTIVE,
-        username=subject or None,
-        expires_at=_iso(expires_ts),
-        days_remaining=max(0.0, remaining),
-        detail="Lisans geçerli",
+        username=username,
+        expires_at=expires.replace(microsecond=0).isoformat(),
+        days_remaining=float(info.duration_days),
+        detail="Lisans etkinleştirildi",
+        activated_at=moment.replace(microsecond=0).isoformat(),
+        duration_days=info.duration_days,
     )
 
 
@@ -246,14 +310,19 @@ def license_for(
 ) -> UserLicense:
     """The licence state of one account, as the API reports and enforces it.
 
+    Read entirely from the stored row rather than from the key. Once activated,
+    the *database* holds the expiry; re-deriving it from the key would restart
+    the countdown on every request and the licence would never run out.
+
     The order of these checks is the policy:
 
-    1. **Administrator** -> unlimited, always, before anything else is read.
+    1. **Administrator** -> unlimited, before anything on the row is read.
     2. **Enforcement off** (no secret) -> unlimited, so an unconfigured site
        keeps working.
-    3. **Explicitly revoked** -> revoked, even if the key it holds still
-       verifies. Revocation is a database fact; the key cannot be un-signed.
-    4. Otherwise the stored key is verified.
+    3. **Explicitly revoked** -> revoked, whatever the dates say. Revocation is
+       a database fact; a signed key cannot be un-signed.
+    4. **No expiry recorded** -> waiting for the operator to enter their key.
+    5. Otherwise the recorded expiry decides.
     """
     if not requires_license(role):
         return UserLicense(status=STATUS_UNLIMITED, detail="Sınırsız yönetici lisansı")
@@ -261,18 +330,69 @@ def license_for(
         return UserLicense(status=STATUS_UNLIMITED, detail="Lisans denetimi kapalı")
 
     record = row or {}
-    stored_status = str(record.get("license_status") or "")
-    if stored_status == STATUS_REVOKED:
+    name = str(record.get("username") or "") or None
+    duration = record.get("license_duration_days")
+    duration_days = int(duration) if duration else None
+
+    if str(record.get("license_status") or "") == STATUS_REVOKED:
         return UserLicense(
             status=STATUS_REVOKED,
-            username=str(record.get("username") or "") or None,
+            username=name,
             detail="Lisans iptal edildi",
+            activated_at=str(record.get("license_activated_at") or "") or None,
+            duration_days=duration_days,
         )
 
-    key = str(record.get("license_key") or "")
-    if not key:
-        return UserLicense(status=STATUS_MISSING, detail="Lisans anahtarı yok")
-    return verify_key(key, str(record.get("username") or "") or None, settings, now)
+    expires_at = str(record.get("license_expires_at") or "").strip()
+    if not expires_at:
+        return UserLicense(
+            status=STATUS_PENDING,
+            username=name,
+            detail="Lisans anahtarı bekleniyor",
+            duration_days=duration_days,
+        )
+
+    moment = now or datetime.now(timezone.utc)
+    remaining = _days_until(expires_at, moment)
+    if remaining is None:
+        # An unparseable date is not an active licence; treat it as unentered
+        # rather than granting access on a value nothing can read.
+        return UserLicense(
+            status=STATUS_PENDING, username=name, detail="Lisans bitiş tarihi okunamadı"
+        )
+
+    activated_at = str(record.get("license_activated_at") or "") or None
+    if remaining <= 0:
+        return UserLicense(
+            status=STATUS_EXPIRED,
+            username=name,
+            expires_at=expires_at,
+            days_remaining=0.0,
+            detail="Lisans süresi doldu",
+            activated_at=activated_at,
+            duration_days=duration_days,
+        )
+
+    return UserLicense(
+        status=STATUS_ACTIVE,
+        username=name,
+        expires_at=expires_at,
+        days_remaining=remaining,
+        detail="Lisans geçerli",
+        activated_at=activated_at,
+        duration_days=duration_days,
+    )
+
+
+def _days_until(expires_at: str, now: datetime) -> float | None:
+    """Days from ``now`` to an ISO-8601 instant, or ``None`` if unreadable."""
+    try:
+        moment = datetime.fromisoformat(expires_at)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:  # pragma: no cover - stored values carry an offset
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment - now).total_seconds() / 86400.0
 
 
 def _iso(timestamp: Any) -> str | None:
@@ -284,11 +404,3 @@ def _iso(timestamp: Any) -> str | None:
         )
     except (TypeError, ValueError, OSError, OverflowError):
         return None
-
-
-def _unverified(token: str) -> dict[str, Any]:
-    """Claims without signature verification, for reporting on a dead key."""
-    try:
-        return dict(jwt.decode(token, options={"verify_signature": False}))
-    except Exception:  # pragma: no cover - malformed token
-        return {}

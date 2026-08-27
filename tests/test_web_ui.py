@@ -737,14 +737,25 @@ def test_the_bootstrap_button_is_hidden_until_the_server_asks_for_setup() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_the_licence_badge_names_both_states() -> None:
-    """Unlimited for an admin, remaining days for an operator."""
+def test_the_licence_badge_names_every_state() -> None:
+    """The vocabulary the brief specifies, verbatim."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     block = script[script.index("const LICENSE_BADGES") :]
     block = block[: block.index("\n  };")]
-    assert "Sınırsız Yönetici Lisansı" in block
-    for status in ("active", "expired", "revoked", "missing"):
+
+    assert "Yönetici (Sınırsız)" in block
+    assert "Lisans Bekliyor" in block
+    assert "Lisans Süresi Doldu" in block
+    for status in ("active", "expired", "revoked", "pending_activation", "unlimited"):
         assert status in block
+
+
+def test_an_active_operator_badge_counts_down() -> None:
+    """`Lisanslı (XX gün kaldı)` — the number is the useful half."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderLicenseBadge") :]
+    body = body[: body.index("\n  }\n")]
+    assert "gün kaldı" in body and "days_remaining" in body
 
 
 def test_the_badge_shows_remaining_days_for_an_operator() -> None:
@@ -807,3 +818,39 @@ def test_the_two_licence_refreshers_do_not_share_a_name() -> None:
     assert "async function refreshLicense()" in script
     assert "async function refreshUserLicense()" in script
     assert "refreshUserLicense();" in script
+
+
+def test_the_deployment_licence_ticker_is_gone_from_the_header() -> None:
+    """The header shows the *user's* licence, not the installation's.
+
+    The old ticker described an enforcement that no longer happens: the
+    deployment licence neither halts the pipeline nor refuses the gate.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="license-label"' not in html
+    assert '"license-label"' not in script, "the element registry must not name it either"
+
+
+def test_the_deployment_licence_no_longer_raises_a_banner() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function applyLicense") :]
+    body = body[: body.index("\n  }\n")]
+    assert "setBanner" not in body
+    assert "görüntü işleme durduruldu" not in body
+
+
+def test_the_header_badge_reads_the_users_own_licence() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function refreshUserLicense") :]
+    body = body[: body.index("\n  }\n")]
+    assert "/api/license/me" in body
+
+
+def test_the_admin_modal_says_the_countdown_starts_at_activation() -> None:
+    """The admin needs to know the key is not burning while it sits in an email."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function generateLicense") :]
+    body = body[: body.index("\n  }\n")]
+    assert "operatör anahtarı girdiğinde başlar" in body
