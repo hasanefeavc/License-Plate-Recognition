@@ -35,8 +35,11 @@ __all__ = [
     "RegisterIn",
     "RelayTriggerOut",
     "StatsOut",
+    "SystemEventOut",
+    "SystemUpdateOut",
     "TokenOut",
     "UserOut",
+    "VersionOut",
     "normalize_plate",
 ]
 
@@ -608,6 +611,106 @@ class UserOut(BaseModel):
     username: str = Field(examples=["admin"])
     role: str = Field(default="operator", examples=["admin"])
     created_at: str | None = Field(default=None, examples=["2026-05-01"])
+
+
+class VersionOut(BaseModel):
+    """Response of ``GET /api/system/version`` -- what is deployed right now."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "version": "0.1.0",
+                    "commit": "e46933f0c2a1b8d4e5f60718293a4b5c6d7e8f90",
+                    "short_commit": "e46933f",
+                    "branch": "main",
+                    "dirty": False,
+                    "update_enabled": True,
+                }
+            ]
+        }
+    )
+
+    version: str = Field(examples=["0.1.0"])
+    #: ``None`` when the deployment is not a git checkout (image built from a
+    #: tarball, git binary absent). The UI falls back to ``version``.
+    commit: str | None = Field(default=None, examples=["e46933f0c2a1b8d4"])
+    short_commit: str | None = Field(default=None, examples=["e46933f"])
+    branch: str | None = Field(default=None, examples=["main"])
+    #: Uncommitted local changes are present, which will block a --ff-only pull.
+    dirty: bool = Field(default=False, examples=[False])
+    #: Whether ``POST /api/system/update`` will do anything, so the UI can
+    #: disable the button instead of offering an action that always 503s.
+    update_enabled: bool = Field(default=False, examples=[True])
+
+
+class SystemUpdateOut(BaseModel):
+    """Response of ``POST /api/system/update`` and ``GET /api/system/update``.
+
+    The POST returns as soon as the work is *accepted*, not when it finishes:
+    the rebuild kills the container serving the request, so success can never
+    be reported over that connection. The UI polls the GET (and then the
+    version endpoint) to find out how it ended.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "state": "running",
+                    "step": "pull",
+                    "detail": "Güncelleme başlatıldı.",
+                    "running": True,
+                    "accepted": True,
+                }
+            ]
+        }
+    )
+
+    state: Literal["idle", "running", "restarting", "succeeded", "failed"] = Field(
+        examples=["running"]
+    )
+    step: str | None = Field(default=None, examples=["pull"])
+    detail: str = Field(default="", examples=["Güncelleme başlatıldı."])
+    running: bool = Field(default=False, examples=[True])
+    #: True only on the POST that actually started an update.
+    accepted: bool = Field(default=False, examples=[True])
+    started_at: float | None = Field(default=None)
+    finished_at: float | None = Field(default=None)
+    commit_before: str | None = Field(default=None)
+    commit_after: str | None = Field(default=None)
+    #: Tail of the git/compose output, for the operator to read on failure.
+    log: list[str] = Field(default_factory=list)
+
+
+class SystemEventOut(BaseModel):
+    """One row of ``GET /api/system/events`` -- the operational audit trail.
+
+    Distinct from ``LogOut``: that is plate traffic at a barrier, this is what
+    the machine did to itself. Sharing a model would mean sharing a table.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": 12,
+                    "ts": "2026-08-27T03:00:04+00:00",
+                    "source": "ota",
+                    "level": "warning",
+                    "message": "2 yeni sürüm bulundu (e46933f). Otomatik güncelleme başlatılıyor.",
+                    "detail": None,
+                }
+            ]
+        }
+    )
+
+    id: int = Field(examples=[12])
+    ts: str = Field(examples=["2026-08-27T03:00:04+00:00"])
+    source: str = Field(examples=["ota"])
+    level: Literal["info", "warning", "error"] = Field(examples=["warning"])
+    message: str = Field(examples=["Gecelik denetim: sistem güncel."])
+    detail: str | None = Field(default=None)
 
 
 class ErrorOut(BaseModel):

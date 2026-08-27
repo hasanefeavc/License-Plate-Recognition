@@ -36,6 +36,9 @@ __all__ = [
     "get_pipeline_optional",
     "get_plate_repository",
     "get_settings_dep",
+    "get_system_event_repository",
+    "get_system_updater",
+    "get_system_updater_for",
     "get_user_repository",
     "is_license_halted",
     "is_paused",
@@ -199,6 +202,39 @@ def get_meta_repository(request: Request) -> Any:
     return _cached_on_state(request.app, "meta_repository", factory)
 
 
+def get_system_updater_for(app: "Starlette") -> Any:
+    """The app's :class:`lpr.updater.SystemUpdater`, built on first use.
+
+    One instance per app, because it owns the single-flight lock that keeps two
+    admins from racing a rebuild against a checkout. Building it per-request
+    would give every caller its own lock and defeat the point -- and the
+    nightly scheduler has to share that same lock with the HTTP handlers, which
+    is why this takes an ``app`` rather than a ``Request``.
+    """
+
+    def factory() -> Any:
+        from lpr.updater import SystemUpdater
+
+        return SystemUpdater(get_settings())
+
+    return _cached_on_state(app, "system_updater", factory)
+
+
+def get_system_updater(request: Request) -> Any:
+    return get_system_updater_for(request.app)
+
+
+def get_system_event_repository(request: Request) -> Any:
+    """Operational audit trail (OTA updates), separate from the plate log."""
+
+    def factory() -> Any:
+        from lpr.db import SystemEventRepository
+
+        return SystemEventRepository()
+
+    return _cached_on_state(request.app, "system_event_repository", factory)
+
+
 def get_settings_dep() -> Settings:
     return get_settings()
 
@@ -209,5 +245,7 @@ LogRepo = Annotated[Any, Depends(get_log_repository)]
 UserRepo = Annotated[Any, Depends(get_user_repository)]
 MetaRepo = Annotated[Any, Depends(get_meta_repository)]
 AdminSettings = Annotated[Settings, Depends(get_settings_dep)]
+SystemUpdaterDep = Annotated[Any, Depends(get_system_updater)]
+SystemEventRepo = Annotated[Any, Depends(get_system_event_repository)]
 Pipeline = Annotated[Any, Depends(get_pipeline)]
 OptionalPipeline = Annotated[Any, Depends(get_pipeline_optional)]

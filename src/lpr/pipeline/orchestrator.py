@@ -57,7 +57,7 @@ from lpr.contracts import (
     Voter,
     utc_now_iso,
 )
-from lpr.db import LogRepository, PlateRepository, init_db
+from lpr.db import LogRepository, PlateRepository, SystemEventRepository, init_db
 from lpr.db.connection import close_all as close_thread_connection
 from lpr.pipeline.camera import CameraWorker
 from lpr.pipeline.snapshots import SnapshotWriter
@@ -124,6 +124,7 @@ class PipelineOrchestrator:
 
         self._plates = PlateRepository()
         self._logs = LogRepository()
+        self._system_events = SystemEventRepository()
 
         # Evidence retention. Built here (so it is available to tests that
         # never call start()), started and stopped with the pipeline.
@@ -723,11 +724,17 @@ class PipelineOrchestrator:
         not delay startup, and uses ``Event.wait`` so ``stop()`` interrupts
         it immediately instead of after up to 24 hours.
 
-        Both stores are trimmed from this one thread rather than from two:
-        they share a cadence, and a single pass keeps a log row and the image
-        it refers to expiring together.
+        All three stores are trimmed from this one thread rather than from
+        three: they share a cadence, and a single pass keeps a log row and the
+        image it refers to expiring together. The system-event trail is on a
+        separate, longer clock -- it is a handful of rows a day, and "what did
+        the machine do to itself last quarter" outlives "which cars came
+        through last week".
         """
         days = int(self._settings.database.log_retention_days)
+        event_days = int(
+            getattr(getattr(self._settings, "system_update", None), "event_retention_days", 0)
+        )
         try:
             while True:
                 try:
@@ -738,6 +745,10 @@ class PipelineOrchestrator:
                     self._snapshots.purge_older_than()
                 except Exception:
                     logger.exception("Snapshot retention pass failed")
+                try:
+                    self._system_events.purge_older_than(event_days)
+                except Exception:
+                    logger.exception("System event retention pass failed")
                 if self._stop_event.wait(RETENTION_INTERVAL_S):
                     break
         finally:

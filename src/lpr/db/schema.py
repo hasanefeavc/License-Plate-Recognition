@@ -19,7 +19,8 @@ from typing import Final
 
 #: Bumped whenever ``ALL_DDL`` changes shape. Stored in ``schema_meta``.
 #: v2 added ``system_meta`` (licence token + anti-rollback clock).
-SCHEMA_VERSION: Final[int] = 2
+#: v3 added ``system_events`` (operational audit trail: OTA updates).
+SCHEMA_VERSION: Final[int] = 3
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -75,6 +76,28 @@ CREATE TABLE IF NOT EXISTS system_meta (
 )
 """
 
+#: Operational audit trail, deliberately *not* the ``logs`` table.
+#:
+#: ``logs`` is plate traffic: every row is a vehicle at a barrier, and it is
+#: what feeds the history view, the CSV export and the occupancy arithmetic.
+#: Putting "an update ran at 03:00" in there would appear in an operator's
+#: history as a car, and would be counted by ``occupancy_since``. A separate
+#: table keeps the two kinds of history from corrupting each other.
+CREATE_SYSTEM_EVENTS: Final[str] = """
+CREATE TABLE IF NOT EXISTS system_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    source  TEXT NOT NULL,
+    level   TEXT NOT NULL,
+    message TEXT NOT NULL,
+    detail  TEXT
+)
+"""
+
+CREATE_IDX_SYSTEM_EVENTS_TS: Final[str] = (
+    "CREATE INDEX IF NOT EXISTS idx_system_events_ts ON system_events(ts)"
+)
+
 CREATE_IDX_LOGS_TS: Final[str] = "CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts)"
 
 CREATE_IDX_LOGS_PLATE: Final[str] = "CREATE INDEX IF NOT EXISTS idx_logs_plate ON logs(plate)"
@@ -90,9 +113,11 @@ ALL_DDL: Final[tuple[str, ...]] = (
     CREATE_LOGS,
     CREATE_SCHEMA_META,
     CREATE_SYSTEM_META,
+    CREATE_SYSTEM_EVENTS,
     CREATE_IDX_LOGS_TS,
     CREATE_IDX_LOGS_PLATE,
     CREATE_IDX_LOGS_CAMERA_TS,
+    CREATE_IDX_SYSTEM_EVENTS_TS,
 )
 
 #: Connection-level pragmas applied to every new connection.
@@ -125,3 +150,18 @@ UPSERT_SYSTEM_META: Final[str] = (
 SELECT_SYSTEM_META: Final[str] = "SELECT value FROM system_meta WHERE key = ?"
 
 DELETE_SYSTEM_META: Final[str] = "DELETE FROM system_meta WHERE key = ?"
+
+INSERT_SYSTEM_EVENT: Final[str] = (
+    "INSERT INTO system_events (ts, source, level, message, detail) VALUES (?, ?, ?, ?, ?)"
+)
+
+SELECT_SYSTEM_EVENTS: Final[str] = (
+    "SELECT id, ts, source, level, message, detail FROM system_events ORDER BY id DESC LIMIT ?"
+)
+
+SELECT_SYSTEM_EVENTS_BY_SOURCE: Final[str] = (
+    "SELECT id, ts, source, level, message, detail FROM system_events "
+    "WHERE source = ? ORDER BY id DESC LIMIT ?"
+)
+
+DELETE_SYSTEM_EVENTS_OLDER_THAN: Final[str] = "DELETE FROM system_events WHERE ts < ?"

@@ -555,6 +555,107 @@ class UserRepository:
 # ---------------------------------------------------------------------------
 # System metadata
 # ---------------------------------------------------------------------------
+# System events (operational audit trail)
+# ---------------------------------------------------------------------------
+
+
+class SystemEventRepository:
+    """Append-only operational history: OTA updates, and anything like them.
+
+    Deliberately separate from :class:`LogRepository`. ``logs`` is plate
+    traffic -- it drives the history view, the CSV export and the occupancy
+    arithmetic -- so an "update installed" row in there would show up in an
+    operator's history as a vehicle and be counted as one. These two kinds of
+    history have different readers, different retention pressure and different
+    schemas; sharing a table would only make both worse.
+    """
+
+    __slots__ = ()
+
+    #: Levels are advisory, matching the logging module so the admin UI can
+    #: colour a row without inventing its own vocabulary.
+    LEVELS = ("info", "warning", "error")
+
+    def write(
+        self,
+        source: str,
+        message: str,
+        level: str = "info",
+        detail: str | None = None,
+    ) -> int:
+        """Record one event and return its rowid; 0 if it could not be stored.
+
+        Never raises. This is an audit trail, not a control path -- a failure
+        to write the breadcrumb must not abort the operation that produced it,
+        which for the nightly updater would mean a database hiccup cancelling
+        an update.
+        """
+        normalised = level if level in self.LEVELS else "info"
+        try:
+            with transaction() as conn:
+                cur = conn.execute(
+                    schema.INSERT_SYSTEM_EVENT,
+                    (
+                        utc_now_iso(),
+                        str(source)[:64],
+                        normalised,
+                        str(message)[:512],
+                        None if detail is None else str(detail)[:4000],
+                    ),
+                )
+                return int(cur.lastrowid or 0)
+        except Exception:
+            logger.warning("Sistem olayı kaydedilemedi: %s", message, exc_info=True)
+            return 0
+
+    def recent(self, limit: int = 50, source: str | None = None) -> list[dict[str, Any]]:
+        """Most recent events first, newest at index 0."""
+        capped = max(1, min(int(limit), 500))
+        try:
+            conn = get_connection()
+            if source:
+                rows = conn.execute(
+                    schema.SELECT_SYSTEM_EVENTS_BY_SOURCE, (str(source), capped)
+                ).fetchall()
+            else:
+                rows = conn.execute(schema.SELECT_SYSTEM_EVENTS, (capped,)).fetchall()
+        except Exception:
+            logger.warning("Sistem olayları okunamadı", exc_info=True)
+            return []
+        return [
+            {
+                "id": int(row["id"]),
+                "ts": str(row["ts"]),
+                "source": str(row["source"]),
+                "level": str(row["level"]),
+                "message": str(row["message"]),
+                "detail": row["detail"],
+            }
+            for row in rows
+        ]
+
+    def purge_older_than(self, days: int) -> int:
+        """Delete events older than ``days``; ``days <= 0`` is a no-op."""
+        if days <= 0:
+            return 0
+        cutoff = (
+            (datetime.now(timezone.utc) - timedelta(days=int(days)))
+            .replace(microsecond=0)
+            .isoformat()
+        )
+        try:
+            with transaction() as conn:
+                cur = conn.execute(schema.DELETE_SYSTEM_EVENTS_OLDER_THAN, (cutoff,))
+                removed = int(cur.rowcount or 0)
+        except Exception:
+            logger.warning("Sistem olayları temizlenemedi", exc_info=True)
+            return 0
+        if removed:
+            logger.info("Purged %d system events older than %d days", removed, days)
+        return removed
+
+
+# ---------------------------------------------------------------------------
 
 
 class SystemMetaRepository:
