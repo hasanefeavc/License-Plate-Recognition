@@ -153,6 +153,10 @@ class PreprocessConfig(BaseModel):
     frame_unsharp_amount: float = Field(default=0.5, ge=0.0, le=3.0)
     #: Unsharp strength inside the OCR crop pre-pass. 0 disables sharpening.
     crop_unsharp_amount: float = Field(default=0.6, ge=0.0, le=3.0)
+    #: Dynamic gamma + percentile contrast stretch on the crop, ahead of CLAHE.
+    #: Rescues plates shot under a headlight or in deep shadow. Self-limiting:
+    #: a normally-exposed crop is passed through untouched.
+    normalize_lighting: bool = True
     #: Retry a failed read on a perspective-corrected copy of the crop. Costs
     #: an extra OCR pass, but only on crops that produced no valid plate.
     rectify_perspective: bool = True
@@ -163,6 +167,15 @@ class OcrConfig(BaseModel):
     gpu: bool = False
     min_confidence: float = 0.5
     allowlist: str = "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
+    #: Extra engines pooled into the per-frame ensemble vote alongside
+    #: ``backend``. Empty by default: the ensemble already votes across the
+    #: several enhanced views of each crop, which recovers most view-dependent
+    #: glyph confusions at no extra model cost. A second *engine* adds a
+    #: genuinely independent opinion but also its own memory and warmup, so it
+    #: is opt-in -- e.g. ``["paddleocr"]`` alongside the default easyocr.
+    #: Engines are queried in order and the ensemble stops as soon as it holds
+    #: a grammatical read, so the second one is a cost paid on hard crops only.
+    ensemble_backends: list[str] = Field(default_factory=list)
 
 
 class VotingConfig(BaseModel):

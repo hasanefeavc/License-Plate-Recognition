@@ -93,8 +93,16 @@ MAX_PLATE_LEN = 9
 #: text cannot turn into an unbounded candidate list.
 MAX_CANDIDATES = 16
 
-# A substring needing more than this many glyph repairs is not a plate we are
+# A read needing more than this many glyph repairs is not a plate we are
 # willing to guess at.
+#
+# The budget is what stops the positional coercion from being *too* good at its
+# job. Every character has a mapping available, so with no cap almost any
+# five-to-nine character word can be bent into something the grammar accepts:
+# "GIRIS" (the sign over the gate) becomes "61R15" for four edits, and the
+# barrier opens for a wall. Two repairs recovers the real failure mode -- one
+# or two confused glyphs in an otherwise clean read -- without inventing plates
+# out of signage.
 _MAX_REPAIR_COST = 2
 
 # ---------------------------------------------------------------------------
@@ -400,6 +408,11 @@ def normalize_plate(raw: str, confidence: float = 0.0) -> PlateRead:
     :func:`coerce_positional` -> substring :func:`extract_candidates`. The
     first stage that produces a grammatical plate wins.
 
+    Repairs are capped at :data:`_MAX_REPAIR_COST` edits. Without a cap the
+    coercion is too powerful to be safe: every glyph has a mapping, so a long
+    enough word can almost always be bent into something the grammar accepts,
+    and the gate would open for the "GIRIS" sign above it.
+
     ``PlateRead.raw_text`` always keeps the untouched recogniser string, so no
     information is lost and a human can audit any decision made here. When
     nothing parses, ``text`` holds the de-noised string and ``valid`` is
@@ -417,19 +430,19 @@ def normalize_plate(raw: str, confidence: float = 0.0) -> PlateRead:
     if validate(cleaned):
         return PlateRead(text=cleaned, confidence=conf, raw_text=raw_text, valid=True)
 
-    # 2. positional confusion repair
-    coerced = coerce_positional(cleaned)
-    if validate(coerced):
-        logger.debug("coerced %r -> %r", cleaned, coerced)
+    # 2. positional confusion repair, within the repair budget
+    coerced, cost = _best_coercion(cleaned)
+    if cost <= _MAX_REPAIR_COST and validate(coerced):
+        logger.debug("coerced %r -> %r (cost %d)", cleaned, coerced, cost)
         return PlateRead(text=coerced, confidence=conf, raw_text=raw_text, valid=True)
 
     # 3. plate hiding inside a longer / multi-line read
     for candidate in extract_candidates(raw_text):
         if validate(candidate):
             return PlateRead(text=candidate, confidence=conf, raw_text=raw_text, valid=True)
-        repaired = coerce_positional(candidate)
-        if validate(repaired):
-            logger.debug("extracted %r -> %r", candidate, repaired)
+        repaired, repair_cost = _best_coercion(candidate)
+        if repair_cost <= _MAX_REPAIR_COST and validate(repaired):
+            logger.debug("extracted %r -> %r (cost %d)", candidate, repaired, repair_cost)
             return PlateRead(text=repaired, confidence=conf, raw_text=raw_text, valid=True)
 
     return PlateRead(text=cleaned, confidence=conf, raw_text=raw_text, valid=False)

@@ -168,6 +168,25 @@ def test_coercion_never_invents_a_valid_province() -> None:
         assert normalize_plate(bad).valid is False
 
 
+def test_coercion_will_not_bend_signage_into_a_plate() -> None:
+    """The repair budget is what stops the gate opening for the sign above it.
+
+    Every glyph has a mapping available, so with no cap the coercion turns
+    "GIRIS" into "61R15" for four edits and calls it a plate. Real misreads are
+    one or two confused glyphs, not four.
+    """
+    for signage in ["GIRIS", "CIKIS", "OTOPARK", "HOSGELDINIZ", "DIKKAT"]:
+        assert normalize_plate(signage).valid is False, signage
+
+
+def test_coercion_still_repairs_a_genuine_misread() -> None:
+    """The budget must not cost us the case it exists to serve."""
+    assert normalize_plate("34A8C123").text == "34ABC123"
+    assert normalize_plate("34A8C123").valid is True
+    assert normalize_plate("O6BZ1234").text == "06BZ1234"
+    assert normalize_plate("O6BZ1234").valid is True
+
+
 def test_coercion_is_idempotent() -> None:
     for plate in VALID_PLATES:
         assert coerce_positional(plate) == plate

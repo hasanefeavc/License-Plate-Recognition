@@ -11,6 +11,12 @@ Public surface:
     voter = build_voter()                # a Voter, per lpr.contracts
     plate = voter.submit("entry", read)  # str once confirmed, else None
 
+Two independent aggregation layers sit behind that ``read``. Within one frame,
+:mod:`lpr.ocr.ensemble` votes across the enhanced views of a single crop (and
+across engines, when ``ocr.ensemble_backends`` names more than one). Across
+frames, :mod:`lpr.ocr.voting` votes over a sliding time window before the gate
+is allowed to move.
+
 Import cost matters here. ``lpr.ocr.normalize`` and ``lpr.ocr.voting`` are pure
 python (standard library only) and are re-exported eagerly, so tests, the API
 and the GUI can use them with nothing installed. The recogniser backends pull
@@ -24,6 +30,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from lpr.ocr.ensemble import Ballot, EnsembleRecognizer, vote
 from lpr.ocr.normalize import (
     CONFUSION_MAP,
     PLATE_RE,
@@ -46,7 +53,9 @@ __all__ = [
     "CONFUSION_MAP",
     "PLATE_RE",
     "TURKISH_LETTERS",
+    "Ballot",
     "EasyOcrRecognizer",
+    "EnsembleRecognizer",
     "MultiFrameVoter",
     "PaddleOcrRecognizer",
     "build_recognizer",
@@ -57,6 +66,7 @@ __all__ = [
     "normalize_plate",
     "strip_noise",
     "validate",
+    "vote",
 ]
 
 #: Backends selectable through ``settings.ocr.backend``.
@@ -77,7 +87,35 @@ def build_recognizer(settings: "Settings | None" = None) -> "Recognizer":
 
         settings = get_settings()
 
-    backend = (settings.ocr.backend or "").strip().lower()
+    primary = _build_backend(settings.ocr.backend, settings)
+
+    extras = [
+        name
+        for name in (getattr(settings.ocr, "ensemble_backends", None) or [])
+        if (name or "").strip().lower() != (settings.ocr.backend or "").strip().lower()
+    ]
+    if not extras:
+        return primary
+
+    members: list[Any] = [primary]
+    for name in extras:
+        try:
+            members.append(_build_backend(name, settings))
+        except RuntimeError as exc:
+            # A missing optional engine must not take down a working pipeline:
+            # the ensemble is an accuracy improvement, not a dependency.
+            logger.warning("Ensemble backend %r unavailable, continuing without it: %s", name, exc)
+
+    if len(members) == 1:
+        return primary
+
+    logger.info("OCR ensemble active: %s", ", ".join(type(member).__name__ for member in members))
+    return EnsembleRecognizer(members)
+
+
+def _build_backend(name: str, settings: "Settings") -> "Recognizer":
+    """Construct one named OCR backend."""
+    backend = (name or "").strip().lower()
     if backend == "easyocr":
         from lpr.ocr.recognizer import EasyOcrRecognizer
 
@@ -87,10 +125,7 @@ def build_recognizer(settings: "Settings | None" = None) -> "Recognizer":
 
         return PaddleOcrRecognizer(settings)
 
-    raise RuntimeError(
-        f"Unknown ocr.backend {settings.ocr.backend!r}. Supported backends: "
-        f"{', '.join(BACKENDS)}."
-    )
+    raise RuntimeError(f"Unknown ocr.backend {name!r}. Supported backends: {', '.join(BACKENDS)}.")
 
 
 def __getattr__(name: str) -> Any:

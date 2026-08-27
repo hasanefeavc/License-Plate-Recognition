@@ -48,8 +48,12 @@ src/lpr/
 ├── hardware/relay.py   queue-driven serial relay + MockRelay fallback
 ├── pipeline/           per-camera capture threads, orchestrator, DI factory
 │   └── snapshots.py    one JPEG per gate decision, written off the hot path
-├── detect/             YOLOv8n detector, crop preprocessing, contour fallback
-├── ocr/                EasyOCR/PaddleOCR backends, TR normaliser, voting
+├── detect/             YOLOv8n detector, contour fallback
+│   └── preprocess.py   gamma/contrast, CLAHE, unsharp, deskew, perspective warp
+├── ocr/                EasyOCR/PaddleOCR backends
+│   ├── ensemble.py     per-frame confidence-weighted vote across views + engines
+│   ├── normalize.py    Turkish plate grammar, positional repair, edit-cost cap
+│   └── voting.py       multi-frame temporal consensus
 ├── api/                FastAPI routes, JWT auth, MJPEG stream, WS events
 └── ui/                 Tkinter client + transport-only API/WS client
 web/                    browser dashboard (static HTML/JS, served at /web)
@@ -183,26 +187,36 @@ The legacy pipeline was Canny edge detection → contour search → a four-point
 Tesseract `--psm 8`. It needed a clean quadrilateral, so it failed on angled, blurred,
 night and partially-occluded plates.
 
-The replacement stacks five independent accuracy layers:
+The replacement stacks six independent accuracy layers:
 
 1. **YOLOv8n detection** — learned plate localisation, plus plausibility filters on
    aspect ratio, area, and Laplacian sharpness so blurred crops never reach OCR.
-2. **Crop enhancement** — upscale, CLAHE, bilateral denoise, unsharp mask, deskew; the
-   recogniser tries the grayscale, thresholded and deskewed variants and keeps the best
-   candidate. If none of them yields a *grammatical* plate, it escalates to a
-   **perspective-rectified** copy of the crop — the plate's four corners are located and
-   warped back to a head-on rectangle — and tries again. That second stage is what reads
-   a plate photographed from the side, which deskew (rotation only) cannot correct, and
-   it is skipped entirely on the plates the cheap variants already read.
-3. **Turkish normalisation** — `^(0[1-9]|[1-7][0-9]|8[01])([A-Z]{1,3})([0-9]{2,4})$`,
+2. **Crop enhancement** — upscale, dynamic gamma + percentile contrast stretch, CLAHE,
+   bilateral denoise, unsharp mask, deskew; the recogniser builds the grayscale,
+   thresholded and deskewed variants. If none of them yields a *grammatical* plate, it
+   escalates to a **perspective-rectified** copy of the crop — the plate's four corners
+   are located and warped back to a head-on rectangle — and tries again. That second
+   stage is what reads a plate photographed from the side, which deskew (rotation only)
+   cannot correct, and it is skipped entirely on the plates the cheap variants read.
+3. **Per-frame ensemble vote** — the variants are not ranked by confidence and topped;
+   they *vote*. Every candidate is normalised, grouped by the plate string it produces,
+   and each group scores the sum of its members' confidences. Which glyphs a view
+   confuses depends on the view — `0`/`O` flips with the binarisation threshold, `8`/`B`
+   with the sharpening — so agreement across views is stronger evidence than any one
+   view's certainty, and an over-confident outlier can no longer win outright. Set
+   `ocr.ensemble_backends: [paddleocr]` to add a second engine as an equal voter.
+4. **Turkish normalisation** — `^(0[1-9]|[1-7][0-9]|8[01])([A-Z]{1,3})([0-9]{2,4})$`,
    with a *positional* confusion map (`0↔O`, `1↔I`, `8↔B`, `5↔S`, …) applied per block:
    digits in the province code, letters in the middle, digits in the tail. Q/W/X and
-   the diacritic letters are rejected — they never appear on Turkish plates.
-4. **ByteTrack tracking** — detection runs through `model.track(persist=True)`, so each
+   the diacritic letters are rejected — they never appear on Turkish plates. Repairs are
+   capped at **two edits**: every glyph has a mapping available, so without a cap the
+   coercion is powerful enough to bend "GIRIS" (the sign above the gate) into "61R15"
+   and call it a plate.
+5. **ByteTrack tracking** — detection runs through `model.track(persist=True)`, so each
    plate keeps a stable `track_id` while it is in view (one tracker state per camera).
    Reads sharing an id are the same physical plate and reinforce each other regardless
    of spelling, and reads from *different* ids are never merged.
-5. **Multi-frame voting** — a plate must win `min_votes` of the last `window` reads
+6. **Multi-frame voting** — a plate must win `min_votes` of the last `window` reads
    inside a `ttl_s` time window before the relay fires, with confidence weighting,
    Levenshtein-1 candidate merging, and a per-plate cooldown.
 
@@ -223,20 +237,94 @@ saving shows up as `ocr_skipped` in `GET /api/stats`. Set `detection.track: fals
 go back to stateless per-frame detection; everything downstream falls back to the
 text-only voting path when a detection has no `track_id`.
 
-### Angled and low-light plates
+### Crop preprocessing
 
-Everything in this section is software-level: it changes what the models are *shown*,
-never what they learned, so none of it needs the detector retrained.
+`src/lpr/detect/preprocess.py`
+
+Every function in this module is *total*: it validates its own input, catches its own
+exceptions, and falls back to returning the input unchanged. A preprocessing failure
+costs one frame a slightly worse read — it never takes down a capture thread.
+
+The OCR pre-pass (`enhance_plate`) runs these stages in this order, and the order is
+load-bearing:
+
+| # | Stage | Why here |
+| --- | --- | --- |
+| 1 | **Upscale** to a 64 px character height (cubic, capped at 4×) | A 20–30 px crop wastes most of the recogniser's capability. Capped because interpolating 6 px to 64 px invents detail rather than revealing it. |
+| 2 | **Dynamic gamma** (`auto_gamma` / `apply_gamma`) | Global exposure must be fixed before anything local runs. |
+| 3 | **Percentile contrast stretch** (`stretch_contrast`) | Spreads what survives gamma across the full range. |
+| 4 | **CLAHE** (clip 2.0, 8×8 tiles) | Local contrast, to separate characters from a dirty plate. |
+| 5 | **Bilateral denoise** | Edge-preserving: a plain Gaussian would soften the strokes the recogniser needs. |
+| 6 | **Unsharp mask** (`unsharp_mask`) | Puts back the stroke edges the bilateral filter softened. |
+| 7 | **Adaptive threshold** | Binarised variant, produced *last* so it thresholds a crisp image. |
+
+#### Dynamic gamma correction
+
+Aimed at night headlights, overexposed plates and deep shadow. A plate is bimodal by
+construction — dark glyphs on a light field — so a correctly exposed one sits around 0.7
+mean luminance, and its exact mean says more about how many characters it carries than
+about its exposure. Driving that towards mid-grey would "correct" every well-lit plate in
+the country.
+
+Instead `auto_gamma` defines a **healthy band** (0.35–0.78 normalised). A crop inside it
+is returned untouched. A crop outside it is pulled back to the *nearest edge* of the band
+by solving `mean ** gamma == target`, so the correction scales with the severity of the
+problem: a plate at 0.80 is nudged, a plate at 0.95 is rescued, and the two do not get
+identical treatment merely because both are "too bright". The exponent is clamped to
+0.4–2.5, and a crop clipped to solid black or solid white is declined outright — there is
+no exposure left in it to recover.
+
+`stretch_contrast` then rescales the 2nd–98th percentile range to full scale. Percentiles
+rather than min/max: one specular highlight off a rivet pins a min/max stretch to the
+extremes and achieves nothing. It declines both when the range is already wide (nothing to
+gain) and when it is nearly flat (no signal — stretching would multiply sensor noise into
+fake structure).
+
+Measured on synthetic crops (std before → after): deep shadow 17 → 109, headlight glare
+36 → 109, well-exposed plate unchanged. Cost ≈ 0.4 ms/crop.
+
+#### Unsharp masking
+
+`sharp = image + amount * (image - blur(image))`, in saturating uint8 arithmetic so a
+highlight clips to white instead of wrapping to black. A contrast threshold skips pixels
+whose local contrast is already below it, which keeps flat plate background — and the
+sensor noise living in it — from being amplified into texture the binariser would read as
+strokes. Cost ≈ 0.03 ms/crop.
+
+#### Perspective rectification
+
+`deskew` can only **rotate**, which straightens a tilted camera but does nothing for a
+plate photographed from the side: there the near edge is longer than the far one and every
+character is trapezoidal. `rectify_perspective` locates the plate's four-corner outline
+(Canny → morphological close → `approxPolyDP`) and warps that quadrilateral back to a
+rectangle, sizing the output from the *near* edge so the foreshortened far edge is
+stretched up to it.
+
+It is deliberately conservative, because a wrong warp does not degrade a crop gracefully —
+it destroys it. A quad is rejected when it is too small (< 25% of the crop), non-convex,
+would rectify to a non-plate aspect ratio, or is merely the crop's own border (a no-op
+warp that edge detection readily finds on a noisy crop). Any rejection returns `None` and
+the caller keeps what it had. Cost ≈ 0.6 ms when it runs.
+
+Rectification is an **escalation**, not a default stage: it runs only when no cheap variant
+produced a grammatical plate, so ordinary plates never pay for the extra OCR pass.
+
+#### Configuration
+
+Everything in this section is software-level — it changes what the models are *shown*,
+never what they learned, so none of it requires the detector retrained.
 
 | Knob | Default | What it does |
 | --- | --- | --- |
-| `preprocess.crop_unsharp_amount` | `0.6` | Unsharp mask inside the OCR crop pre-pass, applied after CLAHE and denoise. Puts back the stroke edges the bilateral filter softens, which is what separates a character from its own shadow on a plate lit from the side. `0` disables it. |
-| `preprocess.rectify_perspective` | `true` | Retry a failed read on a perspective-corrected crop (see above). Costs one extra OCR pass, and only on crops that already produced nothing grammatical. ~0.6 ms to find the outline; a quad that is too small, non-convex, or that would rectify to a non-plate aspect ratio is rejected rather than guessed at. |
-| `preprocess.frame_enhance` | `false` | Whole-frame CLAHE (on the LAB lightness channel, so hue is left alone) plus a mild unsharp mask, applied **before the detector**. ~12 ms per 720p frame. |
+| `preprocess.normalize_lighting` | `true` | Dynamic gamma + percentile contrast stretch, ahead of CLAHE. Runs before CLAHE deliberately: CLAHE equalises per 8×8 tile and will amplify the noise inside a black tile to full scale if the crop arrives globally underexposed. Self-limiting — a normally-exposed plate passes through untouched. |
+| `preprocess.crop_unsharp_amount` | `0.6` | Unsharp strength in the crop pre-pass. `0` disables it. |
+| `preprocess.rectify_perspective` | `true` | Retry a failed read on a perspective-corrected crop. One extra OCR pass, only on crops that already produced nothing grammatical. |
+| `ocr.ensemble_backends` | `[]` | Extra OCR engines pooled into the per-frame vote as equal voters, e.g. `[paddleocr]`. |
+| `preprocess.frame_enhance` | `false` | Whole-frame CLAHE (on the LAB lightness channel, so hue is left alone) plus a mild unsharp mask, applied **before the detector**. ≈ 12 ms per 720p frame. |
 
 The crop-level settings are on by default because they can only ever affect what the
-*recogniser* sees, and the recogniser keeps the best read across several variants — a
-variant that an enhancement made worse simply loses.
+*recogniser* sees, and the recogniser votes across several variants — a variant that an
+enhancement made worse simply loses.
 
 `frame_enhance` is off by default because it is the one setting here that can make things
 worse. It changes what the *detector* sees, and there is no "best of several tries"
@@ -251,6 +339,120 @@ paid on the handful of frames per second that are actually going to be looked at
 capture loop keeps draining the camera at full rate regardless. The enhanced frame goes
 to the detector only: `latest_frame()`, the MJPEG preview and the evidence snapshot all
 keep the untouched frame, so what gets recorded stays what the camera saw.
+
+### Ensemble OCR voting
+
+`src/lpr/ocr/ensemble.py`
+
+Each plate crop produces several *views* — CLAHE'd grayscale, adaptive-threshold
+binarisation, deskewed, and (on escalation) perspective-rectified. Earlier revisions kept
+whichever single candidate scored highest on `(valid, confidence)`. That discards the most
+useful signal available: **how many independent views agreed**.
+
+Which glyphs a view confuses is a property of the view. `0` vs `O` flips with the
+binarisation threshold; `8` vs `B` flips with the sharpening. So the correct reading is
+the one that keeps recurring across views, while each particular misreading tends to
+appear once. A single over-confident outlier can win an argmax; it cannot win a vote.
+
+**Scoring.** Ballots are normalised through `normalize_plate`, grouped by the resulting
+plate string, and each group scores the **sum of its members' confidences** — a
+confidence-weighted majority:
+
+- Three agreeing reads at 0.6 (Σ 1.8) beat one emphatic read at 0.9.
+- Three hesitant reads at 0.2 (Σ 0.6) do **not**.
+- A grammatical read always outranks an ungrammatical one, whatever the arithmetic says.
+
+**Near-miss merging.** Two grammatical spellings one Levenshtein edit apart are the same
+plate seen through different noise, so they are merged onto the stronger spelling before
+the winner is picked. Without this, `34ABC12` seen twice and `34ABD12` seen once are three
+separate one-vote groups and the ensemble has learned nothing. Only *grammatical* groups
+merge — two similar pieces of junk say nothing about which is a plate, and merging them
+would manufacture agreement out of noise.
+
+**Reported confidence.** The winner carries the confidence of the strongest single ballot
+that spelled *that exact string* — not the summed score (a ranking quantity, not a
+probability) and not a merged near-miss's confidence. `ocr.min_confidence` and the
+multi-frame voter both read this field, so it has to keep meaning "how sure was the engine
+about this string".
+
+**Multi-engine.** `EnsembleRecognizer` pools members' raw *ballots* rather than their
+verdicts, so engines vote on equal footing instead of one being a tie-break for the other.
+Members are queried in order and the vote stops as soon as it holds a grammatical read, so
+a second engine is a cost paid on hard crops, not on every car. A member that raises is
+dropped for that crop and the vote proceeds on the rest — half an ensemble still beats no
+read. Enable with `ocr.ensemble_backends: [paddleocr]`; a configured engine that is not
+installed logs a warning and is skipped rather than failing the pipeline.
+
+The module is pure Python (standard library + `lpr.contracts`), so it is unit-testable with
+no ML stack present.
+
+### Turkish plate grammar and repair budget
+
+`src/lpr/ocr/normalize.py` — also pure Python, no numpy, no cv2.
+
+**Grammar.** A Turkish civilian plate is `<province 01–81> <1–3 letters> <2–4 digits>`,
+expressed as:
+
+```
+^(0[1-9]|[1-7][0-9]|8[01])([A-Z]{1,3})([0-9]{2,4})$
+```
+
+The letter block is additionally restricted to the Turkish plate alphabet
+(`ABCDEFGHIJKLMNOPRSTUVYZ`). `Q`, `W`, `X` and the diacritic letters (Ç, Ğ, İ, Ö, Ş, Ü)
+never appear on Turkish plates, so a read containing one is an OCR error or not a plate —
+a constraint plain `[A-Z]` cannot express.
+
+**Positional repair.** OCR engines confuse whole glyph classes: `0`/`O`/`D`/`Q`,
+`1`/`I`/`L`, `8`/`B`, `5`/`S`, `2`/`Z`, `4`/`A`, `6`/`G`, `7`/`T`. A *global* substitution
+table is self-defeating — fixing `O` → `0` in the province block breaks the letter block.
+Because the grammar pins the character *class* of every position, the map is applied
+**directionally**, and every legal segmentation is scored by how many characters it must
+touch, cheapest winning:
+
+```
+"O6BZ1234"  →  "06BZ1234"     letter O in a digit slot     (1 edit)
+"34A8C123"  →  "34ABC123"     digit 8 in a letter slot     (1 edit)
+```
+
+**Edit-cost cap.** Repairs are capped at **two edits**. This is what keeps the coercion
+from being too good at its job: every glyph has a mapping available, so with no cap almost
+any 5–9 character word can be bent into something the grammar accepts. Uncapped, `GIRIS` —
+the sign above the gate — becomes `61R15` for four edits, and the barrier opens for a wall.
+
+| Input | Result | Why |
+| --- | --- | --- |
+| `34A8C123` | `34ABC123`, valid | 1 edit — a genuine glyph confusion |
+| `O6BZ1234` | `06BZ1234`, valid | 1 edit |
+| `GIRIS` | rejected | 4 edits — over budget |
+| `CIKIS`, `OTOPARK`, `HOSGELDINIZ`, `DIKKAT` | rejected | over budget |
+| `34WAB12` | rejected | `W` is not a Turkish plate letter |
+| `00ABC12`, `82ABC12` | rejected | province outside 01–81 |
+
+`PlateRead.raw_text` always retains the untouched recogniser string, so no information is
+lost and any decision made here can be audited after the fact. When nothing parses, the
+speculative repair is deliberately *not* returned — a repair that failed validation is
+noise, not a plate.
+
+### Two voting layers, and why they are separate
+
+| | `lpr.ocr.ensemble` | `lpr.ocr.voting` |
+| --- | --- | --- |
+| Votes across | views of **one crop** (and engines) | reads across **frames** |
+| Window | a single frame | `voting.ttl_s` sliding window |
+| Recovers | view-dependent glyph confusion (`0`/`O`, `8`/`B`) | one-off misreads, momentary occlusion |
+| Output | one `PlateRead` | a confirmed plate, or nothing |
+
+They compose: the ensemble decides what this frame saw, the multi-frame voter decides
+whether the gate may move. Both weight by confidence and both merge spellings one edit
+apart, but at different scales — a plate confused the same way in every view of one frame
+is still only *one* vote at the temporal layer.
+
+The temporal layer is tuned by `voting.window` (how many reads are retained),
+`voting.min_votes` (how many must agree) and `voting.ttl_s` (how long a vote survives).
+Shipped defaults are 5 / 3 / 4.0s. **Shortening `ttl_s` makes confirmation stricter, not
+better** — three reads must then land within a narrower window, so a car crossing slowly
+or a plate briefly occluded confirms less often. Raise `min_votes` if you want fewer false
+opens; shorten `ttl_s` only if you want the gate to forget a car faster.
 
 ### ONNX (optional)
 
@@ -374,8 +576,42 @@ make lint      # ruff + mypy
 make fmt
 ```
 
-Tests run without torch, OpenCV or a camera: the ML-dependent modules are
-`importorskip`-guarded and the pipeline tests use protocol fakes.
+### Test suite
+
+**473 passing tests** across 15 modules (475 collected: 473 pass, 1 skipped, 1 known
+failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
+`importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
+fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
+
+| Module | Tests | Covers |
+| --- | ---: | --- |
+| `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
+| `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
+| `test_api.py` | 48 | Routes, JWT auth, MJPEG stream, WebSocket events |
+| `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
+| `test_pipeline.py` | 37 | Queue semantics, frame stride, thread lifecycle, subscriber fan-out |
+| `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
+| `test_db.py` | 27 | Repositories, migrations, retention |
+| `test_ui_client.py` | 26 | Transport-only API/WS client |
+| `test_web_ui.py` | 19 | Browser dashboard endpoints |
+| `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
+| `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
+| `test_parking.py` | 18 | Occupancy accounting |
+| `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
+| `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
+| `test_preprocess_pipeline.py` | 11 | Preprocessing wiring: escalation staging, frame-hook injection |
+
+The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
+`test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
+`test_preprocess_pipeline.py` together account for 220 of the 475 collected tests. Every
+preprocessing primitive is additionally asserted to be *total* — it must return its input
+unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
+
+> **Known failure:** `test_license.py::test_an_hs256_token_signed_with_the_public_key_is_rejected`
+> currently fails against recent `pyjwt` releases. The test forges an HS256 token using an
+> RSA public key; newer `pyjwt` refuses that at *signing* time, so the failure occurs in
+> the test's own setup rather than in the code under test. The licence check itself is
+> unaffected. The test needs rewriting to construct the forged token directly.
 
 ---
 

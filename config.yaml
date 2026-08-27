@@ -156,6 +156,24 @@ preprocess:
 
   crop_unsharp_amount: 0.6
 
+  # Dynamic gamma + percentile contrast stretch on each crop, ahead of CLAHE.
+
+  # This is the night-glare / deep-shadow rescue: a crop whose mean luminance
+
+  # falls outside a healthy band is pulled back to the nearest edge of it, then
+
+  # stretched across the full range. Both stages are self-limiting, so a
+
+  # normally-exposed plate passes through untouched -- which is why it is safe
+
+  # to leave on. Runs before CLAHE on purpose: CLAHE equalises contrast per
+
+  # tile and will happily amplify the noise inside a black tile to full scale
+
+  # if the crop arrives globally underexposed.
+
+  normalize_lighting: true
+
   # When no variant of a crop produces a grammatical plate, retry on a
 
   # perspective-corrected copy: the plate's four corners are found and warped
@@ -179,6 +197,24 @@ ocr:
   min_confidence: 0.5
 
   allowlist: "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
+
+  # Extra OCR engines pooled into the per-frame ensemble vote alongside
+
+  # `backend`. Empty by default: the ensemble already votes across the several
+
+  # enhanced views of every crop, which is where most view-dependent glyph
+
+  # confusions (0/O, 8/B) are recovered, and that costs no extra model. A
+
+  # second *engine* adds a genuinely independent opinion but brings its own
+
+  # memory footprint and warmup, so it is opt-in. Engines are queried in order
+
+  # and the vote stops as soon as it holds a grammatical read, so the second
+
+  # engine is a cost paid on hard crops only. Example: [paddleocr]
+
+  ensemble_backends: []
 
 
 
