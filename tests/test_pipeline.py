@@ -91,6 +91,7 @@ def _build_pipeline(
     recognizer: Any = None,
     voter: Any = None,
     relay: Any = None,
+    notifier: Any = None,
 ) -> PipelineOrchestrator:
     return PipelineOrchestrator(
         settings=settings,
@@ -98,6 +99,7 @@ def _build_pipeline(
         recognizer=recognizer or FakeRecognizer(),
         voter=voter or FakeVoter(),
         relay=relay or FakeRelay(),
+        notifier=notifier,
     )
 
 
@@ -817,3 +819,123 @@ def test_retention_runs_at_startup(db, monkeypatch, frame) -> None:
         assert calls == [db.database.log_retention_days]
     finally:
         pipeline.stop(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# E-mail notification wiring
+# ---------------------------------------------------------------------------
+
+
+class RecordingNotifier:
+    """Stands in for ``lpr.notify.EmailNotifier`` at the pipeline boundary."""
+
+    def __init__(self, wanted: tuple[str, ...] = ("unauthorized", "blacklisted")) -> None:
+        self.wanted = set(wanted)
+        self.sent: list[Any] = []
+        self.started = False
+        self.stopped = False
+
+    def wants(self, reason: str) -> bool:
+        return reason in self.wanted
+
+    def notify(self, notification: Any) -> bool:
+        self.sent.append(notification)
+        return True
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self.stopped = True
+
+    @property
+    def reasons(self) -> list[str]:
+        return [item.reason for item in self.sent]
+
+
+def test_a_refused_vehicle_raises_an_unauthorized_alert(db, frame) -> None:
+    notifier = RecordingNotifier()
+    pipeline = _build_pipeline(db, notifier=notifier)
+
+    pipeline.process_frame("entry", frame)  # plate is not registered
+
+    assert notifier.reasons == ["unauthorized"]
+    assert notifier.sent[0].plate == "34ABC123"
+    assert notifier.sent[0].camera == "entry"
+
+
+def test_a_blocked_plate_raises_a_blacklisted_alert(db, frame) -> None:
+    """On the list and barred is a different event from never listed."""
+    PlateRepository().upsert("34ABC123", blocked=True)
+    notifier = RecordingNotifier()
+    pipeline = _build_pipeline(db, notifier=notifier)
+
+    pipeline.process_frame("entry", frame)
+
+    assert notifier.reasons == ["blacklisted"]
+
+
+def test_an_authorised_vehicle_raises_no_alert(db, frame) -> None:
+    """The alert is about refusals; a resident arriving is not news."""
+    PlateRepository().add("34ABC123")
+    notifier = RecordingNotifier()
+    pipeline = _build_pipeline(db, notifier=notifier)
+
+    pipeline.process_frame("entry", frame)
+
+    assert notifier.sent == []
+
+
+def test_an_expired_permit_is_refused(db, frame) -> None:
+    """`expires_at` is an access rule, not decoration on the resident list."""
+    PlateRepository().upsert("34ABC123", expires_at="2020-01-01T00:00:00+00:00")
+    notifier = RecordingNotifier()
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay, notifier=notifier)
+
+    pipeline.process_frame("entry", frame)
+
+    assert relay.triggers == 0, "an expired permit must not open the gate"
+    assert notifier.reasons == ["unauthorized"]
+
+
+def test_a_disinterested_notifier_is_not_called(db, frame) -> None:
+    """`notify_on_unauthorized: false` must cost nothing, not send and discard."""
+    notifier = RecordingNotifier(wanted=("blacklisted",))
+    pipeline = _build_pipeline(db, notifier=notifier)
+
+    pipeline.process_frame("entry", frame)
+
+    assert notifier.sent == []
+
+
+def test_a_failing_notifier_does_not_break_the_decision(db, frame) -> None:
+    """The gate decision is already made, logged and photographed by this point."""
+
+    class ExplodingNotifier(RecordingNotifier):
+        def notify(self, notification: Any) -> bool:
+            raise RuntimeError("smtp exploded")
+
+    pipeline = _build_pipeline(db, notifier=ExplodingNotifier())
+    events = pipeline.process_frame("entry", frame)
+
+    assert [e.action for e in events] == [str(Action.DENIED)]
+    assert LogRepository().count_matching() == 1
+
+
+def test_no_notifier_is_the_normal_case(db, frame) -> None:
+    """The default pipeline has none, and must not reference one."""
+    pipeline = _build_pipeline(db)
+    assert [e.action for e in pipeline.process_frame("entry", frame)] == [str(Action.DENIED)]
+
+
+def test_a_cooldown_repeat_does_not_re_alert(db, monkeypatch, frame) -> None:
+    """A car idling at the gate is one e-mail, not one per frame."""
+    monkeypatch.setattr(db.voting, "cooldown_s", 60.0)
+    notifier = RecordingNotifier()
+    pipeline = _build_pipeline(db, notifier=notifier)
+
+    for _ in range(4):
+        pipeline.process_frame("entry", frame)
+
+    assert len(notifier.sent) == 1

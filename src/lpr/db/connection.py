@@ -29,6 +29,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 from lpr.config import get_settings
 from lpr.db import schema
@@ -263,6 +264,7 @@ def init_db(force: bool = False) -> None:
         with transaction() as tx:
             for statement in schema.ALL_DDL:
                 tx.execute(statement)
+            _add_missing_plate_columns(tx)
             tx.execute(
                 schema.UPSERT_SCHEMA_META,
                 (schema.SCHEMA_VERSION_KEY, str(schema.SCHEMA_VERSION)),
@@ -274,6 +276,34 @@ def init_db(force: bool = False) -> None:
         # Windows nicety carried over from the legacy app; a documented
         # no-op everywhere else. All OS branching lives in platform_compat.
         hide_file(path)
+
+
+def _add_missing_plate_columns(tx: Any) -> None:
+    """Bring a pre-v4 ``plates`` table up to the current shape.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op on a table that already exists,
+    so a database created by an older build keeps its three-column ``plates``
+    and every query naming ``owner`` fails at runtime. This closes that gap the
+    only way SQLite allows: ``ALTER TABLE ADD COLUMN``, one column at a time.
+
+    Safe to run on every start. It reads the live column list first and issues
+    nothing when the table is already current, so the common path costs one
+    ``PRAGMA``.
+    """
+    try:
+        existing = {str(row[1]) for row in tx.execute("PRAGMA table_info(plates)")}
+    except Exception:  # pragma: no cover - table always exists by this point
+        logger.debug("Could not inspect the plates table", exc_info=True)
+        return
+
+    for column, statement in schema.PLATES_ADDED_COLUMNS:
+        if column in existing:
+            continue
+        try:
+            tx.execute(statement)
+            logger.info("Migrated plates: added column %s", column)
+        except Exception:  # pragma: no cover - raced with another process
+            logger.warning("Could not add plates.%s", column, exc_info=True)
 
 
 def schema_version() -> int:

@@ -170,6 +170,8 @@ snapshots:
 | `GET /health` | none | liveness; reports `degraded` when the pipeline is down |
 | `POST /api/auth/login` · `/register` | none · first-user-or-admin | JWT bearer token |
 | `GET/POST /api/plates` · `DELETE /api/plates/{plate}` | user · admin | allow-list CRUD |
+| `POST /api/plates/import` · `GET /api/plates/export` | admin | bulk CSV in/out |
+| `GET /api/events/export` | user | access history as CSV |
 | `GET /api/logs` · `/api/logs/dates` | user | history, filterable by camera/plate/date |
 | `GET /api/stats` · `/api/cameras` | user | pipeline and per-camera health |
 | `POST /api/relay/trigger` · `/api/pipeline/pause` · `/resume` | admin | manual control |
@@ -548,6 +550,111 @@ custom model exists, `fetch_models.py` stops downloading the baseline and says s
 
 ---
 
+## Email alerts
+
+When a vehicle is refused at the gate, the service can send an email with the
+event snapshot attached. Off by default (`smtp.enabled`).
+
+Two situations, separately switchable, because they mean different things to an
+operator — an unknown car at 3 a.m. is a question, a barred one is an answer:
+
+| Setting | Fires when |
+|---|---|
+| `smtp.notify_on_unauthorized` | the plate is not on the list at all |
+| `smtp.notify_on_blacklisted` | the plate **is** on the list but flagged `blocked` |
+
+Nothing about this is on the recognition path. `notify()` puts the alert on a
+bounded queue and returns; one daemon worker owns the SMTP conversation — the
+same shape as the relay and the snapshot writer, and for the same reason. A
+refused connection, a rejected recipient or a full queue is logged and dropped:
+the decision it is reporting on has already been made, recorded in `logs` and
+photographed before this module was asked to do anything.
+
+The attachment is the very JPEG `snapshots.py` wrote, not a second encode of
+the same frame — `SnapshotWriter.submit()` takes an `on_saved` callback that
+fires on the writer thread once the file is down. It fires on *failure* too, so
+a full disk costs the photograph but never the alert.
+
+Two things worth being deliberate about before enabling it:
+
+- **`smtp.password` in a YAML file is a credential at rest.** Prefer
+  `LPR_SMTP__PASSWORD`, which overrides the file and keeps the secret out of
+  the repository and out of config backups.
+- **The snapshot is personal data in most jurisdictions.** Send it to a mailbox
+  the site operator controls, and keep `to_emails` short.
+
+Repeat alerts are already bounded by `voting.cooldown_s`: a car idling at the
+gate re-confirms constantly but decides once, so one refused vehicle is one
+email, not one per frame.
+
+---
+
+## Bulk plate lists (CSV)
+
+The `plates` table carries resident data as of schema v4 — `owner`,
+`apartment`, `expires_at` and `blocked` alongside the plate. Existing databases
+are migrated in place on startup by additive `ALTER TABLE ADD COLUMN`
+statements; `CREATE TABLE IF NOT EXISTS` alone would leave a pre-v4 table
+untouched and every query naming `owner` would fail.
+
+Two of those columns are access rules, not decoration:
+
+- **`expires_at`** in the past — a temporary permit that has run out. The gate
+  refuses it and it reports as *unauthorized*.
+- **`blocked`** — listed deliberately, to be refused. A resident who has moved
+  out stays visible and auditable instead of being deleted and silently
+  re-addable by the next import. Refusals report as *blacklisted*.
+
+### Import
+
+`POST /api/plates/import` (admin, multipart) takes a CSV with a `plate` column;
+`owner`, `apartment`, `notes`, `expires_at` and `blocked` are optional.
+
+`?overwrite=false` (the default) **skips** plates that already exist;
+`?overwrite=true` updates them in place. Skipping is the default because
+re-uploading last month's list is a normal thing for a site manager to do, and
+it must not silently overwrite owner and expiry data corrected since.
+
+Rows are processed independently. One mistyped plate in row 400 of a resident
+list does not reject the other 399 — the response carries per-row counts and a
+numbered error list, and row numbers count from the file's first line so they
+match what the spreadsheet shows.
+
+**The parser expects what Excel actually writes**, because that is what arrives
+at a gate:
+
+| Reality | Handled by |
+|---|---|
+| UTF-8 BOM on every "CSV UTF-8" save | `utf-8-sig` decode, plus stripping a second BOM from a double round-trip |
+| `;` delimiter on a Turkish/German/French locale | delimiter counted off the header row |
+| cp1254 encoding from a plain "CSV" save | encoding fallback chain |
+| Turkish headers (`plaka`, `sahibi`, `daire`, `notlar`) | alias table |
+| Header case and spacing, extra columns, blank trailing lines | normalised / ignored |
+
+The delimiter is counted off the **header line** rather than handed to
+`csv.Sniffer`. The header is the one row guaranteed well-formed; Sniffer's
+frequency heuristics are thrown by the ragged short rows and ISO timestamps a
+real export contains, and guessing wrong collapses every row into one column
+and rejects the file for a missing `plate` header.
+
+### Export
+
+`GET /api/plates/export` (admin) and `GET /api/events/export` (any
+authenticated user) return UTF-8-BOM CSV with CRLF line endings, so a
+double-clicked download opens straight into Excel rather than the import
+wizard. The event export takes the same filters as `GET /api/logs`, so the file
+matches what the operator is looking at — and it is built server-side, covering
+the whole filtered range rather than the page currently on screen.
+
+The plate export round-trips: download, edit in Excel, re-upload with
+`overwrite=true` is a supported way to bulk-edit residents.
+
+In the dashboard both live where the data does — **İçe Aktar (CSV)** and
+**Dışa Aktar (CSV)** in Plaka Yönetimi (admin only, hidden for operators), and
+**Dışa Aktar (CSV)** in Geçmiş.
+
+---
+
 ## Remote updates (OTA)
 
 An admin can pull the latest code and rebuild the stack from the dashboard —
@@ -810,7 +917,7 @@ make fmt
 
 ### Test suite
 
-**582 passing tests** across 18 modules (584 collected: 582 pass, 1 skipped, 1 known
+**677 passing tests** across 20 modules (679 collected: 677 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
@@ -818,27 +925,29 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 | Module | Tests | Covers |
 | --- | ---: | --- |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
+| `test_api.py` | 73 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
-| `test_api.py` | 62 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation |
+| `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
+| `test_pipeline.py` | 47 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
-| `test_pipeline.py` | 39 | Queue semantics, frame stride, thread lifecycle, subscriber fan-out, sliding-gate cooldown |
-| `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
+| `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
 | `test_db.py` | 35 | Repositories, migrations, retention, system-event trail |
+| `test_web_ui.py` | 34 | Browser dashboard endpoints, update panel gating, manual gate button, CSV controls |
+| `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
-| `test_web_ui.py` | 33 | Browser dashboard endpoints, update panel gating, manual gate button |
-| `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
+| `test_notify.py` | 24 | SMTP dispatch (mocked), attachment handling, failure containment |
+| `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
+| `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_parking.py` | 18 | Occupancy accounting |
 | `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
-| `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
-| `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
 | `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
-| `test_config.py` | 10 | Shipped defaults: sliding-gate cooldown and pulse width |
 | `test_preprocess_pipeline.py` | 11 | Preprocessing wiring: escalation staging, frame-hook injection |
+| `test_config.py` | 10 | Shipped defaults: sliding-gate cooldown and pulse width |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 584 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 679 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

@@ -261,6 +261,71 @@ class RelayConfig(BaseModel):
         return self.port
 
 
+class SmtpConfig(BaseModel):
+    """Outbound email alerts, with the event snapshot attached.
+
+    Off by default. Enabling it means the service reaches out to a third-party
+    mail server on its own initiative and puts a **photograph of a vehicle** in
+    the message, so it is worth being deliberate about two things:
+
+    * ``password`` in a YAML file is a credential at rest. Prefer the
+      environment variable ``LPR_SMTP__PASSWORD``, which overrides the file and
+      keeps the secret out of the repository and out of any config backup.
+    * The snapshot is personal data in most jurisdictions. Send it to a mailbox
+      the site operator controls, not to a shared or personal address, and keep
+      ``to_emails`` short.
+
+    Nothing here throttles: the pipeline's own ``voting.cooldown_s`` already
+    stops a car idling at the gate from re-deciding, so one refused vehicle
+    produces one email rather than one per frame.
+    """
+
+    enabled: bool = False
+    host: str = ""
+    port: int = Field(default=587, ge=1, le=65535)
+    user: str = ""
+    password: str = ""
+    #: Envelope sender. Falls back to ``user`` when blank, which is what most
+    #: providers require anyway.
+    from_email: str = ""
+    to_emails: list[str] = Field(default_factory=list)
+    #: A plate that is not on the list at all.
+    notify_on_unauthorized: bool = True
+    #: A plate that *is* on the list but flagged ``blocked``.
+    notify_on_blacklisted: bool = True
+    #: STARTTLS on a submission port (587). Set false only for an internal
+    #: relay on 25 that does not offer TLS; port 465 is detected as implicit
+    #: TLS and connects over SMTP_SSL regardless of this flag.
+    use_tls: bool = True
+    #: Seconds to wait on the SMTP conversation before giving up. A mail server
+    #: that has gone away must not pin the sender thread.
+    timeout_s: float = Field(default=15.0, gt=0, le=300)
+    #: Bound on the pending-email queue. Full means the mail server cannot keep
+    #: up with the gate; the oldest alert is dropped rather than the newest,
+    #: because an operator wants the most recent refusal.
+    queue_size: int = Field(default=64, ge=1, le=4096)
+
+    @property
+    def sender(self) -> str:
+        """Envelope sender: ``from_email``, or ``user`` when it is blank."""
+        return (self.from_email or self.user or "").strip()
+
+    @property
+    def recipients(self) -> list[str]:
+        """Non-empty, whitespace-trimmed recipient list."""
+        return [address.strip() for address in self.to_emails if address and address.strip()]
+
+    @property
+    def usable(self) -> bool:
+        """True when the settings are complete enough to attempt a send.
+
+        Checked before the worker thread is even started, so a half-filled
+        configuration is one warning at startup rather than a failed connection
+        per event for the life of the process.
+        """
+        return bool(self.enabled and self.host.strip() and self.sender and self.recipients)
+
+
 class DatabaseConfig(BaseModel):
     path: str = "data/plates.db"
     log_retention_days: int = 10
@@ -426,6 +491,7 @@ class Settings(BaseSettings):
     ocr: OcrConfig = Field(default_factory=OcrConfig)
     voting: VotingConfig = Field(default_factory=VotingConfig)
     relay: RelayConfig = Field(default_factory=RelayConfig)
+    smtp: SmtpConfig = Field(default_factory=SmtpConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     snapshots: SnapshotsConfig = Field(default_factory=SnapshotsConfig)
     parking: ParkingConfig = Field(default_factory=ParkingConfig)

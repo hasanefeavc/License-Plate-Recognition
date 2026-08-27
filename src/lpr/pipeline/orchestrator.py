@@ -89,6 +89,7 @@ class PipelineOrchestrator:
         voter: Voter,
         relay: Relay,
         frame_preprocessor: Callable[[Frame], Frame] | None = None,
+        notifier: Any = None,
     ) -> None:
         if settings is None:  # convenience for callers that have no Settings yet
             from lpr.config import get_settings
@@ -104,6 +105,10 @@ class PipelineOrchestrator:
         #: just before detection. Injected by :mod:`lpr.pipeline.factory` so
         #: this module keeps its "imports nothing from lpr.detect" property.
         self._frame_preprocessor = frame_preprocessor
+        #: Optional e-mail alerting. Injected rather than constructed here so
+        #: this module keeps no knowledge of SMTP, and so the tests can assert
+        #: on what would have been sent.
+        self._notifier = notifier
 
         # Optional capabilities, probed once. A detector that tracks gets one
         # tracker state per camera; a voter that understands tracks gets to
@@ -180,6 +185,7 @@ class PipelineOrchestrator:
             init_db()
             self._stop_event.clear()
             self._snapshots.start()
+            self._start_notifier()
             self._warmup()
 
             for role, camera_config in self._camera_configs():
@@ -233,6 +239,7 @@ class PipelineOrchestrator:
             # own rather than whatever is left of the budget: shutting down
             # should not routinely discard the last image of the day.
             self._snapshots.stop(timeout=max(0.5, deadline - time.monotonic()))
+            self._stop_notifier()
 
             self._cameras.clear()
             self._threads.clear()
@@ -582,7 +589,59 @@ class PipelineOrchestrator:
         """
         if event.action == str(Action.COOLDOWN):
             return
-        self._snapshots.submit(event.plate, frame, camera=camera)
+
+        # A refusal may also be worth an e-mail. The alert wants the snapshot
+        # attached, so it is dispatched from the writer's completion callback
+        # rather than from here -- that way it carries the very file that was
+        # written instead of a second encode of the same frame.
+        reason = self._notify_reason(event)
+        on_saved = None
+        if reason is not None:
+            on_saved = lambda path: self._send_notification(event, reason, path)  # noqa: E731
+
+        queued = self._snapshots.submit(
+            event.plate, frame, camera=camera, on_saved=on_saved
+        )
+        if reason is not None and not queued:
+            # Snapshots are off, or the disk is behind. The alert still goes
+            # out; it just goes out without a photograph, which is far better
+            # than staying silent about a refused vehicle.
+            self._send_notification(event, reason, None)
+
+    def _notify_reason(self, event: LprEvent) -> str | None:
+        """Why this event should raise an alert, or ``None`` for silence.
+
+        ``blacklisted`` outranks ``unauthorized``: a plate that is on the list
+        and barred is a different (and usually more urgent) thing than one that
+        was never listed, and an operator filtering their inbox needs them
+        apart.
+        """
+        if self._notifier is None or event.action != str(Action.DENIED):
+            return None
+        try:
+            reason = "blacklisted" if self._plates.is_blocked(event.plate) else "unauthorized"
+            return reason if self._notifier.wants(reason) else None
+        except Exception:
+            logger.debug("Bildirim gerekçesi belirlenemedi", exc_info=True)
+            return None
+
+    def _send_notification(self, event: LprEvent, reason: str, snapshot: Any) -> None:
+        """Hand one alert to the notifier. Never raises into the caller."""
+        try:
+            from lpr.notify import Notification
+
+            self._notifier.notify(
+                Notification(
+                    plate=event.plate,
+                    camera=event.camera,
+                    reason=reason,
+                    ts=event.ts,
+                    confidence=event.confidence,
+                    snapshot=snapshot,
+                )
+            )
+        except Exception:
+            logger.warning("Bildirim kuyruğa alınamadı: %s", event.plate, exc_info=True)
 
     @property
     def snapshots(self) -> SnapshotWriter:
@@ -716,6 +775,22 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
     # Retention
     # ------------------------------------------------------------------
+
+    def _start_notifier(self) -> None:
+        starter = getattr(self._notifier, "start", None)
+        if callable(starter):
+            try:
+                starter()
+            except Exception:
+                logger.warning("E-posta bildirimleri başlatılamadı", exc_info=True)
+
+    def _stop_notifier(self) -> None:
+        stopper = getattr(self._notifier, "stop", None)
+        if callable(stopper):
+            try:
+                stopper()
+            except Exception:
+                logger.warning("E-posta bildirimleri durdurulamadı", exc_info=True)
 
     def _retention_loop(self) -> None:
         """Purge old log rows and old snapshots now, then once a day.

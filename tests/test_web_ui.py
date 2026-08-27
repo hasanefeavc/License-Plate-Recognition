@@ -210,6 +210,9 @@ def test_the_script_targets_endpoints_the_api_actually_exposes() -> None:
         "/api/system/version",
         "/api/system/update",
         "/api/system/events",
+        "/api/plates/import",
+        "/api/plates/export",
+        "/api/events/export",
     ):
         assert path in script, f"{path} not referenced by app.js"
         assert path in known, f"{path} is not a real route"
@@ -237,13 +240,33 @@ def test_the_page_never_triggers_the_relay_from_an_event() -> None:
     assert "/api/relay/trigger" in script[start:end], "only openGate() may call it"
 
 
-def test_the_csv_export_names_the_file_and_sets_a_csv_mime_type() -> None:
-    """The download is the deliverable an operator hands to accounting."""
+def test_the_csv_export_downloads_through_an_authenticated_fetch() -> None:
+    """The download is the deliverable an operator hands to accounting.
+
+    A plain ``<a href>`` cannot carry the bearer header, so the body is fetched
+    and handed to a synthetic link. The object URL must also be revoked, or a
+    long session leaks a blob per export.
+    """
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    assert 'CSV_FILENAME = "otopark_gecmis.csv"' in script
-    assert "text/csv;charset=utf-8;" in script
-    assert "URL.createObjectURL" in script and "URL.revokeObjectURL" in script
-    assert "link.download = CSV_FILENAME" in script
+    body = script[script.index("async function downloadFromApi") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "Authorization" in body, "the export endpoint is authenticated"
+    assert "URL.createObjectURL" in body and "URL.revokeObjectURL" in script
+    assert "link.download" in body
+
+
+def test_the_history_export_asks_the_server_not_the_rendered_page() -> None:
+    """`state.historyRows` is one page; an operator asking for a month wants it."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function downloadCsv") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "/api/events/export" in body
+    assert "state.historyRows" not in body, "must not rebuild the CSV client-side"
+    # The filters on screen have to reach the export, or the file is the wrong
+    # range with the right name.
+    assert "history-day" in body and "history-camera" in body
 
 
 # ---------------------------------------------------------------------------
