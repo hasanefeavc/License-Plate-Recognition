@@ -214,6 +214,8 @@ def test_the_script_targets_endpoints_the_api_actually_exposes() -> None:
         "/api/plates/export",
         "/api/events/export",
         "/api/users",
+        "/api/license/me",
+        "/api/license/activate",
     ):
         assert path in script, f"{path} not referenced by app.js"
         assert path in known, f"{path} is not a real route"
@@ -286,12 +288,15 @@ def test_the_update_panel_starts_hidden() -> None:
     assert "hidden" in section
 
 
-def test_the_update_panel_is_gated_on_admin_and_enablement() -> None:
+def test_the_update_panel_is_gated_on_server_enablement_only() -> None:
+    """Operators run OTA updates on this deployment, so the panel is not
+    role-gated. It still respects the server's own switch: offering a button
+    that can only ever 503 helps nobody."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("async function refreshUpdatePanel") :]
     body = body[: body.index("\n  }\n")]
-    assert 'state.role !== "admin"' in body, "the panel must be admin-gated client-side"
-    assert "update_enabled" in body, "the panel must respect the server's switch"
+    assert "update_enabled" in body
+    assert 'state.role !== "admin"' not in body
 
 
 def test_the_update_button_asks_for_confirmation_before_posting() -> None:
@@ -546,39 +551,46 @@ def test_row_actions_are_dispatched_by_name_not_position() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_plate_write_control_is_admin_gated() -> None:
+def test_plate_controls_are_open_to_operators() -> None:
+    """Operators are the people at the barrier; plate CRUD is their job.
+
+    The server gates these endpoints on a live licence rather than on the role,
+    and an unlicensed operator gets a 402 and the licence dialog — being told
+    why beats the control quietly vanishing.
+    """
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("function applyPlatePermissions") :]
     body = body[: body.index("\n  }\n")]
 
-    assert 'state.role === "admin"' in body
-    assert "plate-form" in body, "the add form must be hidden, not just disabled"
-    assert "plates-io" in body, "import/export must be hidden for an operator"
-    assert "button[data-plate]" in body, "row actions must be disabled too"
+    assert 'state.role === "admin"' not in body
+    assert 'el["plate-add"].disabled = false' in body
+    assert "form.hidden = false" in body
 
 
-def test_the_search_stays_available_to_an_operator() -> None:
-    """Reading the list is an operator's job; only writing is restricted."""
+def test_only_user_management_stays_admin_only() -> None:
+    """The one restriction that survives the widening."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function updateControls") :]
+    body = body[: body.index("\n  }\n")]
+    assert 'el["btn-users"].hidden = !isAdmin' in body
+
+
+def test_the_search_is_never_disabled() -> None:
+    """It is a read control and belongs to everyone, licensed or not."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("const PLATE_FORM_INPUTS") :]
     body = body[: body.index("\n  }\n", body.index("function applyPlatePermissions"))]
     assert "plate-search" not in body
 
 
-def test_the_admin_only_settings_block_is_hidden_from_an_operator() -> None:
-    """Capacity is server-side config; stream quality is a device preference.
-
-    Hiding the whole modal would take a legitimate control away from operators,
-    so only the capacity block goes.
-    """
-    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+def test_the_settings_modal_is_open_to_operators() -> None:
+    """Capacity is a fact about the car park, not a privileged setting, and the
+    person who notices it is wrong is the one on the gate."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    assert 'id="capacity-section"' in html
-
     body = script[script.index("function openSettings") :]
     body = body[: body.index("\n  }\n")]
-    assert "capacity-section" in body
-    assert "quality-select" in body, "the per-device preference must survive"
+    assert 'el["capacity-input"].disabled = false' in body
+    assert "quality-select" in body
 
 
 def test_the_navbar_shows_the_role_as_a_badge() -> None:
@@ -718,3 +730,80 @@ def test_the_bootstrap_button_is_hidden_until_the_server_asks_for_setup() -> Non
     body = body[: body.index("\n  }\n")]
     assert "setup_required" in body and "/health" in body
     assert "button.hidden = true;" in body, "default to hidden, reveal on proof"
+
+
+# ---------------------------------------------------------------------------
+# Licensing UI
+# ---------------------------------------------------------------------------
+
+
+def test_the_licence_badge_names_both_states() -> None:
+    """Unlimited for an admin, remaining days for an operator."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    block = script[script.index("const LICENSE_BADGES") :]
+    block = block[: block.index("\n  };")]
+    assert "Sınırsız Yönetici Lisansı" in block
+    for status in ("active", "expired", "revoked", "missing"):
+        assert status in block
+
+
+def test_the_badge_shows_remaining_days_for_an_operator() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderLicenseBadge") :]
+    body = body[: body.index("\n  }\n")]
+    assert "days_remaining" in body and "gün" in body
+
+
+def test_a_402_opens_the_licence_dialog() -> None:
+    """402 means "your licence lapsed" — distinct from 403, which offers nothing."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function api(") :]
+    body = body[: body.index("\n  }\n")]
+    assert "response.status === 402" in body
+    assert "onLicenseLapsed" in body
+
+
+def test_the_dialog_is_offered_once_per_lapse() -> None:
+    """A burst of failing polls must not stack dialogs."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function onLicenseLapsed") :]
+    body = body[: body.index("\n  }\n")]
+    assert "state.licensePrompted" in body
+
+
+def test_the_admin_table_offers_generation_and_revocation() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderUsers") :]
+    body = body[: body.index("\n  }\n")]
+    assert "Lisans Üret" in body and "İptal" in body
+    # An admin needs no key, so offering to issue one would be misleading.
+    assert 'role !== "admin"' in body
+
+
+def test_the_generated_key_is_shown_to_the_admin() -> None:
+    """It has to be handed to the operator; storing it silently helps nobody."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function generateLicense") :]
+    body = body[: body.index("\n  }\n")]
+    assert "window.prompt" in body and "issued.key" in body
+
+
+def test_the_validity_choices_include_the_documented_spans() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    block = html[html.index('id="license-days"') :]
+    block = block[: block.index("</select>")]
+    for days in ("30", "90", "365"):
+        assert f'value="{days}"' in block
+    assert 'value="custom"' in block
+
+
+def test_the_two_licence_refreshers_do_not_share_a_name() -> None:
+    """One polls the deployment licence, one the caller's own.
+
+    They are different licences at different scopes; a shared name would make
+    the later definition silently shadow the earlier one.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "async function refreshLicense()" in script
+    assert "async function refreshUserLicense()" in script
+    assert "refreshUserLicense();" in script

@@ -124,6 +124,11 @@
      *  the gate is not known to be moving. */
     gateBusyUntil: 0,
     gateTimer: null,
+    /** The caller's own licence, from /api/license/me. Admins are
+     *  `unlimited`; an operator carries a status and remaining days. */
+    license: null,
+    /** Guards against a burst of 402s opening the dialog once per request. */
+    licensePrompted: false,
     /** Human-readable version of the running server (a tag like `v1.0.0`, or
      *  a bare commit hash in an untagged repo). Display only. */
     version: "",
@@ -170,7 +175,10 @@
     // User management modal
     "modal-users", "btn-users", "user-form", "user-name", "user-password",
     "user-role", "user-ttl", "user-add", "user-rows", "users-empty",
-    "users-count", "users-status",
+    "users-count", "users-status", "license-days", "license-days-custom",
+    // Licence activation modal + navbar badge
+    "modal-license", "license-form", "license-key", "license-submit",
+    "license-status", "license-state", "license-badge",
     "modal-settings", "btn-settings", "settings-form", "settings-save",
     "settings-status", "capacity-input", "capacity-hint", "quality-select",
     "capacity-section", "capacity-divider",
@@ -256,6 +264,11 @@
         typeof detail === "string" && detail ? detail : `HTTP ${response.status}`
       );
       error.status = response.status;
+      // 402 is specifically "this account's licence has lapsed" — distinct
+      // from 403 ("not your role"), which nothing can be done about from here.
+      // Surfacing the dialog beats leaving the operator to guess why every
+      // button suddenly fails.
+      if (response.status === 402 && !state.closing) onLicenseLapsed();
       throw error;
     }
     return payload;
@@ -303,6 +316,15 @@
     const header = response.headers.get("Content-Disposition") || "";
     const match = /filename="?([^";]+)"?/i.exec(header);
     return match ? match[1] : "";
+  }
+
+  /** Re-read the licence and offer the key dialog, at most once per lapse. */
+  function onLicenseLapsed() {
+    if (state.licensePrompted) return;
+    state.licensePrompted = true;
+    refreshUserLicense().then(() => {
+      if (state.openModal !== "modal-license") openLicense();
+    });
   }
 
   function streamUrl(role) {
@@ -644,20 +666,18 @@
   function updateControls() {
     const isAdmin = state.role === "admin";
     const gateBusy = state.gateBusyUntil > Date.now();
-    const gateBlocked = !isAdmin || !state.licenceValid || gateBusy;
+    const gateBlocked = !state.licenceValid || gateBusy;
     if (el["btn-gate"]) {
       el["btn-gate"].disabled = gateBlocked;
-      el["btn-gate"].title = !isAdmin
-        ? "Kapıyı yalnızca yönetici açabilir"
-        : (!state.licenceValid
-            ? "Lisans geçersiz"
-            : (gateBusy ? "Kapı hareket hâlinde" : ""));
+      el["btn-gate"].title = !state.licenceValid
+        ? "Lisans geçersiz"
+        : (gateBusy ? "Kapı hareket hâlinde" : "");
     }
     // User management is admin-only server-side; hide the entry point rather
     // than opening a modal whose every request returns 403.
     if (el["btn-users"]) el["btn-users"].hidden = !isAdmin;
     if (el["btn-pause"]) {
-      el["btn-pause"].disabled = !isAdmin;
+      el["btn-pause"].disabled = false;
       el["btn-pause"].textContent = state.paused ? "Devam Et" : "Duraklat";
     }
   }
@@ -803,16 +823,16 @@
     openModal("modal-settings");
     const isAdmin = state.role === "admin";
 
-    // Capacity is server-side configuration and admin-only; the stream quality
-    // below it is a per-device preference an operator legitimately sets, so
-    // only the capacity block is withheld.
-    if (el["capacity-section"]) el["capacity-section"].hidden = !isAdmin;
-    if (el["capacity-divider"]) el["capacity-divider"].hidden = !isAdmin;
+    // Capacity and stream quality are both open to operators now. The site
+    // capacity is a fact about the car park, not a privileged setting, and the
+    // person who notices it is wrong is the one on the gate.
+    if (el["capacity-section"]) el["capacity-section"].hidden = false;
+    if (el["capacity-divider"]) el["capacity-divider"].hidden = false;
 
     el["capacity-input"].value = state.parking.capacity ? String(state.parking.capacity) : "0";
-    el["capacity-input"].disabled = !isAdmin;
+    el["capacity-input"].disabled = false;
     el["quality-select"].value = String(state.quality);
-    setText(el["capacity-hint"], isAdmin ? `Şu an içeride: ${state.parking.inside}` : "");
+    setText(el["capacity-hint"], `Şu an içeride: ${state.parking.inside}`);
     modalStatus(el["settings-status"], "");
     refreshUpdatePanel();
   }
@@ -829,11 +849,6 @@
       localStorage.setItem(QUALITY_KEY, String(quality));
     }
     if (changed) restartStreams();
-
-    if (state.role !== "admin") {
-      modalStatus(el["settings-status"], "Görüntü kalitesi kaydedildi.", "ok");
-      return;
-    }
 
     const capacity = Number(el["capacity-input"].value);
     if (!Number.isFinite(capacity) || capacity < 0) {
@@ -963,8 +978,6 @@
     if (!section) return;
     section.hidden = true;
     updateLog([]);
-
-    if (state.role !== "admin") return;
 
     try {
       const info = await api("/api/system/version");
@@ -1151,27 +1164,29 @@
     "note-input", "expires-input", "blocked-input",
   ];
 
-  /** Mirror the server's rules so an operator sees why a control is inert
-   *  instead of collecting 403s. This is presentation, not enforcement: every
-   *  one of these endpoints checks the role again. */
+  /** Plate management is open to every signed-in user.
+   *
+   *  Operators are the people standing at the barrier, so add, edit, block and
+   *  delete are all theirs; the server agrees, and gates these endpoints on a
+   *  live licence rather than on the role. What an unlicensed operator gets is
+   *  a 402 and the licence dialog, not a hidden button — being told why is more
+   *  use than the control quietly vanishing.
+   *
+   *  Kept as a function (rather than deleted) because it is called after every
+   *  render, and a future restriction belongs here rather than scattered
+   *  through the table code. */
   function applyPlatePermissions() {
-    const isAdmin = state.role === "admin";
-    const reason = isAdmin ? "" : "Plaka yönetimi için yönetici yetkisi gerekli";
+    el["plate-add"].disabled = false;
+    el["plate-add"].title = "";
+    PLATE_FORM_INPUTS.forEach((id) => { if (el[id]) el[id].disabled = false; });
 
-    el["plate-add"].disabled = !isAdmin;
-    el["plate-add"].title = reason;
-    PLATE_FORM_INPUTS.forEach((id) => { if (el[id]) el[id].disabled = !isAdmin; });
-
-    // The whole add form and the bulk row are admin-only server-side; hide
-    // them outright rather than showing controls that can only ever fail.
     const form = el["plate-form"];
-    if (form) form.hidden = !isAdmin;
-    if (el["plates-io"]) el["plates-io"].hidden = !isAdmin;
+    if (form) form.hidden = false;
+    if (el["plates-io"]) el["plates-io"].hidden = false;
 
-    // Search stays available to everyone: reading the list is an operator's job.
     el["plate-rows"].querySelectorAll("button[data-plate]").forEach((button) => {
-      button.disabled = !isAdmin;
-      if (!isAdmin) button.title = reason;
+      button.disabled = false;
+      button.title = "";
     });
   }
 
@@ -1640,6 +1655,99 @@
   }
 
   // -----------------------------------------------------------------------
+  // Licensing
+  //
+  // Admins are exempt by construction and carry an "unlimited" badge. An
+  // operator holds a key with an expiry, and the server answers 402 on every
+  // operational endpoint once it lapses — which is what opens the dialog.
+  // -----------------------------------------------------------------------
+
+  const LICENSE_BADGES = {
+    unlimited: { label: "Sınırsız Yönetici Lisansı", classes: "border-accent/50 bg-accent/10 text-accent" },
+    active:    { label: "Lisans Aktif",              classes: "border-ok/50 bg-ok/10 text-ok" },
+    expired:   { label: "Lisans Süresi Doldu",       classes: "border-bad/50 bg-bad/10 text-bad" },
+    revoked:   { label: "Lisans İptal Edildi",       classes: "border-bad/50 bg-bad/10 text-bad" },
+    missing:   { label: "Lisans Gerekli",            classes: "border-warn/50 bg-warn/10 text-warn" },
+  };
+
+  function renderLicenseBadge() {
+    const badge = el["license-badge"];
+    if (!badge) return;
+
+    const state_ = state.license;
+    if (!state_) { badge.hidden = true; return; }
+
+    const spec = LICENSE_BADGES[state_.status] || LICENSE_BADGES.missing;
+    let label = spec.label;
+    // Remaining days are the useful half for an operator; an admin has none.
+    if (state_.status === "active" && state_.days_remaining !== null) {
+      label = `Lisans: ${Math.max(0, Math.ceil(state_.days_remaining))} gün`;
+    }
+
+    badge.hidden = false;
+    badge.textContent = label;
+    badge.className =
+      `rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider transition ${spec.classes}`;
+    // An admin has nothing to enter, so the badge is inert for them.
+    badge.disabled = Boolean(state_.unlimited);
+    badge.title = state_.unlimited ? state_.detail : "Lisans anahtarı girin";
+  }
+
+  /** The caller's *own* licence, for the navbar badge.
+   *
+   *  Named apart from `refreshLicense`, which polls the deployment licence
+   *  that gates the whole installation. Two different licences at two
+   *  different scopes; sharing a name here would silently shadow one of them. */
+  async function refreshUserLicense() {
+    try {
+      state.license = await api("/api/license/me");
+    } catch (_) {
+      state.license = null;  // a server too old to know the endpoint
+    }
+    renderLicenseBadge();
+  }
+
+  function openLicense() {
+    openModal("modal-license");
+    el["license-key"].value = "";
+    modalStatus(el["license-status"], "");
+
+    const node = el["license-state"];
+    const current = state.license;
+    if (node) {
+      node.textContent = current
+        ? current.detail || current.status
+        : "Lisans durumu okunamadı.";
+      node.className =
+        "rounded-lg border border-line bg-void px-3 py-2.5 text-sm " +
+        (current && current.valid ? TEXT_CLASSES.ok : TEXT_CLASSES.warn);
+    }
+  }
+
+  async function activateLicense(event) {
+    event.preventDefault();
+    const key = el["license-key"].value.trim();
+    if (!key) return;
+
+    el["license-submit"].disabled = true;
+    modalStatus(el["license-status"], "Etkinleştiriliyor...", "muted");
+    try {
+      state.license = await api("/api/license/activate", {
+        method: "POST",
+        body: JSON.stringify({ key }),
+      });
+      state.licensePrompted = false;
+      renderLicenseBadge();
+      modalStatus(el["license-status"], "Lisans etkinleştirildi.", "ok");
+      updateControls();
+    } catch (err) {
+      modalStatus(el["license-status"], err.message, "bad");
+    } finally {
+      el["license-submit"].disabled = false;
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // User management (admin only)
   // -----------------------------------------------------------------------
 
@@ -1706,12 +1814,38 @@
       session.className = "px-3 py-2.5 font-mono text-xs text-muted";
       session.textContent = formatSession(row.token_ttl_min, role);
 
-      const created = document.createElement("td");
-      created.className = "px-3 py-2.5 font-mono text-xs text-muted";
-      created.textContent = formatDate(row.created_at);
+      const license = document.createElement("td");
+      license.className = "px-3 py-2.5";
+      license.append(licenseCell(row, role));
 
       const actions = document.createElement("td");
-      actions.className = "px-4 py-2.5 text-right sm:px-6";
+      actions.className = "whitespace-nowrap px-4 py-2.5 text-right sm:px-6";
+
+      // Admins are exempt, so there is nothing to issue or revoke for them.
+      if (role !== "admin") {
+        const generate = document.createElement("button");
+        generate.type = "button";
+        generate.className =
+          "mr-1.5 rounded-md border border-accent/50 px-2.5 py-1 text-xs font-bold text-accent " +
+          "transition hover:bg-accent hover:text-ground";
+        generate.textContent = "Lisans Üret";
+        generate.dataset.username = username;
+        generate.dataset.licenseAction = "generate";
+        actions.append(generate);
+
+        if (row.license_key) {
+          const revoke = document.createElement("button");
+          revoke.type = "button";
+          revoke.className =
+            "mr-1.5 rounded-md border border-warn/50 px-2.5 py-1 text-xs font-bold text-warn " +
+            "transition hover:bg-warn hover:text-ground";
+          revoke.textContent = "İptal";
+          revoke.dataset.username = username;
+          revoke.dataset.licenseAction = "revoke";
+          actions.append(revoke);
+        }
+      }
+
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className =
@@ -1727,12 +1861,80 @@
       }
       actions.append(remove);
 
-      tr.append(name, roleCell, session, created, actions);
+      tr.append(name, roleCell, session, license, actions);
       body.append(tr);
     });
 
     el["users-empty"].hidden = rows.length > 0;
     setText(el["users-count"], String(rows.length));
+  }
+
+  /** Licence state for one row, with the key exposed for copying. */
+  function licenseCell(row, role) {
+    const wrap = document.createElement("div");
+    const status = String(row.license_status || (role === "admin" ? "unlimited" : "missing"));
+    const spec = LICENSE_BADGES[status] || LICENSE_BADGES.missing;
+
+    const badge = document.createElement("span");
+    badge.className =
+      `inline-block rounded-full border px-2.5 py-0.5 text-xs font-bold ${spec.classes}`;
+    badge.textContent = role === "admin" ? "Sınırsız" : spec.label;
+    wrap.append(badge);
+
+    if (role !== "admin" && row.license_expires_at) {
+      const until = document.createElement("div");
+      until.className = "mt-0.5 font-mono text-[11px] text-muted";
+      until.textContent = formatDate(row.license_expires_at);
+      wrap.append(until);
+    }
+    // The key is what the admin has to hand over; the title makes it
+    // selectable without widening the column.
+    if (row.license_key) wrap.title = row.license_key;
+    return wrap;
+  }
+
+  /** The validity the admin picked, in days. */
+  function selectedLicenseDays() {
+    const choice = el["license-days"] ? el["license-days"].value : "365";
+    if (choice !== "custom") return Number(choice) || 365;
+    const custom = Number(el["license-days-custom"] && el["license-days-custom"].value);
+    return Number.isFinite(custom) && custom > 0 ? Math.min(3650, custom) : 365;
+  }
+
+  async function generateLicense(username) {
+    const days = selectedLicenseDays();
+    modalStatus(el["users-status"], `${username} için lisans üretiliyor...`, "muted");
+    try {
+      const issued = await api(`/api/users/${encodeURIComponent(username)}/license`, {
+        method: "POST",
+        body: JSON.stringify({ days }),
+      });
+      await loadUsers();
+      modalStatus(
+        el["users-status"],
+        `${username}: ${days} günlük lisans üretildi. Anahtarı kopyalayıp iletin.`,
+        "ok"
+      );
+      // Shown rather than silently stored: the admin has to pass it on, and a
+      // prompt is the one place a key can be selected and copied reliably.
+      window.prompt(`${username} için lisans anahtarı:`, issued.key || "");
+    } catch (err) {
+      modalStatus(el["users-status"], err.message, "bad");
+    }
+  }
+
+  async function revokeLicense(username) {
+    if (!window.confirm(`${username} kullanıcısının lisansı iptal edilecek.\n\nDevam edilsin mi?`)) {
+      return;
+    }
+    modalStatus(el["users-status"], "İptal ediliyor...", "muted");
+    try {
+      await api(`/api/users/${encodeURIComponent(username)}/license`, { method: "DELETE" });
+      await loadUsers();
+      modalStatus(el["users-status"], `${username} lisansı iptal edildi.`, "warn");
+    } catch (err) {
+      modalStatus(el["users-status"], err.message, "bad");
+    }
   }
 
   async function loadUsers() {
@@ -1847,7 +2049,8 @@
     attachStream("exit");
     connectSocket();
     refreshStats();
-    refreshLicense();
+    refreshLicense();      // deployment licence -> the banner
+    refreshUserLicense();  // this account's licence -> the navbar badge
     refreshParking();
     loadRecentLogs();
     clearInterval(state.statsTimer);
@@ -1964,6 +2167,7 @@
 
     wireModal("modal-plates");
     wireModal("modal-history");
+    wireModal("modal-license");
     wireModal("modal-users");
     wireModal("modal-settings");
     document.addEventListener("keydown", (event) => {
@@ -1986,10 +2190,21 @@
     if (el["plate-search"]) el["plate-search"].addEventListener("input", refreshPlateTable);
 
     if (el["user-form"]) el["user-form"].addEventListener("submit", addUser);
+    if (el["license-form"]) el["license-form"].addEventListener("submit", activateLicense);
+    if (el["license-badge"]) el["license-badge"].addEventListener("click", openLicense);
+    if (el["license-days"]) {
+      el["license-days"].addEventListener("change", () => {
+        el["license-days-custom"].hidden = el["license-days"].value !== "custom";
+      });
+    }
     if (el["user-rows"]) {
       el["user-rows"].addEventListener("click", (event) => {
         const button = event.target.closest("button[data-username]");
-        if (button && !button.disabled) removeUser(button.dataset.username);
+        if (!button || button.disabled) return;
+        const who = button.dataset.username;
+        if (button.dataset.licenseAction === "generate") generateLicense(who);
+        else if (button.dataset.licenseAction === "revoke") revokeLicense(who);
+        else removeUser(who);
       });
     }
 

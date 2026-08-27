@@ -61,7 +61,10 @@ from lpr.api.schemas import (
     SystemEventOut,
     SystemUpdateOut,
     TokenOut,
+    LicenseKeyIn,
     UserCreateIn,
+    UserLicenseIn,
+    UserLicenseOut,
     UserOut,
     VersionOut,
     normalize_plate,
@@ -75,6 +78,7 @@ from lpr.api.security import (
     create_token,
     current_user,
     require_admin,
+    require_license,
     token_ttl_seconds,
     user_from_token,
 )
@@ -97,6 +101,9 @@ _STREAM_IDLE_TIMEOUT_S = 30.0
 
 CurrentUser = Annotated[AuthUser, Depends(current_user)]
 AdminUser = Annotated[AuthUser, Depends(require_admin)]
+#: Authenticated, and licensed if the role needs one. Everything that *operates*
+#: the site uses this; only account management stays admin-only.
+LicensedUser = Annotated[AuthUser, Depends(require_license)]
 
 
 def app_version() -> str:
@@ -358,12 +365,26 @@ async def list_users(_: AdminUser, user_repo: deps.UserRepo) -> list[UserOut]:
 
 
 def _user_out(row: dict[str, Any]) -> UserOut:
+    """Map one user row onto the wire model, with its live licence state.
+
+    ``license_status`` is recomputed rather than read straight off the row: the
+    stored value is what was true when the key was issued, and a key that has
+    since expired should show as expired without anybody having to run a
+    sweep.
+    """
+    from lpr.user_license import license_for
+
     ttl = row.get("token_ttl_min")
+    role = str(row.get("role") or "operator")
+    state = license_for(role, row)
     return UserOut(
         username=str(row.get("username", "")),
-        role=str(row.get("role") or "operator"),
+        role=role,
         created_at=(str(row["created_at"]) if row.get("created_at") else None),
         token_ttl_min=int(ttl) if ttl else None,
+        license_status=state.status,
+        license_expires_at=state.expires_at or (row.get("license_expires_at") or None),
+        license_key=(row.get("license_key") or None),
     )
 
 
@@ -552,7 +573,7 @@ def _plate_records(plate_repo: Any) -> list[dict[str, Any]]:
     tags=["plates"],
     summary="Plaka ekle",
 )
-async def add_plate(payload: PlateIn, _: AdminUser, plate_repo: deps.PlateRepo) -> PlateOut:
+async def add_plate(payload: PlateIn, _: LicensedUser, plate_repo: deps.PlateRepo) -> PlateOut:
     """Register one plate, with resident details when the caller supplied them.
 
     Still a 409 on a duplicate rather than a silent overwrite: adding a plate
@@ -592,7 +613,7 @@ async def add_plate(payload: PlateIn, _: AdminUser, plate_repo: deps.PlateRepo) 
 )
 async def update_plate(
     payload: PlateUpdateIn,
-    _: AdminUser,
+    _: LicensedUser,
     plate_repo: deps.PlateRepo,
     plate: Annotated[str, Path(min_length=1, max_length=32, examples=["34ABC123"])],
 ) -> PlateDetailOut:
@@ -639,7 +660,7 @@ async def update_plate(
     summary="Plaka sil",
 )
 async def delete_plate(
-    _: AdminUser,
+    _: LicensedUser,
     plate_repo: deps.PlateRepo,
     plate: Annotated[str, Path(min_length=1, max_length=32, examples=["34ABC123"])],
 ) -> PlateOut:
@@ -783,7 +804,7 @@ async def parking_state(
 )
 async def set_parking_capacity(
     payload: ParkingIn,
-    user: AdminUser,
+    user: LicensedUser,
     log_repo: deps.LogRepo,
     meta_repo: deps.MetaRepo,
     settings: deps.AdminSettings,
@@ -906,7 +927,7 @@ async def cameras(request: Request, _: CurrentUser) -> list[CameraStatusOut]:
 )
 async def set_camera_source(
     request: Request,
-    _: AdminUser,
+    _: LicensedUser,
     camera: Annotated[str, Path(examples=["entry"])],
     payload: Annotated[CameraSourceIn, Body()],
 ) -> CameraStatusOut:
@@ -932,7 +953,7 @@ async def set_camera_source(
     tags=["pipeline"],
     summary="İşlemeyi duraklat",
 )
-async def pause_pipeline(request: Request, _: AdminUser) -> PipelineStateOut:
+async def pause_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
     # Remembered so releasing a licence hold does not undo a deliberate pause.
     request.app.state.manual_paused = True
     paused = deps.set_paused(request.app, True)
@@ -946,7 +967,7 @@ async def pause_pipeline(request: Request, _: AdminUser) -> PipelineStateOut:
     tags=["pipeline"],
     summary="İşlemeye devam et",
 )
-async def resume_pipeline(request: Request, _: AdminUser) -> PipelineStateOut:
+async def resume_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
     request.app.state.manual_paused = False
     # An expired site must not be able to resume itself through this endpoint;
     # the only way out is a valid key via POST /api/license.
@@ -1225,7 +1246,7 @@ async def system_version(request: Request, _: CurrentUser) -> VersionOut:
     tags=["system"],
     summary="Güncelleme durumu",
 )
-async def system_update_status(request: Request, _: AdminUser) -> SystemUpdateOut:
+async def system_update_status(request: Request, _: LicensedUser) -> SystemUpdateOut:
     """Progress of the current or last update.
 
     This is what the UI polls after the POST. Note that a *successful* update
@@ -1247,7 +1268,7 @@ async def system_update_status(request: Request, _: AdminUser) -> SystemUpdateOu
         503: {"description": "Sistem güncellemesi devre dışı"},
     },
 )
-async def system_update(request: Request, user: AdminUser) -> SystemUpdateOut:
+async def system_update(request: Request, user: LicensedUser) -> SystemUpdateOut:
     """Pull from the configured remote and rebuild the stack. Admin only.
 
     Returns **202 Accepted**, not 200: the work is detached onto its own thread
@@ -1285,7 +1306,7 @@ async def system_update(request: Request, user: AdminUser) -> SystemUpdateOut:
 )
 async def system_events(
     request: Request,
-    _: AdminUser,
+    _: LicensedUser,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     source: Annotated[str | None, Query(max_length=64)] = None,
 ) -> list[SystemEventOut]:
@@ -1340,7 +1361,7 @@ def _export_stamp() -> str:
     summary="Plakaları CSV ile içe aktar",
 )
 async def import_plates(
-    _: AdminUser,
+    _: LicensedUser,
     plate_repo: deps.PlateRepo,
     file: Annotated[
         UploadFile,
@@ -1388,7 +1409,7 @@ async def import_plates(
     response_class=Response,
     responses={200: {"content": {"text/csv": {}}}},
 )
-async def export_plates(_: AdminUser, plate_repo: deps.PlateRepo) -> Response:
+async def export_plates(_: LicensedUser, plate_repo: deps.PlateRepo) -> Response:
     """The whole plate list as CSV, in the same column order the importer reads.
 
     Round-trips: downloading, editing in Excel and re-uploading with
@@ -1450,3 +1471,168 @@ async def export_events(
     ]
     payload = await _in_thread(export_events_csv, rows)
     return _csv_response(payload, f"kayitlar-{_export_stamp()}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Per-operator licences
+#
+# Distinct from the deployment licence above: that one is RS256 from the vendor
+# and decides whether this installation may run at all; these are HS256 keys
+# this server issues to its own operators and decide who may drive it.
+# ---------------------------------------------------------------------------
+
+
+def _user_license_out(state: Any, key: str | None = None) -> UserLicenseOut:
+    """Wire model for a *per-operator* licence.
+
+    Named apart from ``_license_out`` above, which renders the deployment
+    licence. Two licences at two scopes; one name for both would shadow.
+    """
+    return UserLicenseOut(**state.to_dict(), key=key)
+
+
+@router.get(
+    "/api/license/me",
+    response_model=UserLicenseOut,
+    tags=["license"],
+    summary="Kendi lisans durumum",
+)
+async def my_license(user: CurrentUser, user_repo: deps.UserRepo) -> UserLicenseOut:
+    """The caller's own licence state, for the navbar badge.
+
+    Deliberately *not* licence-gated: an operator whose licence has lapsed is
+    exactly who needs to read this, and gating it would leave the dashboard
+    unable to explain why everything else is refusing.
+    """
+    from lpr.user_license import license_for
+
+    row = await _in_thread(user_repo.get, user.username) if hasattr(user_repo, "get") else None
+    return _user_license_out(license_for(user.role, row or {"username": user.username}))
+
+
+@router.post(
+    "/api/license/activate",
+    response_model=UserLicenseOut,
+    tags=["license"],
+    summary="Lisans anahtarı etkinleştir",
+)
+async def activate_user_license(
+    payload: LicenseKeyIn, user: CurrentUser, user_repo: deps.UserRepo
+) -> UserLicenseOut:
+    """Activate a licence key issued to the calling account.
+
+    Not licence-gated, for the obvious reason: this is the way *out* of being
+    unlicensed. It is still authenticated, and the key is checked against the
+    caller's own username -- a key is issued to a person, and without that
+    binding an operator could activate a colleague's key and inherit its
+    validity.
+    """
+    from lpr.user_license import STATUS_ACTIVE, verify_key
+
+    state = verify_key(payload.key, user.username)
+    if not state.valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=state.detail or "Lisans anahtarı geçersiz",
+        )
+
+    stored = await _in_thread(
+        user_repo.set_license, user.username, payload.key, state.expires_at, STATUS_ACTIVE
+    )
+    if not stored:  # pragma: no cover - account deleted mid-request
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Kullanıcı bulunamadı: {user.username}",
+        )
+
+    logger.info("Lisans etkinleştirildi: %s (%s)", user.username, state.expires_at)
+    return _user_license_out(state)
+
+
+@router.post(
+    "/api/users/{username}/license",
+    response_model=UserLicenseOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["license"],
+    summary="Kullanıcıya lisans anahtarı üret",
+)
+async def generate_user_license(
+    payload: UserLicenseIn,
+    _: AdminUser,
+    user_repo: deps.UserRepo,
+    username: Annotated[str, Path(min_length=1, max_length=40, examples=["bekci"])],
+) -> UserLicenseOut:
+    """Issue a licence key for one operator. Admin only.
+
+    The key is both stored on the account *and* returned once, so the admin can
+    pass it on. Issuing activates immediately -- an admin generating a key for
+    somebody has already decided they should be working.
+
+    Refuses for an administrator: they are exempt by construction, and a key
+    that would never be checked is a misleading thing to hand somebody.
+    """
+    from lpr.user_license import STATUS_ACTIVE, issue_key, requires_license, verify_key
+
+    name = username.strip()
+    row = await _in_thread(user_repo.get, name) if hasattr(user_repo, "get") else None
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Kullanıcı bulunamadı: {name}"
+        )
+    if not requires_license(str(row.get("role") or "operator")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Yönetici hesapları sınırsızdır; lisans anahtarı gerekmez",
+        )
+
+    try:
+        key, expires_at = await _in_thread(issue_key, name, payload.days)
+    except RuntimeError as exc:
+        # No signing secret: say so rather than handing over a key that will
+        # fail at activation.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    await _in_thread(user_repo.set_license, name, key, expires_at, STATUS_ACTIVE)
+    logger.info("Lisans üretildi: %s (%d gün, bitiş %s)", name, payload.days, expires_at)
+    return _user_license_out(verify_key(key, name), key=key)
+
+
+@router.delete(
+    "/api/users/{username}/license",
+    response_model=UserLicenseOut,
+    tags=["license"],
+    summary="Kullanıcının lisansını iptal et",
+)
+async def revoke_user_license(
+    _: AdminUser,
+    user_repo: deps.UserRepo,
+    username: Annotated[str, Path(min_length=1, max_length=40, examples=["bekci"])],
+) -> UserLicenseOut:
+    """Revoke an operator's licence. Admin only, and effective immediately.
+
+    The key stays on the row and the *status* is what changes. A signed key
+    cannot be un-signed, so a status flag is the only thing that can actually
+    withdraw it -- and keeping the key lets an admin see what was revoked.
+    """
+    from lpr.user_license import STATUS_REVOKED, UserLicense
+
+    name = username.strip()
+    row = await _in_thread(user_repo.get, name) if hasattr(user_repo, "get") else None
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Kullanıcı bulunamadı: {name}"
+        )
+
+    await _in_thread(
+        user_repo.set_license,
+        name,
+        row.get("license_key"),
+        row.get("license_expires_at"),
+        STATUS_REVOKED,
+    )
+    logger.warning("Lisans iptal edildi: %s", name)
+    return _user_license_out(
+        UserLicense(status=STATUS_REVOKED, username=name, detail="Lisans iptal edildi")
+    )

@@ -156,6 +156,10 @@
     <div class="flex items-center justify-end gap-2 sm:gap-4">
       <!-- Username plus a role chip; filled by renderUserBadge(). -->
       <span id="user-label" class="hidden items-center text-sm sm:inline-flex"></span>
+      <!-- Licence badge: "Sınırsız Yönetici Lisansı" for an admin, remaining
+           days for an operator. Filled by renderLicenseBadge(). -->
+      <button id="license-badge" type="button" hidden
+              class="rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider transition"></button>
       <span class="flex items-center gap-1.5">
         <span id="conn-dot" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
         <span id="conn-label" class="text-xs font-bold text-bad sm:text-sm">Bağlı Değil</span>
@@ -483,8 +487,26 @@
 
     <!-- overflow-auto, not overflow-y: the table keeps a min width and scrolls
          sideways on a phone rather than crushing five columns into 360px. -->
+    <div class="shrink-0 border-b border-line px-4 py-3 sm:px-6">
+      <label for="license-days" class="text-[11px] font-bold tracking-wider text-muted">
+        LİSANS SÜRESİ
+      </label>
+      <div class="mt-1.5 flex items-center gap-2">
+        <select id="license-days"
+                class="min-h-[44px] flex-1 rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent sm:flex-none sm:w-48">
+          <option value="30">30 gün</option>
+          <option value="90">90 gün</option>
+          <option value="365" selected>1 yıl</option>
+          <option value="custom">Özel (gün)</option>
+        </select>
+        <input id="license-days-custom" type="number" min="1" max="3650" hidden placeholder="gün"
+               class="min-h-[44px] w-28 rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition focus:border-accent">
+        <span class="text-xs text-muted">Aşağıdaki &ldquo;Lisans Üret&rdquo; bu süreyi kullanır.</span>
+      </div>
+    </div>
+
     <div class="scroll-thin min-h-0 flex-1 overflow-auto">
-      <table class="w-full min-w-[34rem] border-collapse text-left">
+      <table class="w-full min-w-[46rem] border-collapse text-left">
         <thead class="sticky top-0 z-10 bg-chrome">
           <tr class="text-[11px] font-bold tracking-wider text-muted">
             <th scope="col" class="px-4 py-2.5 sm:px-6">ZAMAN</th>
@@ -511,6 +533,51 @@
 </div>
 
 <!-- Settings ------------------------------------------------------------ -->
+<!-- Licence activation ------------------------------------------------------ -->
+<div id="modal-license" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
+  <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+
+  <div role="dialog" aria-modal="true" aria-labelledby="license-title"
+       class="relative flex w-full max-w-md flex-col overflow-hidden border-line bg-card shadow-2xl sm:rounded-xl sm:border">
+
+    <header class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-4 py-4 sm:px-6">
+      <div>
+        <h2 id="license-title" class="text-lg font-bold">Lisans Anahtarı Girin</h2>
+        <p class="mt-0.5 text-xs text-muted">
+          Sistem yöneticinizden aldığınız anahtarı yapıştırın.
+        </p>
+      </div>
+      <button type="button" data-close aria-label="Kapat"
+              class="-mr-2 -mt-1 min-h-[44px] min-w-[44px] rounded-lg text-2xl leading-none text-muted transition hover:bg-row hover:text-ink">
+        &times;
+      </button>
+    </header>
+
+    <form id="license-form" class="space-y-4 px-4 py-5 sm:px-6">
+      <p id="license-state" class="rounded-lg border border-line bg-void px-3 py-2.5 text-sm"></p>
+      <div>
+        <label for="license-key" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">LİSANS ANAHTARI</label>
+        <textarea id="license-key" name="key" rows="4" required data-autofocus
+                  spellcheck="false" autocomplete="off"
+                  placeholder="eyJhbGciOiJIUzI1NiJ9..."
+                  class="scroll-thin w-full resize-none rounded-lg border border-line bg-void px-3 py-2.5 font-mono text-xs text-ink outline-none transition placeholder:text-muted/60 focus:border-accent"></textarea>
+      </div>
+    </form>
+
+    <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
+      <span id="license-status" class="flex-1 truncate text-sm font-semibold" role="status" aria-live="polite"></span>
+      <button type="button" data-close
+              class="min-h-[44px] rounded-lg bg-line px-5 font-bold text-ink transition hover:brightness-125">
+        Kapat
+      </button>
+      <button id="license-submit" type="submit" form="license-form"
+              class="min-h-[44px] rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+        Etkinleştir
+      </button>
+    </footer>
+  </div>
+</div>
+
 <!-- User management -------------------------------------------------------- -->
 <div id="modal-users" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
   <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
@@ -581,8 +648,8 @@
             <th scope="col" class="px-4 py-2.5 sm:px-6">KULLANICI</th>
             <th scope="col" class="w-32 px-3 py-2.5">ROL</th>
             <th scope="col" class="w-32 px-3 py-2.5">OTURUM</th>
-            <th scope="col" class="w-32 px-3 py-2.5">OLUŞTURULMA</th>
-            <th scope="col" class="w-24 px-4 py-2.5 text-right sm:px-6">İŞLEM</th>
+            <th scope="col" class="w-40 px-3 py-2.5">LİSANS</th>
+            <th scope="col" class="w-52 px-4 py-2.5 text-right sm:px-6">İŞLEM</th>
           </tr>
         </thead>
         <tbody id="user-rows" class="divide-y divide-line/60"></tbody>

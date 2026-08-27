@@ -667,6 +667,32 @@ class UserRepository:
         row = conn.execute(schema.SELECT_USER, (name,)).fetchone()
         return dict(row) if row is not None else None
 
+    def set_license(
+        self,
+        username: str,
+        key: str | None,
+        expires_at: str | None,
+        status: str,
+    ) -> bool:
+        """Store (or clear) one account's licence. Returns False if unknown.
+
+        Revocation keeps the key on the row rather than deleting it. The key is
+        signed and cannot be un-signed, so ``license_status`` is the only thing
+        that can actually withdraw it -- and keeping the key means an admin can
+        still see *what* was revoked.
+        """
+        name = (username or "").strip()
+        if not name:
+            return False
+        with transaction() as conn:
+            cur = conn.execute(
+                schema.UPDATE_USER_LICENSE, (key, expires_at, status, name)
+            )
+            changed = cur.rowcount > 0
+        if changed:
+            logger.info("Lisans güncellendi: %s (%s)", name, status)
+        return changed
+
     def count_by_role(self, role: str) -> int:
         """How many accounts hold ``role``.
 

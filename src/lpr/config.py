@@ -526,6 +526,18 @@ class Settings(BaseSettings):
     snapshots: SnapshotsConfig = Field(default_factory=SnapshotsConfig)
     parking: ParkingConfig = Field(default_factory=ParkingConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    #: HMAC secret for **per-operator** licence keys, from ``LPR_LICENSE_SECRET``.
+    #:
+    #: Distinct from the deployment licence in :mod:`lpr.license`, which is
+    #: RS256 against a vendor public key and gates the *installation*. These
+    #: keys are signed and verified by this server for its own operators, so a
+    #: shared secret is the right shape and no private key ever leaves the box.
+    #:
+    #: Empty disables per-operator licensing entirely -- see
+    #: :func:`lpr.user_license.enforcement_enabled`. That default is deliberate:
+    #: an upgrade must not lock every operator out of a working gate because a
+    #: new secret had not been set yet.
+    license_secret: str = ""
     system_update: SystemUpdateConfig = Field(default_factory=SystemUpdateConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 

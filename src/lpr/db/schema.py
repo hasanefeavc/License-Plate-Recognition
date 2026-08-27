@@ -23,7 +23,8 @@ from typing import Final
 #: v4 added the resident columns on ``plates`` (owner, apartment, expires_at,
 #: blocked), applied to existing databases by ``PLATES_ADDED_COLUMNS``.
 #: v5 added ``users.token_ttl_min`` (per-account session length).
-SCHEMA_VERSION: Final[int] = 5
+#: v6 added the per-operator licence columns on ``users``.
+SCHEMA_VERSION: Final[int] = 6
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -68,7 +69,10 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role          TEXT NOT NULL DEFAULT 'operator',
     created_at    TEXT NOT NULL,
-    token_ttl_min INTEGER
+    token_ttl_min INTEGER,
+    license_key        TEXT,
+    license_expires_at TEXT,
+    license_status     TEXT
 )
 """
 
@@ -80,6 +84,9 @@ CREATE TABLE IF NOT EXISTS users (
 #: inherits the role policy rather than needing a backfill.
 USERS_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
     ("token_ttl_min", "ALTER TABLE users ADD COLUMN token_ttl_min INTEGER"),
+    ("license_key", "ALTER TABLE users ADD COLUMN license_key TEXT"),
+    ("license_expires_at", "ALTER TABLE users ADD COLUMN license_expires_at TEXT"),
+    ("license_status", "ALTER TABLE users ADD COLUMN license_status TEXT"),
 )
 
 CREATE_LOGS: Final[str] = """
@@ -222,12 +229,20 @@ SELECT_PLATES_DETAIL: Final[str] = (
     "SELECT plate, added_at, note, owner, apartment, expires_at, blocked FROM plates ORDER BY plate"
 )
 
-SELECT_USERS: Final[str] = (
-    "SELECT username, role, created_at, token_ttl_min FROM users ORDER BY username"
+#: Never selects ``password_hash``. The licence *key* is included because an
+#: admin has to be able to hand it to the operator it was issued for.
+_USER_COLUMNS: Final[str] = (
+    "username, role, created_at, token_ttl_min, "
+    "license_key, license_expires_at, license_status"
 )
 
-SELECT_USER: Final[str] = (
-    "SELECT username, role, created_at, token_ttl_min FROM users WHERE username = ?"
+SELECT_USERS: Final[str] = f"SELECT {_USER_COLUMNS} FROM users ORDER BY username"
+
+SELECT_USER: Final[str] = f"SELECT {_USER_COLUMNS} FROM users WHERE username = ?"
+
+UPDATE_USER_LICENSE: Final[str] = (
+    "UPDATE users SET license_key = ?, license_expires_at = ?, license_status = ? "
+    "WHERE username = ?"
 )
 
 COUNT_USERS_BY_ROLE: Final[str] = "SELECT COUNT(*) AS n FROM users WHERE role = ?"
