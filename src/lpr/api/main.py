@@ -252,6 +252,49 @@ async def _license_watchdog(app: FastAPI, interval: float) -> None:
             logger.exception("Lisans denetimi başarısız")
 
 
+def _start_nightly_update(app: FastAPI, settings: Settings) -> "asyncio.Task[None] | None":
+    """Start the nightly OTA check, or return None when it is switched off.
+
+    Returning ``None`` rather than starting a task that immediately does
+    nothing keeps the "no scheduler is running" case visible in a task dump,
+    which is what you want to check first when an update did not happen
+    overnight.
+    """
+    cfg = getattr(settings, "system_update", None)
+    if not bool(getattr(cfg, "nightly_check", False)):
+        return None
+    if not bool(getattr(cfg, "enabled", False)):
+        # The job would refuse every night anyway; say so once at startup
+        # instead of writing an audit row about it every day.
+        logger.info("Gecelik güncelleme denetimi atlandı: system_update.enabled kapalı")
+        return None
+
+    try:
+        from lpr.db import SystemEventRepository
+        from lpr.scheduler import NightlyUpdateJob, nightly_update_loop
+
+        job = NightlyUpdateJob(
+            updater=deps.get_system_updater_for(app),
+            events=SystemEventRepository(),
+            auto_update=bool(getattr(cfg, "auto_update", False)),
+        )
+        hour = int(getattr(cfg, "check_hour", 3))
+        minute = int(getattr(cfg, "check_minute", 0))
+    except Exception:
+        logger.exception("Gecelik güncelleme görevi kurulamadı")
+        return None
+
+    logger.info(
+        "Gecelik güncelleme denetimi %02d:%02d için planlandı (otomatik kurulum=%s)",
+        hour,
+        minute,
+        job.auto_update,
+    )
+    return asyncio.create_task(
+        nightly_update_loop(job, hour, minute), name="nightly-update"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Start/stop everything the request handlers depend on."""
@@ -288,12 +331,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     watchdog = asyncio.create_task(
         _license_watchdog(app, LICENSE_CHECK_INTERVAL_S), name="license-watchdog"
     )
+    nightly = _start_nightly_update(app, settings)
     try:
         yield
     finally:
-        watchdog.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watchdog
+        for task in (watchdog, nightly):
+            if task is None:
+                continue
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         _stop_pipeline(app)
         logger.info("lpr-api kapatıldı")
 

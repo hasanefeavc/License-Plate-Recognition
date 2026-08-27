@@ -175,6 +175,9 @@ snapshots:
 | `POST /api/relay/trigger` · `/api/pipeline/pause` · `/resume` | admin | manual control |
 | `GET /api/license` · `POST /api/license` | user · admin | licence state; install a new key |
 | `GET /api/stream/{camera}` | bearer | MJPEG preview (capped ~10 fps) |
+| `GET /api/system/version` | user | deployed version, git commit and branch |
+| `GET/POST /api/system/update` | admin | OTA update status; trigger an update (202) |
+| `GET /api/system/events` | admin | operational audit trail (nightly OTA activity) |
 | `WS /ws/events?token=` | token | live plate events as JSON |
 
 Interactive docs at `/docs`.
@@ -491,6 +494,150 @@ custom model exists, `fetch_models.py` stops downloading the baseline and says s
 
 ---
 
+## Remote updates (OTA)
+
+An admin can pull the latest code and rebuild the stack from the dashboard —
+**Ayarlar → Sistem Güncellemesi** — instead of SSHing into every site.
+
+### Read this before enabling it
+
+This feature is remote code execution. That is not a flaw in the
+implementation; it is what an OTA updater *does*. It is therefore **disabled by
+default**, and turning it on has two consequences that no amount of code can
+remove:
+
+1. **Whoever controls the git remote controls every machine running this.** A
+   compromised maintainer account, or a compromised forge, becomes arbitrary
+   code on every deployed site the next time an admin presses the button.
+2. **Rebuilding the stack from inside a container requires the Docker socket.**
+   Mounting `/var/run/docker.sock` lets that container start any container on
+   the host, with any mount, as root — which is host root, laundered through
+   the API process.
+
+That is a reasonable trade for a fleet you operate. It is a bad one for a
+product shipped to sites you do not control, or for an API reachable from an
+untrusted network. The alternative that avoids both risks is a host-side
+`systemd` timer polling `git fetch`, with no endpoint at all.
+
+### What is constrained
+
+Given the feature is enabled, the implementation narrows the blast radius as
+far as it can:
+
+| Control | Effect |
+|---|---|
+| Off by default (`system_update.enabled`) | No endpoint surface until an operator opts in |
+| Admin-only JWT (`require_admin`) | Operators get 403; the updater is never reached |
+| **No caller-supplied target** | Remote, branch, repo dir and compose file come from config only — a stolen admin token can re-run *your* repo, never point at theirs |
+| No shell, ever | Every command is a fixed `list[str]`; `shell=True` appears nowhere |
+| `git pull --ff-only` | A diverged or locally-modified checkout fails loudly instead of producing a merge commit or leaving conflict markers in a file the service imports |
+| Single-flight lock | Two admins cannot race a rebuild against a checkout; the second call gets 409 |
+| Per-step timeouts | A hung fetch cannot pin a thread for the life of the process |
+| No-op detection | An already-current checkout skips the rebuild, so the gate does not go down for nothing |
+
+### Enabling it
+
+```yaml
+# config.yaml
+system_update:
+  enabled: true
+  git_remote: origin
+  git_branch: main
+  compose_file: docker/docker-compose.yml
+```
+
+Then uncomment the OTA block in `docker/docker-compose.yml`, which mounts the
+repo (so `git pull` has a checkout — the image itself has no `.git`) and the
+Docker socket (so the container can rebuild its own stack).
+
+Without those mounts the endpoint still answers; the update just fails with a
+specific message rather than a traceback — *"… bir git deposu değil"* or
+*"Docker soketine erişim reddedildi"*.
+
+### Why the POST returns 202, not 200
+
+`docker compose up -d --build` recreates the container that is serving the
+request. The process is killed partway through its own subprocess call, so the
+update **cannot** report its own success over the connection that asked for it.
+
+Hence the shape of the thing:
+
+1. `POST /api/system/update` validates, starts a detached worker thread, and
+   returns **202 Accepted** immediately.
+2. The worker writes its status to `<data_dir>/last_update.json` *before*
+   starting the rebuild — the last chance to leave a breadcrumb.
+3. The container dies and is replaced.
+4. The new container reads that file on startup. A record still saying
+   "restarting" means the previous container was replaced mid-update, which is
+   the *expected* ending: this process running at all is the evidence the
+   rebuild worked.
+5. The browser polls `GET /api/system/version` through the outage — connection
+   errors during a rebuild are expected, not fatal — until a different commit
+   answers, then reports the new version. A 10-minute deadline bounds the wait.
+
+Failures land in `GET /api/system/update` with a `log` tail of the git and
+compose output, which the dashboard shows verbatim under the button.
+
+### Nightly check (03:00)
+
+Once a night the service asks the remote whether anything new has landed. It is
+an `asyncio` task started from the lifespan, alongside the licence watchdog —
+not APScheduler. One scheduled job does not justify a dependency with its own
+job store, executor pool and threading model, and adding one would leave two
+unrelated scheduling mechanisms in a codebase that deliberately has one of
+everything. The whole scheduling calculation is `seconds_until()`, a pure
+function over a clock.
+
+**Two switches, because these are two different risks:**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `system_update.nightly_check` | `true` | Ask the remote what is available, once a night. **Read-only** — `git fetch` updates a remote-tracking ref and does not touch the working tree. It only records *"an update is waiting"* where an admin will see it. |
+| `system_update.auto_update` | `false` | Install what the check finds, unattended. Requires `enabled` as well. |
+| `system_update.check_hour` / `check_minute` | `3` / `0` | Local wall-clock time. "Low traffic" is a property of the site's clock, not UTC — 03:00 UTC is 06:00 in Turkey, which is a shift change. |
+
+Checking is safe to leave on; **installing unattended is not the same decision
+as pressing the button**. An admin pressing the button is watching the result
+and is updating one site. The nightly job updates every site in the fleet at the
+same moment with nobody looking, so a bad commit becomes a fleet-wide outage
+discovered by a phone call rather than a rollback. Hence the separate opt-in.
+
+The check is `git fetch` followed by
+`git rev-list --count HEAD..origin/main`, not `git status` parsing: porcelain
+status text is localised and gets reformatted between git versions, whereas
+rev-list answers the actual question — "how many commits am I missing" — as a
+single integer. A failed fetch is reported as **"could not tell"**, never as
+"up to date"; conflating those is how a fleet silently stops updating.
+
+Installing uses the same `SystemUpdater.start()` path as the button, so it is
+fast-forward-only and shares the same single-flight lock. A site with local
+modifications fails the nightly update exactly as it would fail a manual one,
+and the failure is recorded rather than worked around.
+
+### Where the nightly job reports
+
+Every attempt, skip and failure is written to the **`system_events`** table
+(schema v3) and shown in the dashboard under the update button, newest first.
+
+`system_events` is deliberately *not* the `logs` table. `logs` is plate
+traffic — it drives the history view, the CSV export and the occupancy
+arithmetic — so an "update installed at 03:00" row in there would appear in an
+operator's vehicle history as a car and be counted as one. The two histories
+share a database, never a table.
+
+```
+[warning] 27.08 03:00  2 yeni sürüm bulundu (e46933f). Otomatik güncelleme başlatılıyor.
+[info]    26.08 03:00  Gecelik denetim: sistem güncel.
+[error]   25.08 03:00  Güncelleme denetimi başarısız.
+```
+
+Rows are retained for `system_update.event_retention_days` (90 by default) and
+trimmed by the existing retention thread. That is longer than the plate log
+because it is a handful of rows a day, and "what did this machine do to itself
+last quarter" outlives "which cars came through last week".
+
+---
+
 ## Licensing (time-limited deployments)
 
 Sites are licensed offline with a signed JWT whose `exp` claim *is* the expiry
@@ -578,7 +725,7 @@ make fmt
 
 ### Test suite
 
-**473 passing tests** across 15 modules (475 collected: 473 pass, 1 skipped, 1 known
+**555 passing tests** across 17 modules (557 collected: 555 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
@@ -587,23 +734,25 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 | --- | ---: | --- |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
-| `test_api.py` | 48 | Routes, JWT auth, MJPEG stream, WebSocket events |
+| `test_api.py` | 62 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
 | `test_pipeline.py` | 37 | Queue semantics, frame stride, thread lifecycle, subscriber fan-out |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
-| `test_db.py` | 27 | Repositories, migrations, retention |
+| `test_db.py` | 35 | Repositories, migrations, retention, system-event trail |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
-| `test_web_ui.py` | 19 | Browser dashboard endpoints |
+| `test_web_ui.py` | 26 | Browser dashboard endpoints, update panel gating |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_parking.py` | 18 | Occupancy accounting |
 | `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
+| `test_updater.py` | 29 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check |
+| `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
 | `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
 | `test_preprocess_pipeline.py` | 11 | Preprocessing wiring: escalation staging, frame-hook injection |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 475 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 557 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

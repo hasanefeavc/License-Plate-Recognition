@@ -455,3 +455,82 @@ def test_migrate_legacy_database(db, tmp_path) -> None:
     second = migrate(legacy_path)
     assert second.already_migrated is True
     assert logs.count_matching() == 4
+
+
+# ---------------------------------------------------------------------------
+# System events
+# ---------------------------------------------------------------------------
+
+
+def _events() -> Any:
+    from lpr.db import SystemEventRepository
+
+    return SystemEventRepository()
+
+
+def test_system_events_round_trip(db: Any) -> None:
+    repo = _events()
+    assert repo.write("ota", "Gecelik denetim: sistem güncel.") > 0
+
+    rows = repo.recent()
+    assert len(rows) == 1
+    assert rows[0]["source"] == "ota"
+    assert rows[0]["level"] == "info"
+    assert rows[0]["ts"]
+
+
+def test_system_events_come_back_newest_first(db: Any) -> None:
+    repo = _events()
+    for index in range(3):
+        repo.write("ota", f"olay {index}")
+    assert [row["message"] for row in repo.recent()] == ["olay 2", "olay 1", "olay 0"]
+
+
+def test_system_events_filter_by_source(db: Any) -> None:
+    repo = _events()
+    repo.write("ota", "güncelleme")
+    repo.write("license", "lisans")
+    assert len(repo.recent(source="ota")) == 1
+    assert len(repo.recent()) == 2
+
+
+def test_an_unknown_level_falls_back_to_info(db: Any) -> None:
+    """The UI colours rows by level; an unexpected value must not break it."""
+    repo = _events()
+    repo.write("ota", "mesaj", level="catastrophic")
+    assert repo.recent()[0]["level"] == "info"
+
+
+def test_system_events_are_kept_out_of_the_plate_log(db: Any) -> None:
+    """The two histories share a database, never a table.
+
+    An OTA row in ``logs`` would show up in an operator's vehicle history and
+    be counted by the occupancy arithmetic.
+    """
+    from lpr.db import LogRepository
+
+    _events().write("ota", "Otomatik güncelleme başlatıldı")
+    assert LogRepository().recent(limit=10) == []
+
+
+def test_system_event_retention_is_a_no_op_at_zero(db: Any) -> None:
+    repo = _events()
+    repo.write("ota", "kalsın")
+    assert repo.purge_older_than(0) == 0
+    assert len(repo.recent()) == 1
+
+
+def test_system_event_retention_keeps_recent_rows(db: Any) -> None:
+    repo = _events()
+    repo.write("ota", "bugün")
+    assert repo.purge_older_than(30) == 0
+    assert len(repo.recent()) == 1
+
+
+def test_a_long_message_is_truncated_rather_than_rejected(db: Any) -> None:
+    """Compose output is long; losing the row entirely would be worse."""
+    repo = _events()
+    assert repo.write("ota", "x" * 5000, detail="y" * 9000) > 0
+    row = repo.recent()[0]
+    assert len(row["message"]) <= 512
+    assert len(row["detail"]) <= 4000

@@ -207,6 +207,9 @@ def test_the_script_targets_endpoints_the_api_actually_exposes() -> None:
         "/api/logs",
         "/api/logs/dates",
         "/api/parking",
+        "/api/system/version",
+        "/api/system/update",
+        "/api/system/events",
     ):
         assert path in script, f"{path} not referenced by app.js"
         assert path in known, f"{path} is not a real route"
@@ -241,3 +244,78 @@ def test_the_csv_export_names_the_file_and_sets_a_csv_mime_type() -> None:
     assert "text/csv;charset=utf-8;" in script
     assert "URL.createObjectURL" in script and "URL.revokeObjectURL" in script
     assert "link.download = CSV_FILENAME" in script
+
+
+# ---------------------------------------------------------------------------
+# System update panel
+# ---------------------------------------------------------------------------
+
+
+def test_the_update_panel_starts_hidden() -> None:
+    """It is revealed only for an admin on a server with the feature enabled.
+
+    Shipping it visible would offer every operator a button that can only ever
+    come back 403, and every non-updatable deployment one that only 503s.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    section = html[html.index('id="update-section"') :][:200]
+    assert "hidden" in section
+
+
+def test_the_update_panel_is_gated_on_admin_and_enablement() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function refreshUpdatePanel") :]
+    body = body[: body.index("\n  }\n")]
+    assert 'state.role !== "admin"' in body, "the panel must be admin-gated client-side"
+    assert "update_enabled" in body, "the panel must respect the server's switch"
+
+
+def test_the_update_button_asks_for_confirmation_before_posting() -> None:
+    """A mis-click must not rebuild a live gate."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function runUpdate") :]
+    body = body[: body.index("\n  }\n")]
+
+    confirm_at = body.index("window.confirm")
+    post_at = body.index('"/api/system/update"')
+    assert confirm_at < post_at, "the POST must come after the confirmation"
+    assert "if (!confirmed) return;" in body
+
+
+def test_the_update_button_shows_a_spinner_while_it_runs() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="update-spinner"' in html
+    assert "animate-spin" in html
+    assert "setUpdateBusy" in script
+
+
+def test_the_client_polls_for_the_restart_instead_of_awaiting_the_post() -> None:
+    """The POST is 202; success can only be observed by the commit changing."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function pollForRestart") :]
+    body = body[: body.index("\n  }\n")]
+    assert "/api/system/version" in body
+    assert "UPDATE_POLL_TIMEOUT_MS" in script, "the poll loop needs a deadline"
+    # A connection error during the rebuild is expected, not fatal.
+    assert "continue" in body
+
+
+def test_the_update_panel_shows_the_nightly_audit_trail() -> None:
+    """An admin should see whether 03:00 came and went without incident."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="update-history"' in html
+    body = script[script.index("async function refreshUpdateHistory") :]
+    body = body[: body.index("\n  }\n")]
+    assert "source=ota" in body, "the trail must be filtered to OTA events"
+
+
+def test_the_audit_trail_is_rendered_as_text_not_markup() -> None:
+    """Event messages carry git and compose output; innerHTML would be an XSS."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function refreshUpdateHistory") :]
+    body = body[: body.index("\n  }\n")]
+    assert "innerHTML" not in body
+    assert "textContent" in body

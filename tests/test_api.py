@@ -902,3 +902,251 @@ def test_ws_forwards_decisions_and_telemetry_separately(
         assert seen["event"]["plate"] == "34ABC123"
         assert seen["event"]["action"] == "granted"
         assert seen["telemetry"]["kind"] == "read"
+
+
+# ---------------------------------------------------------------------------
+# System / OTA update
+# ---------------------------------------------------------------------------
+
+
+class FakeUpdater:
+    """Stands in for ``lpr.updater.SystemUpdater`` at the HTTP boundary."""
+
+    def __init__(self, enabled: bool = True, error: Exception | None = None) -> None:
+        self.enabled = enabled
+        self.error = error
+        self.starts = 0
+        self._status = types.SimpleNamespace(
+            to_dict=lambda: {
+                "state": "idle",
+                "step": None,
+                "detail": "",
+                "running": False,
+                "started_at": None,
+                "finished_at": None,
+                "commit_before": None,
+                "commit_after": None,
+                "log": [],
+            }
+        )
+
+    def version(self) -> Any:
+        return types.SimpleNamespace(
+            to_dict=lambda: {
+                "version": "0.1.0",
+                "commit": "e46933f0c2a1b8d4",
+                "short_commit": "e46933f",
+                "branch": "main",
+                "dirty": False,
+            }
+        )
+
+    @property
+    def status(self) -> Any:
+        return self._status
+
+    def start(self) -> Any:
+        self.starts += 1
+        if self.error is not None:
+            raise self.error
+        self._status = types.SimpleNamespace(
+            to_dict=lambda: {
+                "state": "running",
+                "step": "pull",
+                "detail": "Güncelleme başlatıldı.",
+                "running": True,
+                "started_at": 1.0,
+                "finished_at": None,
+                "commit_before": "aaa",
+                "commit_after": None,
+                "log": [],
+            }
+        )
+        return self._status
+
+
+@pytest.fixture()
+def updater() -> FakeUpdater:
+    return FakeUpdater()
+
+
+@pytest.fixture()
+def update_client(api_app: Any, updater: FakeUpdater) -> TestClient:
+    api_app.dependency_overrides[deps.get_system_updater] = lambda: updater
+    # deps.get_system_updater is also called directly (not as a dependency) by
+    # the handlers, so the app-state cache has to hold the fake too.
+    api_app.state.system_updater = updater
+    return TestClient(api_app)
+
+
+def test_version_requires_authentication(update_client: TestClient) -> None:
+    assert update_client.get("/api/system/version").status_code == 401
+
+
+def test_version_is_readable_by_an_operator(
+    update_client: TestClient, operator_token: str
+) -> None:
+    """An operator who can see the running version can report it on the phone."""
+    response = update_client.get("/api/system/version", headers=auth(operator_token))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["short_commit"] == "e46933f"
+    assert body["branch"] == "main"
+    assert body["update_enabled"] is True
+
+
+def test_update_requires_authentication(update_client: TestClient) -> None:
+    assert update_client.post("/api/system/update").status_code == 401
+
+
+def test_update_is_forbidden_to_an_operator(
+    update_client: TestClient, operator_token: str, updater: FakeUpdater
+) -> None:
+    """The whole feature is remote code execution; operators must not reach it."""
+    response = update_client.post("/api/system/update", headers=auth(operator_token))
+    assert response.status_code == 403
+    assert updater.starts == 0, "a rejected caller must never reach the updater"
+
+
+def test_update_status_is_forbidden_to_an_operator(
+    update_client: TestClient, operator_token: str
+) -> None:
+    response = update_client.get("/api/system/update", headers=auth(operator_token))
+    assert response.status_code == 403
+
+
+def test_an_admin_can_start_an_update(
+    update_client: TestClient, admin_token: str, updater: FakeUpdater
+) -> None:
+    response = update_client.post("/api/system/update", headers=auth(admin_token))
+    assert response.status_code == 202, "202: the work outlives the request"
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["state"] == "running"
+    assert updater.starts == 1
+
+
+def test_a_disabled_updater_answers_503(
+    api_app: Any, admin_token: str
+) -> None:
+    disabled = FakeUpdater(enabled=False, error=RuntimeError("Sistem güncellemesi devre dışı."))
+    api_app.state.system_updater = disabled
+    api_app.dependency_overrides[deps.get_system_updater] = lambda: disabled
+    response = TestClient(api_app).post("/api/system/update", headers=auth(admin_token))
+    assert response.status_code == 503
+
+
+def test_a_concurrent_update_answers_409(api_app: Any, admin_token: str) -> None:
+    busy = FakeUpdater(error=RuntimeError("Zaten devam eden bir güncelleme var."))
+    api_app.state.system_updater = busy
+    api_app.dependency_overrides[deps.get_system_updater] = lambda: busy
+    response = TestClient(api_app).post("/api/system/update", headers=auth(admin_token))
+    assert response.status_code == 409
+
+
+def test_update_status_is_readable_by_an_admin(
+    update_client: TestClient, admin_token: str
+) -> None:
+    response = update_client.get("/api/system/update", headers=auth(admin_token))
+    assert response.status_code == 200
+    assert response.json()["state"] == "idle"
+
+
+def test_the_update_endpoint_accepts_no_caller_supplied_target(
+    update_client: TestClient, admin_token: str, updater: FakeUpdater
+) -> None:
+    """A body naming another repo must not change what gets pulled.
+
+    ``start()`` takes no arguments, so there is nowhere for a caller-supplied
+    remote to go even if one were sent. This pins that shape.
+    """
+    response = update_client.post(
+        "/api/system/update",
+        headers=auth(admin_token),
+        json={"remote": "https://evil.example/repo", "branch": "payload"},
+    )
+    assert response.status_code == 202
+    assert updater.starts == 1
+
+
+class FakeSystemEventRepo:
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+        self.rows = rows or []
+        self.queries: list[tuple[int, str | None]] = []
+
+    def recent(self, limit: int = 50, source: str | None = None) -> list[dict[str, Any]]:
+        self.queries.append((limit, source))
+        rows = [r for r in self.rows if source is None or r["source"] == source]
+        return rows[:limit]
+
+
+@pytest.fixture()
+def events_repo() -> FakeSystemEventRepo:
+    return FakeSystemEventRepo(
+        [
+            {
+                "id": 2,
+                "ts": "2026-08-27T03:00:04+00:00",
+                "source": "ota",
+                "level": "warning",
+                "message": "2 yeni sürüm bulundu. Otomatik güncelleme başlatılıyor.",
+                "detail": None,
+            },
+            {
+                "id": 1,
+                "ts": "2026-08-26T03:00:02+00:00",
+                "source": "ota",
+                "level": "info",
+                "message": "Gecelik denetim: sistem güncel.",
+                "detail": "Sistem güncel.",
+            },
+        ]
+    )
+
+
+@pytest.fixture()
+def events_client(api_app: Any, events_repo: FakeSystemEventRepo) -> TestClient:
+    api_app.state.system_event_repository = events_repo
+    api_app.dependency_overrides[deps.get_system_event_repository] = lambda: events_repo
+    return TestClient(api_app)
+
+
+def test_system_events_require_admin(
+    events_client: TestClient, operator_token: str
+) -> None:
+    """The audit trail says when the machine last rebuilt itself."""
+    assert events_client.get("/api/system/events").status_code == 401
+    assert (
+        events_client.get("/api/system/events", headers=auth(operator_token)).status_code
+        == 403
+    )
+
+
+def test_an_admin_reads_the_audit_trail_newest_first(
+    events_client: TestClient, admin_token: str
+) -> None:
+    response = events_client.get("/api/system/events", headers=auth(admin_token))
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["id"] for row in body] == [2, 1]
+    assert body[0]["level"] == "warning"
+
+
+def test_the_audit_trail_can_be_filtered_and_limited(
+    events_client: TestClient, admin_token: str, events_repo: FakeSystemEventRepo
+) -> None:
+    response = events_client.get(
+        "/api/system/events?limit=1&source=ota", headers=auth(admin_token)
+    )
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert events_repo.queries[-1] == (1, "ota")
+
+
+def test_the_audit_trail_rejects_an_absurd_limit(
+    events_client: TestClient, admin_token: str
+) -> None:
+    assert (
+        events_client.get("/api/system/events?limit=99999", headers=auth(admin_token)).status_code
+        == 422
+    )

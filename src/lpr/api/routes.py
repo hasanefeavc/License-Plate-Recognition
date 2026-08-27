@@ -44,8 +44,11 @@ from lpr.api.schemas import (
     RegisterIn,
     RelayTriggerOut,
     StatsOut,
+    SystemEventOut,
+    SystemUpdateOut,
     TokenOut,
     UserOut,
+    VersionOut,
     normalize_plate,
 )
 from lpr.api.security import (
@@ -890,3 +893,117 @@ async def stream(
             "Connection": "close",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# System / OTA update
+#
+# The dangerous half of this feature lives in :mod:`lpr.updater`, not here.
+# These handlers authenticate, translate the updater's two refusal modes into
+# status codes, and get out of the way -- there is no command construction, no
+# subprocess call and nothing from the request body anywhere in this section.
+# ---------------------------------------------------------------------------
+
+
+def _update_out(status_obj: Any, accepted: bool = False) -> SystemUpdateOut:
+    return SystemUpdateOut(**status_obj.to_dict(), accepted=accepted)
+
+
+@router.get(
+    "/api/system/version",
+    response_model=VersionOut,
+    tags=["system"],
+    summary="Sistem sürümü",
+)
+async def system_version(request: Request, _: CurrentUser) -> VersionOut:
+    """The deployed version and git revision.
+
+    Readable by any authenticated user: an operator who can see that the site
+    is three commits behind can say so on the phone instead of guessing. It
+    shells out to git, so it runs off the event loop.
+    """
+    updater = deps.get_system_updater(request)
+    info = await _in_thread(updater.version)
+    return VersionOut(**info.to_dict(), update_enabled=bool(updater.enabled))
+
+
+@router.get(
+    "/api/system/update",
+    response_model=SystemUpdateOut,
+    tags=["system"],
+    summary="Güncelleme durumu",
+)
+async def system_update_status(request: Request, _: AdminUser) -> SystemUpdateOut:
+    """Progress of the current or last update.
+
+    This is what the UI polls after the POST. Note that a *successful* update
+    kills the container serving it, so the reply that reports success normally
+    comes from the freshly started container reading the state file the old one
+    left behind.
+    """
+    return _update_out(deps.get_system_updater(request).status)
+
+
+@router.post(
+    "/api/system/update",
+    response_model=SystemUpdateOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["system"],
+    summary="Sistemi güncelle",
+    responses={
+        409: {"description": "Zaten devam eden bir güncelleme var"},
+        503: {"description": "Sistem güncellemesi devre dışı"},
+    },
+)
+async def system_update(request: Request, user: AdminUser) -> SystemUpdateOut:
+    """Pull from the configured remote and rebuild the stack. Admin only.
+
+    Returns **202 Accepted**, not 200: the work is detached onto its own thread
+    and the response is sent before ``docker compose`` starts, because the
+    rebuild terminates this process. A 202 that arrives is the strongest
+    promise this endpoint can honestly make -- the client must poll
+    ``GET /api/system/update`` and ``GET /api/system/version`` for the outcome.
+
+    Nothing about *what* is pulled comes from the caller; see
+    :class:`lpr.config.SystemUpdateConfig`.
+    """
+    updater = deps.get_system_updater(request)
+    try:
+        state = updater.start()
+    except RuntimeError as exc:
+        detail = str(exc)
+        # Disabled is a deployment state (503); already-running is a conflict
+        # (409). Both are expected, neither is a server fault.
+        code = (
+            status.HTTP_409_CONFLICT
+            if "devam eden" in detail
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=code, detail=detail) from exc
+
+    logger.warning("Sistem güncellemesi '%s' tarafından tetiklendi", user.username)
+    return _update_out(state, accepted=True)
+
+
+@router.get(
+    "/api/system/events",
+    response_model=list[SystemEventOut],
+    tags=["system"],
+    summary="Sistem olayları",
+)
+async def system_events(
+    request: Request,
+    _: AdminUser,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    source: Annotated[str | None, Query(max_length=64)] = None,
+) -> list[SystemEventOut]:
+    """Operational audit trail, newest first. Admin only.
+
+    This is where the nightly updater reports what it did at 03:00 -- checked,
+    found nothing, found something and installed it, or failed and why. It is
+    *not* the plate log: those live in different tables precisely so an
+    unattended update cannot appear in an operator's vehicle history.
+    """
+    repo = deps.get_system_event_repository(request)
+    rows = await _in_thread(repo.recent, limit, source)
+    return [SystemEventOut.model_validate(row) for row in rows]

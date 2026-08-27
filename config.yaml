@@ -330,6 +330,109 @@ api:
 
 
 
+# Remote over-the-air update: git pull + docker compose rebuild, triggered by
+
+# an admin from the dashboard.
+
+#
+
+# OFF BY DEFAULT, AND READ THIS BEFORE TURNING IT ON. Enabling this means an
+
+# admin token can make this machine run whatever the configured git remote
+
+# currently contains, and rebuilding the stack from inside a container needs
+
+# /var/run/docker.sock mounted -- which is root on the host. Two consequences
+
+# worth being explicit about:
+
+#
+
+#   * Whoever controls the git remote controls every site running this.
+
+#   * Anyone who gets code execution in the API container owns the host.
+
+#
+
+# That is an acceptable trade for a fleet you control and a bad one for a
+
+# product shipped to sites you do not. Nothing here is settable per-request:
+
+# the remote, branch and compose file are operator configuration, so a stolen
+
+# admin token cannot redirect the update at somebody else's repository.
+
+system_update:
+
+  enabled: false
+
+  # Working directory for the git and compose commands (the repo root).
+
+  repo_dir: "."
+
+  git_remote: origin
+
+  git_branch: main
+
+  compose_file: docker/docker-compose.yml
+
+  # Fetching is quick; building an image with the ML stack in it is not.
+
+  git_timeout_s: 120.0
+
+  build_timeout_s: 900.0
+
+  # Where the outcome is left for the container that comes up after the
+
+  # rebuild. Empty = <data_dir>/last_update.json.
+
+  state_file: ""
+
+  # --- Nightly check ---------------------------------------------------
+
+  # Ask the remote once a night whether anything new has landed. On its own
+
+  # this is READ-ONLY -- `git fetch` does not touch the working tree -- so it
+
+  # is safe to leave on: it just records "an update is waiting" in the system
+
+  # events an admin can read from the dashboard.
+
+  nightly_check: true
+
+  # Install what the nightly check finds, with nobody watching.
+
+  #
+
+  # This is a bigger risk than the manual button and has its own switch for
+
+  # that reason. An admin pressing the button is watching the result and is
+
+  # updating one site; this updates the whole fleet at 03:00 simultaneously,
+
+  # so a bad commit is a fleet-wide outage you find out about by phone.
+
+  # Requires `enabled` as well -- both must be true.
+
+  auto_update: false
+
+  # Local wall-clock time of the check. "Low traffic" is a property of the
+
+  # site's clock, not of UTC: 03:00 UTC is 06:00 in Turkey, a shift change.
+
+  check_hour: 3
+
+  check_minute: 0
+
+  # Retention for the system_events audit rows. Longer than the plate log:
+
+  # it is a handful of rows a day, and "what did this machine do to itself
+
+  # last quarter" outlives "which cars came through last week".
+
+  event_retention_days: 90
+
+
 security:
 
   password_hasher: argon2

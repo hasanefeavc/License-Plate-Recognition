@@ -117,6 +117,9 @@
     feedCount: 0,
     licenceValid: true,
     closing: false,
+    /** Short commit of the running server, used to detect that an OTA update
+     *  actually replaced the process rather than merely restarting it. */
+    version: "",
     /** Last rows fetched into the history modal. The CSV is built from
      *  exactly what the operator is looking at, not from a second query that
      *  could return something else. */
@@ -151,6 +154,10 @@
     "modal-settings", "btn-settings", "settings-form", "settings-save",
     "settings-status", "capacity-input", "capacity-hint", "quality-select",
     "occupancy", "capacity", "full-banner",
+    // System update (inside the settings modal)
+    "update-section", "update-version", "update-branch", "update-dirty-row",
+    "update-run", "update-run-label", "update-spinner", "update-status",
+    "update-log", "update-history", "update-history-wrap",
   ].forEach((id) => { el[id] = $(id); });
 
   // -----------------------------------------------------------------------
@@ -655,6 +662,7 @@
       isAdmin ? `Şu an içeride: ${state.parking.inside}` : "Değiştirmek için yönetici yetkisi gerekli"
     );
     modalStatus(el["settings-status"], "");
+    refreshUpdatePanel();
   }
 
   async function saveSettings(event) {
@@ -760,6 +768,213 @@
     if (!node) return;
     node.textContent = message || "";
     node.className = `flex-1 truncate text-sm font-semibold ${TEXT_CLASSES[tone] || TEXT_CLASSES.muted}`;
+  }
+
+  // -----------------------------------------------------------------------
+  // System update (OTA)
+  //
+  // The server cannot report its own success: `docker compose up --build`
+  // recreates the container that is serving the request, so POST only ever
+  // returns 202 "accepted". Everything after that is this client polling the
+  // version endpoint through the outage until a *different* commit answers.
+  // -----------------------------------------------------------------------
+
+  /** How long to keep polling for the rebuilt server before giving up. */
+  const UPDATE_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+  const UPDATE_POLL_INTERVAL_MS = 4000;
+
+  function updateStatusText(message, tone = "muted") {
+    const node = el["update-status"];
+    if (!node) return;
+    node.textContent = message || "";
+    node.className = `mt-2 text-xs font-semibold ${TEXT_CLASSES[tone] || TEXT_CLASSES.muted}`;
+  }
+
+  function updateLog(lines) {
+    const node = el["update-log"];
+    if (!node) return;
+    const text = (lines || []).join("\n").trim();
+    node.textContent = text;
+    node.hidden = !text;
+  }
+
+  function setUpdateBusy(busy, label) {
+    if (el["update-run"]) el["update-run"].disabled = busy;
+    if (el["update-spinner"]) el["update-spinner"].hidden = !busy;
+    setText(el["update-run-label"], label || "Güncellemeyi Denetle & Uygula");
+  }
+
+  /** Show the current version, and reveal the panel only for an admin on a
+   *  server that actually has the feature enabled. */
+  async function refreshUpdatePanel() {
+    const section = el["update-section"];
+    if (!section) return;
+    section.hidden = true;
+    updateLog([]);
+
+    if (state.role !== "admin") return;
+
+    try {
+      const info = await api("/api/system/version");
+      section.hidden = !info.update_enabled;
+
+      setText(el["update-version"], info.short_commit || info.version || "—");
+      setText(el["update-branch"], info.branch || "—");
+      if (el["update-dirty-row"]) el["update-dirty-row"].hidden = !info.dirty;
+
+      state.version = info.short_commit || info.version || "";
+      if (!info.update_enabled) return;
+
+      setUpdateBusy(false);
+      // A previous update -- or last night's scheduled one -- may have
+      // finished while nobody was looking.
+      await refreshUpdateState();
+      await refreshUpdateHistory();
+    } catch (err) {
+      // A server too old to know these endpoints simply has no update panel.
+      if (err.status !== 404) updateStatusText(err.message, "bad");
+    }
+  }
+
+  const EVENT_TONES = { error: "bad", warning: "warn", info: "muted" };
+
+  /** Render the OTA audit trail: what the nightly job did, newest first. */
+  async function refreshUpdateHistory() {
+    const list = el["update-history"];
+    const wrap = el["update-history-wrap"];
+    if (!list || !wrap) return;
+
+    let rows = [];
+    try {
+      rows = await api("/api/system/events?limit=8&source=ota");
+    } catch (_) {
+      wrap.hidden = true;
+      return;
+    }
+
+    list.replaceChildren();
+    wrap.hidden = !rows.length;
+
+    rows.forEach((row) => {
+      const item = document.createElement("li");
+      item.className = "flex gap-2";
+
+      const when = document.createElement("span");
+      when.className = "shrink-0 font-mono text-muted";
+      when.textContent = shortTimestamp(row.ts);
+
+      const text = document.createElement("span");
+      text.className = TEXT_CLASSES[EVENT_TONES[row.level]] || TEXT_CLASSES.muted;
+      text.textContent = row.message;
+      if (row.detail) text.title = row.detail;
+
+      item.append(when, text);
+      list.appendChild(item);
+    });
+  }
+
+  /** `2026-08-27T03:00:04+00:00` -> `27.08 03:00`; unparseable input verbatim. */
+  function shortTimestamp(value) {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value || "");
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(parsed.getDate())}.${pad(parsed.getMonth() + 1)} ` +
+           `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+  }
+
+  /** Read the last/current update outcome and render it. */
+  async function refreshUpdateState() {
+    try {
+      const status = await api("/api/system/update");
+      if (!status || status.state === "idle") return;
+      const tone = { succeeded: "ok", failed: "bad" }[status.state] || "accent";
+      updateStatusText(status.detail || status.state, tone);
+      if (status.state === "failed") updateLog(status.log);
+    } catch (_) { /* status is a nicety; never block the panel on it */ }
+  }
+
+  async function runUpdate() {
+    const confirmed = window.confirm(
+      "Sistem güncellenecek.\n\n" +
+      "Sunucu en son sürümü indirip kendini yeniden başlatacak. " +
+      "Bu sırada kameralar ve bariyer birkaç dakika devre dışı kalır.\n\n" +
+      "Devam edilsin mi?"
+    );
+    if (!confirmed) return;
+
+    const before = state.version;
+    setUpdateBusy(true, "Güncelleniyor...");
+    updateStatusText("Güncelleme başlatılıyor...", "accent");
+    updateLog([]);
+
+    try {
+      const accepted = await api("/api/system/update", { method: "POST" });
+      updateStatusText(accepted.detail || "Güncelleme başlatıldı.", "accent");
+    } catch (err) {
+      setUpdateBusy(false);
+      updateStatusText(err.message, "bad");
+      return;
+    }
+
+    updateStatusText("Sunucu yeniden derleniyor, lütfen bekleyin...", "accent");
+    await pollForRestart(before);
+  }
+
+  /** Poll until the server answers with a different commit, or time out.
+   *
+   *  Connection errors here are expected, not exceptional: the container is
+   *  being replaced, so the socket *should* fail for a while. Only the clock
+   *  ends this loop. */
+  async function pollForRestart(before) {
+    const deadline = Date.now() + UPDATE_POLL_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+      await sleep(UPDATE_POLL_INTERVAL_MS);
+      if (state.closing) return;
+
+      let info = null;
+      try {
+        info = await api("/api/system/version");
+      } catch (_) {
+        updateStatusText("Sunucu yeniden başlatılıyor...", "accent");
+        continue;
+      }
+
+      const now = info.short_commit || info.version || "";
+      if (before && now && now !== before) {
+        setUpdateBusy(false);
+        state.version = now;
+        setText(el["update-version"], now);
+        setText(el["update-branch"], info.branch || "—");
+        updateStatusText(`Güncelleme tamamlandı. Yeni sürüm: ${now}`, "ok");
+        refreshUpdateHistory();
+        return;
+      }
+
+      // Same commit and the server is answering again: either nothing to pull
+      // or the update failed. The status endpoint knows which.
+      const status = await api("/api/system/update").catch(() => null);
+      if (status && !status.running) {
+        setUpdateBusy(false);
+        if (status.state === "failed") {
+          updateStatusText(status.detail || "Güncelleme başarısız.", "bad");
+          updateLog(status.log);
+        } else {
+          updateStatusText(status.detail || "Sistem zaten güncel.", "ok");
+        }
+        return;
+      }
+    }
+
+    setUpdateBusy(false);
+    updateStatusText(
+      "Güncelleme durumu doğrulanamadı. Sayfayı yenileyip sürümü kontrol edin.",
+      "warn"
+    );
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // -----------------------------------------------------------------------
@@ -1153,6 +1368,7 @@
     el["btn-plates"].addEventListener("click", openPlates);
     el["btn-history"].addEventListener("click", openHistory);
     el["btn-settings"].addEventListener("click", openSettings);
+    if (el["update-run"]) el["update-run"].addEventListener("click", runUpdate);
     el["btn-logout"].addEventListener("click", () => logout(""));
 
     wireModal("modal-plates");

@@ -244,6 +244,57 @@ class ParkingConfig(BaseModel):
     capacity: int = Field(default=100, ge=0, le=100000)
 
 
+class SystemUpdateConfig(BaseModel):
+    """Remote over-the-air update (git pull + docker compose rebuild).
+
+    **Off by default, deliberately.** Turning this on gives anyone holding an
+    admin token the ability to make the host run whatever the configured git
+    remote currently contains, and rebuilding the stack from inside it needs a
+    mounted Docker socket, which is root on the host. That is an acceptable
+    trade for a fleet you control and a terrible default for a product that
+    ships to sites you do not.
+
+    Note what is *not* here: nothing in this model is settable per-request. The
+    remote, branch, working directory and compose file are operator
+    configuration, so a stolen admin token cannot redirect the update at an
+    attacker's repository -- it can only re-run the operator's own.
+    """
+
+    #: Master switch for POST /api/system/update. GET /api/system/version keeps
+    #: working either way, so the UI can still show what is deployed.
+    enabled: bool = False
+    #: Working directory for the git and compose commands; the repo root.
+    repo_dir: str = "."
+    git_remote: str = "origin"
+    git_branch: str = "main"
+    compose_file: str = "docker/docker-compose.yml"
+    #: Fetching is quick; building an ML image is not.
+    git_timeout_s: float = Field(default=120.0, gt=0, le=3600)
+    build_timeout_s: float = Field(default=900.0, gt=0, le=21600)
+    #: Where the outcome is left for the container that comes up after the
+    #: rebuild. Empty = ``<data_dir>/last_update.json``.
+    state_file: str = ""
+
+    #: Check the remote for new commits once a night. Read-only on its own:
+    #: with ``auto_update`` off it only *reports* that an update is waiting,
+    #: which is a safe thing to leave on.
+    nightly_check: bool = True
+    #: Install what the nightly check finds, unattended.
+    #:
+    #: Separate from ``enabled`` because they are different risks. A human
+    #: pressing the button watches the result and updates one site; this
+    #: updates the whole fleet at once with nobody looking, so a bad commit
+    #: becomes a fleet-wide outage discovered by a phone call. Requires
+    #: ``enabled`` as well -- both must be true.
+    auto_update: bool = False
+    #: Local wall-clock time of the nightly check. "Low traffic" is a property
+    #: of the site's clock, not of UTC.
+    check_hour: int = Field(default=3, ge=0, le=23)
+    check_minute: int = Field(default=0, ge=0, le=59)
+    #: Retention for the ``system_events`` audit rows.
+    event_retention_days: int = Field(default=90, ge=0, le=3650)
+
+
 class ApiConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
@@ -331,6 +382,7 @@ class Settings(BaseSettings):
     snapshots: SnapshotsConfig = Field(default_factory=SnapshotsConfig)
     parking: ParkingConfig = Field(default_factory=ParkingConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    system_update: SystemUpdateConfig = Field(default_factory=SystemUpdateConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     @classmethod
