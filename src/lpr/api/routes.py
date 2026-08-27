@@ -16,7 +16,8 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from typing import Annotated, Any, Literal
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -28,10 +29,14 @@ from lpr.api.schemas import (
     CameraSourceIn,
     CameraStatusOut,
     HealthOut,
+    LicenseIn,
+    LicenseOut,
+    LoginIn,
     LogOut,
     LogQuery,
-    LoginIn,
     MetricsOut,
+    ParkingIn,
+    ParkingOut,
     PipelineStateOut,
     PlateIn,
     PlateListOut,
@@ -55,6 +60,9 @@ from lpr.api.security import (
     user_from_token,
 )
 from lpr.contracts import CameraRole, LprEvent, utc_now_iso
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from lpr.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -401,6 +409,96 @@ async def log_dates(_: CurrentUser, log_repo: deps.LogRepo) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Parking occupancy
+# ---------------------------------------------------------------------------
+
+#: ``system_meta`` key holding the operator-set capacity. Stored in the
+#: database rather than config.yaml so an admin can change it from the browser
+#: without a redeploy, and so every tablet on the site reads one value.
+CAPACITY_KEY = "parking.capacity"
+
+
+def _day_start_iso() -> str:
+    """Midnight UTC today -- the window the occupancy counter works over.
+
+    Occupancy is a same-day tally: it resets at 00:00 UTC rather than trying
+    to reconcile a car that was parked overnight. A gate log is not a parking
+    contract, and a counter that silently drifts for weeks is worse than one
+    that is honest about its window.
+    """
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _read_capacity(meta_repo: Any, settings: Settings) -> int:
+    """Operator-set capacity, falling back to the configured default."""
+    try:
+        stored = meta_repo.get(CAPACITY_KEY)
+    except Exception:  # pragma: no cover - a missing table reads as "unset"
+        logger.debug("Kapasite okunamadı", exc_info=True)
+        stored = None
+    if stored is not None:
+        try:
+            return max(0, int(stored))
+        except (TypeError, ValueError):
+            logger.warning("Geçersiz kapasite değeri saklanmış: %r", stored)
+    return max(0, int(settings.parking.capacity))
+
+
+async def _parking_state(log_repo: Any, meta_repo: Any, settings: Settings) -> ParkingOut:
+    since = _day_start_iso()
+    capacity = _read_capacity(meta_repo, settings)
+    counts = await _in_thread(log_repo.occupancy_since, since)
+    inside = int(counts.get("inside", 0))
+    return ParkingOut(
+        inside=inside,
+        capacity=capacity,
+        # A capacity of 0 means "not configured", not "permanently full".
+        full=capacity > 0 and inside >= capacity,
+        entries=int(counts.get("entries", 0)),
+        exits=int(counts.get("exits", 0)),
+        since=since,
+    )
+
+
+@router.get(
+    "/api/parking",
+    response_model=ParkingOut,
+    tags=["parking"],
+    summary="Doluluk ve kapasite",
+)
+async def parking_state(
+    _: CurrentUser,
+    log_repo: deps.LogRepo,
+    meta_repo: deps.MetaRepo,
+    settings: deps.AdminSettings,
+) -> ParkingOut:
+    return await _parking_state(log_repo, meta_repo, settings)
+
+
+@router.put(
+    "/api/parking",
+    response_model=ParkingOut,
+    tags=["parking"],
+    summary="Kapasiteyi ayarla",
+)
+async def set_parking_capacity(
+    payload: ParkingIn,
+    user: AdminUser,
+    log_repo: deps.LogRepo,
+    meta_repo: deps.MetaRepo,
+    settings: deps.AdminSettings,
+) -> ParkingOut:
+    await _in_thread(meta_repo.set, CAPACITY_KEY, str(int(payload.capacity)))
+    logger.info(
+        "Otopark kapasitesi %d olarak ayarlandı (kullanıcı: %s)",
+        payload.capacity,
+        user.username,
+    )
+    return await _parking_state(log_repo, meta_repo, settings)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline / cameras
 # ---------------------------------------------------------------------------
 
@@ -449,6 +547,10 @@ async def metrics(request: Request, _: CurrentUser) -> MetricsOut:
     except Exception:  # pragma: no cover - the socket layer is optional
         clients = 0
 
+    # The cached status, not a fresh verify: the watchdog refreshes it on its
+    # own interval, and a scrape job must never make this endpoint do crypto.
+    license_status = deps.get_license_guard(request.app).status
+
     return MetricsOut(
         running=bool(getattr(pipeline, "running", False)),
         uptime_s=max(0.0, time.time() - started_at) if started_at else 0.0,
@@ -462,6 +564,11 @@ async def metrics(request: Request, _: CurrentUser) -> MetricsOut:
         cameras_connected=sum(1 for cam in cameras if cam.get("connected")),
         cameras_total=len(cameras),
         websocket_clients=clients,
+        license_valid=license_status.valid,
+        license_reason=license_status.reason,
+        license_client=license_status.client,
+        license_expires_at=license_status.expires_at,
+        license_days_remaining=license_status.days_remaining,
     )
 
 
@@ -527,6 +634,8 @@ async def set_camera_source(
     summary="İşlemeyi duraklat",
 )
 async def pause_pipeline(request: Request, _: AdminUser) -> PipelineStateOut:
+    # Remembered so releasing a licence hold does not undo a deliberate pause.
+    request.app.state.manual_paused = True
     paused = deps.set_paused(request.app, True)
     pipeline = deps.get_pipeline_optional(request)
     return PipelineStateOut(paused=paused, running=bool(getattr(pipeline, "running", False)))
@@ -539,9 +648,85 @@ async def pause_pipeline(request: Request, _: AdminUser) -> PipelineStateOut:
     summary="İşlemeye devam et",
 )
 async def resume_pipeline(request: Request, _: AdminUser) -> PipelineStateOut:
+    request.app.state.manual_paused = False
+    # An expired site must not be able to resume itself through this endpoint;
+    # the only way out is a valid key via POST /api/license.
+    guard = deps.get_license_guard(request.app)
+    if deps.is_license_halted(request.app) or not guard.status.valid:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=guard.status.detail,
+        )
     paused = deps.set_paused(request.app, False)
     pipeline = deps.get_pipeline_optional(request)
     return PipelineStateOut(paused=paused, running=bool(getattr(pipeline, "running", False)))
+
+
+# ---------------------------------------------------------------------------
+# Licence
+# ---------------------------------------------------------------------------
+
+
+def _license_out(request: Request, status_obj: Any) -> LicenseOut:
+    return LicenseOut(
+        **status_obj.to_dict(),
+        pipeline_halted=deps.is_license_halted(request.app),
+    )
+
+
+@router.get(
+    "/api/license",
+    response_model=LicenseOut,
+    tags=["license"],
+    summary="Lisans durumu",
+)
+async def license_status(request: Request, _: CurrentUser) -> LicenseOut:
+    """Current licence state, as last checked by the watchdog.
+
+    Any authenticated user may read it -- the desktop client polls this to
+    decide whether to lock its own UI, and an operator who cannot see *why*
+    the system stopped just phones the installer.
+    """
+    guard = deps.get_license_guard(request.app)
+    return _license_out(request, guard.status)
+
+
+@router.post(
+    "/api/license",
+    response_model=LicenseOut,
+    tags=["license"],
+    summary="Lisans anahtarı gir",
+)
+async def submit_license(
+    request: Request,
+    payload: LicenseIn,
+    user: AdminUser,
+) -> LicenseOut:
+    """Install a new licence key and, if it is good, release the halt.
+
+    Verification and storage happen off the event loop (signature check plus
+    two SQLite writes). A rejected key is a 400 carrying the reason the
+    operator needs -- expired, invalid, or a rolled-back system clock.
+    """
+    from lpr.license import LicenseError
+
+    guard = deps.get_license_guard(request.app)
+    try:
+        activated = await _in_thread(guard.activate, payload.key)
+    except LicenseError as exc:
+        logger.warning("Lisans anahtarı reddedildi (kullanıcı: %s): %s", user.username, exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+    deps.apply_license_state(request.app, activated.valid)
+    logger.info(
+        "Lisans güncellendi (kullanıcı: %s, müşteri: %s, bitiş: %s)",
+        user.username,
+        activated.client,
+        activated.expires_at,
+    )
+    return _license_out(request, activated)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +748,15 @@ async def trigger_relay(
     """Open the gate by hand and record it as a ``granted`` event for plate
     ``MANUAL`` so the audit trail shows who opened the barrier and when.
     """
+    guard = deps.get_license_guard(request.app)
+    if not guard.status.valid:
+        # The gate is the licensed function. Refusing here closes the obvious
+        # hole in halting only the ML half of the pipeline.
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=guard.status.detail,
+        )
+
     pipeline = deps.get_pipeline(request)
     trigger = getattr(pipeline, "trigger_relay", None)
     if not callable(trigger):

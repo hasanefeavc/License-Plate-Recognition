@@ -19,17 +19,26 @@ from typing import TYPE_CHECKING
 
 from lpr.contracts import Detector
 from lpr.detect.preprocess import (
+    FRAME_CLAHE_CLIP_LIMIT,
+    FRAME_UNSHARP_AMOUNT,
     EnhancedCrop,
     LetterboxResult,
     crop_with_padding,
     deskew,
+    enhance_frame,
     enhance_plate,
     letterbox,
+    rectify_perspective,
     sharpness,
+    unsharp_mask,
 )
 from lpr.detect.yolo import ContourPlateDetector, YoloPlateDetector, plausible_box
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import numpy as np
+
     from lpr.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -40,12 +49,16 @@ __all__ = [
     "LetterboxResult",
     "YoloPlateDetector",
     "build_detector",
+    "build_frame_preprocessor",
     "crop_with_padding",
     "deskew",
+    "enhance_frame",
     "enhance_plate",
     "letterbox",
     "plausible_box",
+    "rectify_perspective",
     "sharpness",
+    "unsharp_mask",
 ]
 
 
@@ -76,3 +89,39 @@ def build_detector(settings: "Settings | None" = None) -> Detector:
             message,
         )
         return ContourPlateDetector(settings)
+
+
+def build_frame_preprocessor(
+    settings: "Settings | None" = None,
+) -> Callable[[np.ndarray], np.ndarray] | None:
+    """A whole-frame enhancement callable, or ``None`` when it is switched off.
+
+    Returns ``None`` unless ``preprocess.frame_enhance`` is set, so the default
+    pipeline pays nothing at all -- not even a function call per frame, since
+    the orchestrator short-circuits on the ``None``.
+
+    The returned callable is a closure over the configured CLAHE and unsharp
+    parameters rather than a bound method, which keeps the orchestrator's
+    dependency on this package to a single plain ``Callable``.
+    """
+    if settings is None:
+        from lpr.config import get_settings
+
+        settings = get_settings()
+
+    cfg = getattr(settings, "preprocess", None)
+    if not bool(getattr(cfg, "frame_enhance", False)):
+        return None
+
+    clip_limit = float(getattr(cfg, "frame_clahe_clip", FRAME_CLAHE_CLIP_LIMIT))
+    unsharp_amount = float(getattr(cfg, "frame_unsharp_amount", FRAME_UNSHARP_AMOUNT))
+    logger.info(
+        "Whole-frame enhancement enabled (clahe_clip=%.2f, unsharp=%.2f)",
+        clip_limit,
+        unsharp_amount,
+    )
+
+    def preprocess_frame(frame: np.ndarray) -> np.ndarray:
+        return enhance_frame(frame, clip_limit=clip_limit, unsharp_amount=unsharp_amount)
+
+    return preprocess_frame

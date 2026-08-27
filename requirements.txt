@@ -43,7 +43,17 @@ pyyaml>=6.0,<7
 # --- Hardware / auth / security ------------------------------------------
 pyserial>=3.5,<4
 argon2-cffi>=23.1,<24
+# Signs and verifies both kinds of token this project issues: the API's
+# session bearer tokens (lpr.api.security, HS256 over api.secret_key) and the
+# offline licence keys (lpr.license, RS256). Without PyJWT the API cannot
+# authenticate and the service cannot verify its own licence.
 pyjwt>=2.8,<3
+# Required by PyJWT for RS256 -- it is an optional extra of pyjwt, so it is
+# pinned here explicitly rather than relied upon transitively. Licence
+# verification is a hard dependency of the service (lpr.license) and key
+# generation needs it too (scripts/generate_keys.py). A build without it does
+# not degrade: no site can verify its licence, so nothing processes frames.
+cryptography>=42.0,<47
 
 # ---------------------------------------------------------------------------
 # NOT installed here: the Tkinter GUI client.

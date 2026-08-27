@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="tr" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Plaka Tanıma Sistemi</title>
+
+<!-- Tailwind from the CDN. If the site has no internet the script simply does
+     not load, so the base styles below keep the page dark and legible and
+     #cdn-warning tells the operator why it looks plain. -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  if (window.tailwind) {
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ground: "#10141b",   /* window surface            */
+            chrome: "#161c26",   /* header / control panel    */
+            card:   "#1a2029",   /* card body                 */
+            row:    "#212936",   /* one row inside a card     */
+            void:   "#0a0d12",   /* video area, no signal     */
+            line:   "#2c3542",
+            ink:    "#e8ecf3",
+            muted:  "#78859a",
+            ok:     "#2ecc71",
+            bad:    "#ff5c5c",
+            warn:   "#f0ad4e",
+            accent: "#4c9aff",
+          },
+          fontFamily: {
+            sans: ['Segoe UI', 'Helvetica Neue', 'Helvetica', 'Arial', 'sans-serif'],
+            mono: ['Consolas', 'DejaVu Sans Mono', 'Menlo', 'monospace'],
+          },
+        },
+      },
+    };
+  }
+</script>
+<style>
+  /* Enough to survive a blocked CDN: dark ground, readable text, no flash. */
+  :root { color-scheme: dark; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: #10141b;
+    color: #e8ecf3;
+    font-family: 'Segoe UI', Helvetica, Arial, sans-serif;
+    /* Phones: keep content clear of the notch and the home indicator. */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: #2c3542 transparent; }
+  .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+  .scroll-thin::-webkit-scrollbar-thumb { background: #2c3542; border-radius: 4px; }
+  @keyframes feed-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+  .feed-in { animation: feed-in .18s ease-out; }
+  @keyframes pulse-full { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+  .pulse-full { animation: pulse-full 1.8s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .feed-in, .pulse-full { animation: none; }
+  }
+  [hidden] { display: none !important; }
+  /* Every interactive control clears the 44px touch target on a phone. */
+  button, select, input, a { touch-action: manipulation; }
+</style>
+</head>
+
+<body class="h-full bg-ground text-ink font-sans antialiased">
+
+<!-- ===================================================================== -->
+<!-- Login                                                                  -->
+<!-- ===================================================================== -->
+<div id="login-screen" class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-ground p-4 sm:p-6">
+  <div class="w-full max-w-sm rounded-xl border border-line bg-card p-6 shadow-2xl sm:p-8">
+    <div class="mb-6 flex items-center justify-center gap-2">
+      <span class="text-2xl text-accent">◉</span>
+      <span class="text-xs font-bold tracking-widest text-ink sm:text-sm">PLAKA TANIMA SİSTEMİ</span>
+    </div>
+    <h1 class="text-center text-2xl font-bold">Oturum Açın</h1>
+    <p class="mt-1 text-center text-sm text-muted">Kontrol paneline erişmek için giriş yapın.</p>
+
+    <form id="login-form" class="mt-7 space-y-4" autocomplete="on">
+      <div>
+        <label for="login-username" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">KULLANICI ADI</label>
+        <input id="login-username" name="username" type="text" required autocomplete="username"
+               class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition focus:border-accent">
+      </div>
+      <div>
+        <label for="login-password" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">PAROLA</label>
+        <input id="login-password" name="password" type="password" required autocomplete="current-password"
+               class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition focus:border-accent">
+      </div>
+      <p id="login-error" class="min-h-[1.25rem] text-center text-sm font-semibold text-bad" role="alert" aria-live="polite"></p>
+      <div class="flex gap-2">
+        <button id="login-submit" type="submit"
+                class="min-h-[48px] flex-1 rounded-lg bg-ok py-3 font-bold text-ground transition hover:brightness-110 disabled:opacity-50">
+          Giriş Yap
+        </button>
+        <!-- On a fresh installation there is nobody to log in as: the first
+             account may be created without auth, and becomes the admin. -->
+        <button id="login-register" type="button"
+                class="min-h-[48px] flex-1 rounded-lg border-2 border-line py-3 font-bold text-muted transition hover:border-accent hover:text-accent disabled:opacity-50">
+          Kaydol
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<!-- Dashboard                                                              -->
+<!-- ===================================================================== -->
+<!--
+  Height strategy: on a phone the page scrolls normally (min-h-full), so the
+  camera cards keep a real 16:9 size instead of being crushed into whatever is
+  left of the viewport. From `lg` up it becomes a fixed-height control-room
+  layout that never scrolls as a whole.
+-->
+<div id="dashboard" hidden class="flex min-h-full flex-col gap-2.5 p-2 sm:p-2.5 lg:h-full">
+
+  <!-- Header ------------------------------------------------------------ -->
+  <header class="grid shrink-0 grid-cols-2 items-center gap-y-3 rounded-lg border border-line bg-chrome px-3 py-2.5 sm:px-4 lg:grid-cols-3">
+    <div class="flex items-center gap-2.5">
+      <span class="text-xl text-accent">◉</span>
+      <div class="leading-tight">
+        <div class="text-xs font-bold tracking-wide sm:text-sm">PLAKA TANIMA SİSTEMİ</div>
+        <div class="text-[10px] font-bold tracking-widest text-muted">KONTROL PANELİ</div>
+      </div>
+    </div>
+
+    <!-- Counters. Last in source order on a phone (full-width row 2), centred
+         in the middle column from `lg` up. -->
+    <div class="order-last col-span-2 flex items-center justify-center gap-4 sm:gap-8 lg:order-none lg:col-span-1">
+      <div class="text-center leading-tight">
+        <div class="text-[10px] font-bold tracking-widest text-muted">ÇALIŞMA SÜRESİ</div>
+        <div id="uptime" class="font-mono text-base font-bold tabular-nums sm:text-lg">00:00:00</div>
+      </div>
+      <div class="h-8 w-px bg-line"></div>
+      <div class="text-center leading-tight">
+        <div class="text-[10px] font-bold tracking-widest text-muted">İÇERİDEKİ ARAÇ</div>
+        <div class="font-mono text-base font-bold tabular-nums sm:text-lg">
+          <span id="occupancy" class="text-accent">0</span><span class="text-muted"> / </span><span id="capacity">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-end gap-2 sm:gap-4">
+      <span id="user-label" class="hidden text-sm font-bold sm:inline"></span>
+      <span class="flex items-center gap-1.5">
+        <span id="conn-dot" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
+        <span id="conn-label" class="text-xs font-bold text-bad sm:text-sm">Bağlı Değil</span>
+      </span>
+    </div>
+  </header>
+
+  <!-- Banners ------------------------------------------------------------ -->
+  <div id="full-banner" hidden role="alert"
+       class="pulse-full shrink-0 rounded-lg bg-warn px-4 py-2.5 text-center text-sm font-bold tracking-widest text-ground sm:text-base">
+    OTOPARK DOLU
+  </div>
+  <div id="banner" hidden role="alert"
+       class="shrink-0 rounded-lg bg-bad px-4 py-2.5 text-center text-sm font-bold text-white"></div>
+  <div id="cdn-warning" hidden
+       class="shrink-0 rounded-lg bg-warn px-4 py-2 text-center text-sm font-bold text-ground">
+    Tailwind CDN yüklenemedi (internet yok). Panel sade görünümde çalışıyor.
+  </div>
+
+  <!-- Body: cameras | live feed ----------------------------------------- -->
+  <main class="grid min-h-0 flex-1 grid-cols-1 gap-2.5 lg:grid-cols-[3fr_minmax(320px,1fr)]">
+
+    <!-- Cameras stack on a phone, sit side by side from `md` up. -->
+    <section class="grid min-h-0 grid-cols-1 gap-2.5 md:grid-cols-2">
+      <figure class="flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-card">
+        <figcaption class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2.5">
+          <span id="dot-entry" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
+          <span class="text-sm font-bold tracking-wide">GİRİŞ</span>
+          <span id="fps-entry" class="ml-auto font-mono text-xs text-muted"></span>
+          <span id="badge-entry" class="text-xs font-bold text-bad">Bağlı Değil</span>
+        </figcaption>
+        <div class="relative mx-3 mb-3 aspect-video min-h-0 overflow-hidden rounded border border-line bg-void lg:aspect-auto lg:flex-1">
+          <!-- Hidden until the first frame arrives: a broken <img> paints its
+               alt text over the placeholder, which reads as a bug. -->
+          <img id="cam-entry" alt="Giriş kamerası canlı görüntü" hidden
+               class="absolute inset-0 h-full w-full object-contain">
+          <div id="ph-entry" class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-muted">
+            <span class="text-4xl">⚠</span><span class="text-sm font-bold">Görüntü yok</span>
+          </div>
+        </div>
+      </figure>
+
+      <figure class="flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-card">
+        <figcaption class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2.5">
+          <span id="dot-exit" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
+          <span class="text-sm font-bold tracking-wide">ÇIKIŞ</span>
+          <span id="fps-exit" class="ml-auto font-mono text-xs text-muted"></span>
+          <span id="badge-exit" class="text-xs font-bold text-bad">Bağlı Değil</span>
+        </figcaption>
+        <div class="relative mx-3 mb-3 aspect-video min-h-0 overflow-hidden rounded border border-line bg-void lg:aspect-auto lg:flex-1">
+          <img id="cam-exit" alt="Çıkış kamerası canlı görüntü" hidden
+               class="absolute inset-0 h-full w-full object-contain">
+          <div id="ph-exit" class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-muted">
+            <span class="text-4xl">⚠</span><span class="text-sm font-bold">Görüntü yok</span>
+          </div>
+        </div>
+      </figure>
+    </section>
+
+    <!-- Live plate feed. Bounded on a phone so it scrolls itself instead of
+         pushing the control panel off the bottom of a long page. -->
+    <section class="flex max-h-[60vh] min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-card lg:max-h-none">
+      <div class="flex shrink-0 items-center justify-between border-b border-line px-3.5 py-2.5">
+        <h2 class="text-sm font-bold tracking-wide">CANLI KAYIT</h2>
+        <span id="feed-count" class="font-mono text-sm font-bold text-accent">0</span>
+      </div>
+      <div id="feed" class="scroll-thin min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
+        <p id="feed-empty" class="py-10 text-center text-sm text-muted">Henüz plaka okunmadı.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- Telemetry --------------------------------------------------------- -->
+  <div class="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 px-1">
+    <span id="activity" class="order-last w-full truncate font-mono text-xs text-muted sm:order-none sm:w-auto sm:flex-1"></span>
+    <div class="flex items-center gap-2">
+      <div class="rounded-md border border-line bg-chrome px-3 py-1 text-center sm:px-3.5">
+        <div id="stat-read" class="font-mono text-base font-bold text-accent tabular-nums">0</div>
+        <div class="text-[10px] font-bold tracking-widest text-muted">OKUNAN</div>
+      </div>
+      <div class="rounded-md border border-line bg-chrome px-3 py-1 text-center sm:px-3.5">
+        <div id="stat-grant" class="font-mono text-base font-bold text-ok tabular-nums">0</div>
+        <div class="text-[10px] font-bold tracking-widest text-muted">İZİN</div>
+      </div>
+      <div class="rounded-md border border-line bg-chrome px-3 py-1 text-center sm:px-3.5">
+        <div id="stat-deny" class="font-mono text-base font-bold text-bad tabular-nums">0</div>
+        <div class="text-[10px] font-bold tracking-widest text-muted">RET</div>
+      </div>
+    </div>
+    <span id="license-label" class="truncate font-mono text-xs text-muted"></span>
+  </div>
+
+  <!-- Control panel ------------------------------------------------------ -->
+  <footer class="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-line bg-chrome p-2.5 sm:gap-2.5 sm:p-3">
+    <button id="btn-gate" type="button"
+            class="min-h-[52px] w-full rounded-lg bg-ok px-8 text-lg font-bold text-ground transition hover:brightness-110 active:scale-[.98] disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto sm:py-4">
+      Bariyeri Aç
+    </button>
+    <button id="btn-pause" type="button"
+            class="min-h-[44px] flex-1 rounded-lg border-2 border-warn px-4 font-bold text-warn transition hover:bg-warn hover:text-ground disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none sm:px-5 sm:py-3">
+      Duraklat
+    </button>
+    <button id="btn-plates" type="button"
+            class="min-h-[44px] flex-1 rounded-lg bg-accent px-4 font-bold text-ground transition hover:brightness-110 sm:flex-none sm:px-5 sm:py-3">
+      Plaka Yönetimi
+    </button>
+    <button id="btn-history" type="button"
+            class="min-h-[44px] flex-1 rounded-lg bg-line px-4 font-bold text-ink transition hover:brightness-125 sm:flex-none sm:px-5 sm:py-3">
+      Geçmiş Kayıtlar
+    </button>
+    <button id="btn-settings" type="button"
+            class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none sm:px-5 sm:py-3">
+      Ayarlar
+    </button>
+    <span id="toast" class="order-last w-full text-sm font-bold sm:order-none sm:w-auto" role="status" aria-live="polite"></span>
+    <button id="btn-logout" type="button"
+            class="min-h-[44px] flex-1 rounded-lg border-2 border-bad px-4 font-bold text-bad transition hover:bg-bad hover:text-white sm:ml-auto sm:flex-none sm:px-5 sm:py-3">
+      Oturumu Kapat
+    </button>
+  </footer>
+</div>
+
+<!-- ===================================================================== -->
+<!-- Modals                                                                 -->
+<!-- ===================================================================== -->
+<!--
+  Each modal is a full-screen sheet on a phone and a centred dialog from `sm`
+  up, which is the pattern a thumb expects on a handset and a mouse expects on
+  a desktop.
+-->
+
+<!-- Plate management ---------------------------------------------------- -->
+<div id="modal-plates" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
+  <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+
+  <div role="dialog" aria-modal="true" aria-labelledby="plates-title"
+       class="relative flex h-full max-h-full w-full flex-col overflow-hidden border-line bg-card shadow-2xl sm:h-auto sm:max-h-[85vh] sm:max-w-2xl sm:rounded-xl sm:border">
+
+    <header class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-4 py-4 sm:px-6">
+      <div>
+        <h2 id="plates-title" class="text-lg font-bold">Plaka Yönetimi</h2>
+        <p class="mt-0.5 text-xs text-muted">Kayıtlı plakalara bariyer otomatik açılır.</p>
+      </div>
+      <button type="button" data-close aria-label="Kapat"
+              class="-mr-2 -mt-1 min-h-[44px] min-w-[44px] rounded-lg text-2xl leading-none text-muted transition hover:bg-row hover:text-ink">
+        &times;
+      </button>
+    </header>
+
+    <form id="plate-form" class="shrink-0 border-b border-line px-4 py-4 sm:px-6">
+      <div class="flex flex-wrap items-end gap-3">
+        <div class="min-w-[8rem] flex-1">
+          <label for="plate-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">PLAKA</label>
+          <input id="plate-input" name="plate" type="text" required maxlength="16" data-autofocus
+                 placeholder="34ABC123" autocomplete="off" spellcheck="false"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 font-mono text-lg font-bold uppercase tracking-wide text-ink outline-none transition placeholder:font-sans placeholder:text-base placeholder:font-normal placeholder:tracking-normal placeholder:text-muted/60 focus:border-accent">
+        </div>
+        <div class="min-w-[10rem] flex-[2]">
+          <label for="note-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">NOT</label>
+          <input id="note-input" name="note" type="text" maxlength="200"
+                 placeholder="Müdür aracı" autocomplete="off"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+        </div>
+        <button id="plate-add" type="submit"
+                class="min-h-[44px] w-full rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto">
+          Ekle
+        </button>
+      </div>
+    </form>
+
+    <div class="scroll-thin min-h-0 flex-1 overflow-auto">
+      <table class="w-full min-w-[22rem] border-collapse text-left">
+        <thead class="sticky top-0 z-10 bg-chrome">
+          <tr class="text-[11px] font-bold tracking-wider text-muted">
+            <th scope="col" class="w-12 px-4 py-2.5 sm:px-6">#</th>
+            <th scope="col" class="px-3 py-2.5">PLAKA</th>
+            <th scope="col" class="w-24 px-4 py-2.5 text-right sm:px-6">İŞLEM</th>
+          </tr>
+        </thead>
+        <tbody id="plate-rows" class="divide-y divide-line/60"></tbody>
+      </table>
+      <p id="plates-empty" class="py-12 text-center text-sm text-muted">Kayıtlı plaka yok.</p>
+    </div>
+
+    <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
+      <span id="plates-count" class="font-mono text-sm font-bold text-accent">0</span>
+      <span id="plates-status" class="flex-1 truncate text-sm font-semibold" role="status" aria-live="polite"></span>
+      <button type="button" data-close
+              class="min-h-[44px] rounded-lg bg-line px-5 font-bold text-ink transition hover:brightness-125">
+        Kapat
+      </button>
+    </footer>
+  </div>
+</div>
+
+<!-- History + CSV export ------------------------------------------------ -->
+<div id="modal-history" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
+  <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+
+  <div role="dialog" aria-modal="true" aria-labelledby="history-title"
+       class="relative flex h-full max-h-full w-full flex-col overflow-hidden border-line bg-card shadow-2xl sm:h-auto sm:max-h-[85vh] sm:max-w-4xl sm:rounded-xl sm:border">
+
+    <header class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-4 py-4 sm:px-6">
+      <div>
+        <h2 id="history-title" class="text-lg font-bold">Geçmiş Kayıtlar</h2>
+        <p class="mt-0.5 text-xs text-muted">Zaman damgaları UTC'dir (kayıt tablosuyla aynı).</p>
+      </div>
+      <button type="button" data-close aria-label="Kapat"
+              class="-mr-2 -mt-1 min-h-[44px] min-w-[44px] rounded-lg text-2xl leading-none text-muted transition hover:bg-row hover:text-ink">
+        &times;
+      </button>
+    </header>
+
+    <div class="flex shrink-0 flex-wrap items-end gap-3 border-b border-line px-4 py-3.5 sm:px-6">
+      <div class="flex-1 sm:flex-none">
+        <label for="history-day" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">GÜN</label>
+        <select id="history-day" data-autofocus
+                class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent sm:w-auto">
+          <option value="">Tümü</option>
+        </select>
+      </div>
+      <div class="flex-1 sm:flex-none">
+        <label for="history-camera" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">KAMERA</label>
+        <select id="history-camera"
+                class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent sm:w-auto">
+          <option value="">Tümü</option>
+          <option value="entry">Giriş</option>
+          <option value="exit">Çıkış</option>
+        </select>
+      </div>
+      <button id="history-refresh" type="button"
+              class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none">
+        Yenile
+      </button>
+      <button id="history-csv" type="button"
+              class="min-h-[44px] flex-1 rounded-lg bg-ok px-5 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 sm:ml-auto sm:flex-none">
+        CSV İndir
+      </button>
+    </div>
+
+    <!-- overflow-auto, not overflow-y: the table keeps a min width and scrolls
+         sideways on a phone rather than crushing five columns into 360px. -->
+    <div class="scroll-thin min-h-0 flex-1 overflow-auto">
+      <table class="w-full min-w-[34rem] border-collapse text-left">
+        <thead class="sticky top-0 z-10 bg-chrome">
+          <tr class="text-[11px] font-bold tracking-wider text-muted">
+            <th scope="col" class="px-4 py-2.5 sm:px-6">ZAMAN</th>
+            <th scope="col" class="px-3 py-2.5">KAMERA</th>
+            <th scope="col" class="px-3 py-2.5">PLAKA</th>
+            <th scope="col" class="px-3 py-2.5">DURUM</th>
+            <th scope="col" class="px-4 py-2.5 text-right sm:px-6">GÜVEN</th>
+          </tr>
+        </thead>
+        <tbody id="history-rows" class="divide-y divide-line/60"></tbody>
+      </table>
+      <p id="history-empty" class="py-12 text-center text-sm text-muted">Kayıt bulunamadı.</p>
+    </div>
+
+    <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
+      <span id="history-count" class="font-mono text-sm font-bold text-accent">0</span>
+      <span id="history-status" class="flex-1 truncate text-sm font-semibold" role="status" aria-live="polite"></span>
+      <button type="button" data-close
+              class="min-h-[44px] rounded-lg bg-line px-5 font-bold text-ink transition hover:brightness-125">
+        Kapat
+      </button>
+    </footer>
+  </div>
+</div>
+
+<!-- Settings ------------------------------------------------------------ -->
+<div id="modal-settings" hidden class="fixed inset-0 z-40 flex items-center justify-center sm:p-4">
+  <div data-backdrop class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+
+  <div role="dialog" aria-modal="true" aria-labelledby="settings-title"
+       class="relative flex h-full max-h-full w-full flex-col overflow-hidden border-line bg-card shadow-2xl sm:h-auto sm:max-h-[85vh] sm:max-w-lg sm:rounded-xl sm:border">
+
+    <header class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-4 py-4 sm:px-6">
+      <div>
+        <h2 id="settings-title" class="text-lg font-bold">Ayarlar</h2>
+        <p class="mt-0.5 text-xs text-muted">Kapasite tüm cihazlarda ortaktır; kalite yalnızca bu cihazı etkiler.</p>
+      </div>
+      <button type="button" data-close aria-label="Kapat"
+              class="-mr-2 -mt-1 min-h-[44px] min-w-[44px] rounded-lg text-2xl leading-none text-muted transition hover:bg-row hover:text-ink">
+        &times;
+      </button>
+    </header>
+
+    <form id="settings-form" class="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-4 py-5 sm:px-6">
+      <!-- Capacity: server-side, so every tablet on the site agrees. -->
+      <div>
+        <label for="capacity-input" class="block text-sm font-bold">Otopark Kapasitesi</label>
+        <p class="mt-0.5 text-xs text-muted">
+          Sunucuda saklanır ve tüm cihazlarda geçerlidir. Doluluk bu sayıya ulaşınca
+          &ldquo;OTOPARK DOLU&rdquo; uyarısı gösterilir. 0 = sınırsız.
+        </p>
+        <div class="mt-2.5 flex items-center gap-3">
+          <input id="capacity-input" data-autofocus type="number" min="0" max="100000" step="1" inputmode="numeric"
+                 class="min-h-[44px] w-32 rounded-lg border border-line bg-void px-3 py-2.5 font-mono text-lg font-bold text-ink outline-none transition focus:border-accent disabled:opacity-40">
+          <span class="text-sm text-muted">araç</span>
+          <span id="capacity-hint" class="ml-auto text-xs text-muted"></span>
+        </div>
+      </div>
+
+      <div class="h-px bg-line"></div>
+
+      <!-- Stream quality: a per-device display preference, so localStorage is
+           the right home for it. A phone on mobile data wants a lighter
+           stream than the control-room PC on the same server. -->
+      <div>
+        <label for="quality-select" class="block text-sm font-bold">Kamera Akış Kalitesi</label>
+        <p class="mt-0.5 text-xs text-muted">
+          Yalnızca bu cihaz için geçerlidir. Düşük kalite, mobil bağlantıda
+          bant genişliğinden tasarruf eder.
+        </p>
+        <select id="quality-select"
+                class="mt-2.5 min-h-[44px] w-full rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent sm:w-56">
+          <option value="90">Yüksek (90)</option>
+          <option value="75">Orta (75)</option>
+          <option value="45">Düşük (45)</option>
+        </select>
+      </div>
+    </form>
+
+    <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
+      <span id="settings-status" class="flex-1 truncate text-sm font-semibold" role="status" aria-live="polite"></span>
+      <button type="button" data-close
+              class="min-h-[44px] rounded-lg bg-line px-5 font-bold text-ink transition hover:brightness-125">
+        Kapat
+      </button>
+      <button id="settings-save" type="submit" form="settings-form"
+              class="min-h-[44px] rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+        Kaydet
+      </button>
+    </footer>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

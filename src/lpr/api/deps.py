@@ -23,15 +23,21 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AdminSettings",
+    "LicenseGuardDep",
     "LogRepo",
+    "MetaRepo",
     "PlateRepo",
     "UserRepo",
+    "apply_license_state",
+    "get_license_guard",
+    "get_license_guard_dep",
     "get_log_repository",
     "get_pipeline",
     "get_pipeline_optional",
     "get_plate_repository",
     "get_settings_dep",
     "get_user_repository",
+    "is_license_halted",
     "is_paused",
     "set_paused",
 ]
@@ -94,6 +100,63 @@ def set_paused(app: "Starlette", value: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Licence
+# ---------------------------------------------------------------------------
+
+
+def get_license_guard(app: "Starlette") -> Any:
+    """The app's :class:`lpr.license.LicenseGuard`, built on first use."""
+
+    def factory() -> Any:
+        from lpr.license import LicenseGuard
+
+        return LicenseGuard()
+
+    return _cached_on_state(app, "license_guard", factory)
+
+
+def get_license_guard_dep(request: Request) -> Any:
+    return get_license_guard(request.app)
+
+
+def is_license_halted(app: "Starlette") -> bool:
+    """True while the pipeline is paused *because of* the licence.
+
+    Tracked separately from ``app.state.paused`` so an operator's manual
+    pause and a licence halt cannot cancel each other out: releasing the
+    licence hold must not resume a pipeline the operator deliberately paused,
+    and resuming by hand must not clear a licence hold.
+    """
+    return bool(getattr(app.state, "license_halted", False))
+
+
+def apply_license_state(app: "Starlette", valid: bool) -> bool:
+    """Halt or release the pipeline to match the licence state.
+
+    Returns whether the pipeline is currently held for licence reasons. Safe
+    to call on every check: the transitions are idempotent, and it never
+    resumes a pipeline that an operator paused by hand.
+    """
+    halted = is_license_halted(app)
+
+    if not valid:
+        app.state.license_halted = True
+        if not halted:
+            logger.error("Lisans geçersiz: görüntü işleme durduruluyor")
+        set_paused(app, True)
+        return True
+
+    app.state.license_halted = False
+    if halted:
+        logger.info("Lisans geçerli: görüntü işleme devam ediyor")
+        # Only the licence hold is released here. If the operator had also
+        # pressed pause, ``manual_paused`` keeps the pipeline down.
+        if not bool(getattr(app.state, "manual_paused", False)):
+            set_paused(app, False)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Repositories
 # ---------------------------------------------------------------------------
 
@@ -125,13 +188,26 @@ def get_user_repository(request: Request) -> Any:
     return _cached_on_state(request.app, "user_repository", factory)
 
 
+def get_meta_repository(request: Request) -> Any:
+    """Key/value store for runtime settings an admin can change (capacity)."""
+
+    def factory() -> Any:
+        from lpr.db import SystemMetaRepository
+
+        return SystemMetaRepository()
+
+    return _cached_on_state(request.app, "meta_repository", factory)
+
+
 def get_settings_dep() -> Settings:
     return get_settings()
 
 
+LicenseGuardDep = Annotated[Any, Depends(get_license_guard_dep)]
 PlateRepo = Annotated[Any, Depends(get_plate_repository)]
 LogRepo = Annotated[Any, Depends(get_log_repository)]
 UserRepo = Annotated[Any, Depends(get_user_repository)]
+MetaRepo = Annotated[Any, Depends(get_meta_repository)]
 AdminSettings = Annotated[Settings, Depends(get_settings_dep)]
 Pipeline = Annotated[Any, Depends(get_pipeline)]
 OptionalPipeline = Annotated[Any, Depends(get_pipeline_optional)]

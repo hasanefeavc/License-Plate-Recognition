@@ -9,9 +9,23 @@ The OCR pre-pass (:func:`enhance_plate`) is where a large share of the
 recognition accuracy comes from. Plate crops out of a 720p frame are often
 20-30 px tall, low contrast at night and washed out in daylight; feeding that
 straight to a recogniser wastes most of the model's capability. Upscaling to a
-sane character height, equalising local contrast with CLAHE and offering a
-binarised variant alongside the grayscale one gives the recogniser two very
-different shots at the same crop.
+sane character height, equalising local contrast with CLAHE, sharpening the
+stroke edges back up with an unsharp mask and offering a binarised variant
+alongside the grayscale one gives the recogniser several very different shots
+at the same crop.
+
+Angled plates get two further tools, both of them geometric rather than
+photometric. :func:`deskew` rotates a tilted crop back to horizontal, and
+:func:`rectify_perspective` warps a plate photographed from the side back to a
+head-on rectangle. They are separate because they cost very different amounts:
+deskew is cheap enough to run on every crop, whereas rectification runs an edge
+detector and a contour pass and is worth paying for only once the cheaper reads
+have already failed.
+
+:func:`enhance_frame` is the whole-frame counterpart, for use ahead of the
+detector rather than ahead of OCR. It is off by default -- see
+``preprocess.frame_enhance`` in the config -- because unlike everything else
+here it changes what the *detector* sees.
 """
 
 from __future__ import annotations
@@ -29,9 +43,12 @@ __all__ = [
     "LetterboxResult",
     "crop_with_padding",
     "deskew",
+    "enhance_frame",
     "enhance_plate",
     "letterbox",
+    "rectify_perspective",
     "sharpness",
+    "unsharp_mask",
 ]
 
 #: Target height a plate crop is upscaled to before OCR.
@@ -50,6 +67,48 @@ CLAHE_TILE_GRID = (8, 8)
 #: Deskew is bounded: a plate seen at more than this angle is better handled by
 #: the detector's next frame than by a rotation that smears the glyphs.
 MAX_DESKEW_DEGREES = 15.0
+
+#: Unsharp masking. ``amount`` is how much of the image's own high-frequency
+#: detail is added back on top of it. 0.6 visibly crisps glyph edges; past
+#: roughly 1.2 a white halo appears along every stroke, which a binariser then
+#: reads as an extra stroke.
+UNSHARP_AMOUNT = 0.6
+UNSHARP_RADIUS = 3
+
+#: Local contrast (in grey levels) a pixel needs before it is sharpened at all.
+#: At 0 the flat background of a plate -- i.e. its sensor noise -- is amplified
+#: just as eagerly as a character edge.
+UNSHARP_THRESHOLD = 4
+
+#: Whole-frame enhancement is deliberately gentler than the crop pre-pass. The
+#: detector is a CNN trained on ordinary frames, so the goal here is to lift a
+#: shadowed plate out of the background, not to restyle the image.
+FRAME_CLAHE_CLIP_LIMIT = 2.0
+FRAME_CLAHE_TILE_GRID = (8, 8)
+FRAME_UNSHARP_AMOUNT = 0.5
+
+#: Perspective rectification bounds. A quadrilateral covering less than this
+#: fraction of the crop is a glyph or a mounting bolt, not the plate outline.
+MIN_QUAD_AREA_RATIO = 0.25
+
+#: Plate-like aspect window for the rectified output. Outside it the quad was
+#: not a plate, and warping to it would smear the glyphs past recognition.
+MIN_RECTIFIED_ASPECT = 1.2
+MAX_RECTIFIED_ASPECT = 8.0
+
+#: How far a corner must sit from the crop's own corner before the quad counts
+#: as a real outline, as a fraction of the crop's width/height with a 2 px
+#: floor. Edge detection on a noisy or tightly cropped plate readily traces the
+#: crop border itself; warping that back to a rectangle is an identity
+#: transform, and the OCR pass over it is wasted. A genuine side-view plate
+#: displaces its far corners by far more than this -- a trapezoid worth
+#: correcting has one edge 20-40% shorter than the other -- so the test
+#: separates the two cases cleanly.
+#: The absolute floor matters on short crops, where 3% of a 40 px height is
+#: under two pixels -- tighter than Canny plus ``approxPolyDP`` can localise a
+#: corner in the first place, so the test would never fire.
+NO_OP_CORNER_TOLERANCE_RATIO = 0.03
+MIN_NO_OP_CORNER_TOLERANCE = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,15 +260,27 @@ def to_gray(crop: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
 
-def enhance_plate(crop: np.ndarray, target_height: int = TARGET_CROP_HEIGHT) -> EnhancedCrop:
+def enhance_plate(
+    crop: np.ndarray,
+    target_height: int = TARGET_CROP_HEIGHT,
+    unsharp_amount: float = UNSHARP_AMOUNT,
+) -> EnhancedCrop:
     """Prepare a plate crop for OCR.
 
     Upscale small crops to ``target_height`` (cubic, capped at
     :data:`MAX_UPSCALE`), convert to grayscale, equalise local contrast with
-    CLAHE, denoise lightly, and produce an adaptive-threshold variant
-    alongside. The recogniser tries both variants and keeps the better read --
-    binarisation wins on clean high-contrast plates and loses badly on shadowed
-    ones, so neither can be the only option.
+    CLAHE, denoise lightly, sharpen with an unsharp mask, and produce an
+    adaptive-threshold variant alongside. The recogniser tries both variants
+    and keeps the better read -- binarisation wins on clean high-contrast
+    plates and loses badly on shadowed ones, so neither can be the only option.
+
+    The step order is load-bearing. CLAHE first, because sharpening a crop
+    whose characters are still buried in shadow only sharpens the shadow.
+    Denoise second, so the unsharp mask has no isolated hot pixels left to
+    amplify. Sharpen third, which puts back the stroke edges the bilateral
+    filter softened. Binarise last, off the sharpened image, because a crisper
+    edge is exactly what makes the adaptive threshold land on the glyph
+    boundary instead of a few pixels inside it.
 
     Always returns an :class:`EnhancedCrop`; on failure ``gray`` is the input
     and ``binary`` is ``None``.
@@ -235,6 +306,11 @@ def enhance_plate(crop: np.ndarray, target_height: int = TARGET_CROP_HEIGHT) -> 
         # Edge-preserving denoise: a plain Gaussian would soften the very
         # strokes the recogniser needs.
         gray = cv2.bilateralFilter(gray, d=5, sigmaColor=40, sigmaSpace=40)
+
+        # Put the stroke edges back. This is the step that separates a
+        # character from its own shadow on a plate lit from the side, which is
+        # the usual failure mode on an angled read.
+        gray = unsharp_mask(gray, amount=unsharp_amount)
 
         binary: np.ndarray | None = None
         try:
@@ -326,3 +402,228 @@ def sharpness(crop: np.ndarray) -> float:
     except Exception:
         logger.debug("sharpness failed, reporting 0.0", exc_info=True)
         return 0.0
+
+
+def unsharp_mask(
+    image: np.ndarray,
+    amount: float = UNSHARP_AMOUNT,
+    radius: int = UNSHARP_RADIUS,
+    threshold: int = UNSHARP_THRESHOLD,
+) -> np.ndarray:
+    """Sharpen ``image`` by adding back its own high-frequency detail.
+
+    Computes ``image + amount * (image - blur(image))`` with saturating uint8
+    arithmetic, so a highlight clips to white instead of wrapping round to
+    black. ``threshold`` leaves pixels whose local contrast is already below it
+    untouched, which keeps the flat background of a plate -- and the sensor
+    noise living in it -- from being amplified into texture that the binariser
+    would go on to read as strokes.
+
+    Returns a new array; the input is never modified. Returns the input
+    unchanged on any failure, or when ``amount`` is not positive.
+    """
+    if not _is_image(image) or amount <= 0:
+        return image
+    try:
+        ksize = max(3, int(radius) | 1)  # GaussianBlur needs an odd kernel
+        blurred = cv2.GaussianBlur(image, (ksize, ksize), 0)
+        sharpened = cv2.addWeighted(image, 1.0 + float(amount), blurred, -float(amount), 0.0)
+
+        if threshold > 0:
+            # Keep the sharpened pixels only where there was detail to sharpen.
+            flat = cv2.absdiff(image, blurred) < int(threshold)
+            np.copyto(sharpened, image, where=flat)
+        return sharpened
+    except Exception:
+        logger.debug("unsharp_mask failed, returning input unchanged", exc_info=True)
+        return image
+
+
+def enhance_frame(
+    frame: np.ndarray,
+    clip_limit: float = FRAME_CLAHE_CLIP_LIMIT,
+    tile_grid: tuple[int, int] = FRAME_CLAHE_TILE_GRID,
+    unsharp_amount: float = FRAME_UNSHARP_AMOUNT,
+) -> np.ndarray:
+    """Local-contrast and edge enhancement for a whole capture frame.
+
+    Equalises local contrast with CLAHE, then applies a mild unsharp mask. On a
+    colour frame CLAHE runs on the L channel of LAB and the chroma channels are
+    left alone, so the result is the same scene with its shadows opened up
+    rather than a recoloured one. That distinction matters here in a way it
+    does not for a crop: the consumer is a CNN trained on ordinary frames, and
+    shifting the colour distribution is a good way to lose detections.
+
+    Returns a new array; the input frame is never modified, so the copy kept
+    for the live view and for snapshot evidence stays what the camera actually
+    saw. Returns the input unchanged on any failure.
+    """
+    if not _is_image(frame):
+        return frame
+    try:
+        clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tuple(tile_grid))
+        if frame.ndim == 2:
+            equalised = clahe.apply(frame)
+        else:
+            bgr = frame[:, :, :3] if frame.shape[2] == 4 else frame
+            lightness, a_chan, b_chan = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB))
+            merged = cv2.merge((clahe.apply(lightness), a_chan, b_chan))
+            equalised = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+        return unsharp_mask(equalised, amount=unsharp_amount)
+    except Exception:
+        logger.debug("enhance_frame failed, returning input unchanged", exc_info=True)
+        return frame
+
+
+def _order_quad(points: np.ndarray) -> np.ndarray:
+    """Order four corners as top-left, top-right, bottom-right, bottom-left."""
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    total = points.sum(axis=1)
+    diff = np.diff(points, axis=1).ravel()  # y - x
+    ordered[0] = points[int(np.argmin(total))]  # smallest x+y -> top-left
+    ordered[2] = points[int(np.argmax(total))]  # largest x+y  -> bottom-right
+    ordered[1] = points[int(np.argmin(diff))]  # smallest y-x -> top-right
+    ordered[3] = points[int(np.argmax(diff))]  # largest y-x  -> bottom-left
+    return ordered
+
+
+def _plate_quad(gray: np.ndarray) -> np.ndarray | None:
+    """Four corners of the plate outline in ``gray``, or ``None`` if not found.
+
+    Works off Canny edges rather than a threshold because the plate border is
+    a strong edge at every exposure, whereas its brightness relative to the
+    bumper is not. The morphological close bridges the gaps that a dirty or
+    partly shadowed border leaves in that outline; without it the contour
+    fragments and no four-point approximation survives.
+    """
+    height, width = gray.shape[:2]
+    area = float(height) * float(width)
+    if area <= 0:
+        return None
+
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    # Largest first, and stop as soon as they are too small to be the plate.
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        if cv2.contourArea(contour) < area * MIN_QUAD_AREA_RATIO:
+            break
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+        # Loosen the approximation until it collapses to a quadrilateral; a
+        # single fixed epsilon finds the outline on clean borders only.
+        for epsilon_ratio in (0.02, 0.03, 0.05):
+            approx = cv2.approxPolyDP(contour, epsilon_ratio * perimeter, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                return approx.reshape(4, 2).astype(np.float32)
+    return None
+
+
+def _is_crop_border(ordered: np.ndarray, shape: tuple[int, int]) -> bool:
+    """True when the quad is just the crop's own rectangle, to within a pixel or two.
+
+    Canny finds the crop's edges as readily as the plate's, especially on a
+    tight or noisy crop. The resulting quad warps to an identity transform, so
+    detecting it here saves the caller a pointless OCR pass over a copy of the
+    image it already has.
+    """
+    height, width = shape
+    corners = np.array(
+        [[0.0, 0.0], [width - 1.0, 0.0], [width - 1.0, height - 1.0], [0.0, height - 1.0]],
+        dtype=np.float32,
+    )
+    tolerance = np.array(
+        [
+            max(MIN_NO_OP_CORNER_TOLERANCE, width * NO_OP_CORNER_TOLERANCE_RATIO),
+            max(MIN_NO_OP_CORNER_TOLERANCE, height * NO_OP_CORNER_TOLERANCE_RATIO),
+        ],
+        dtype=np.float32,
+    )
+    return bool(np.all(np.abs(ordered - corners) <= tolerance))
+
+
+def rectify_perspective(crop: np.ndarray) -> np.ndarray | None:
+    """Flatten a plate seen at an angle into a head-on view.
+
+    :func:`deskew` can only *rotate*, which straightens a tilted camera but
+    does nothing for a plate photographed from the side: there the near edge is
+    longer than the far one and every character is trapezoidal. This finds the
+    plate's four-corner outline and warps that quadrilateral back to a
+    rectangle, turning a side-view crop into something a recogniser trained on
+    head-on plates can actually read.
+
+    Deliberately conservative. A quad that is too small, non-convex, or that
+    would rectify to a non-plate aspect ratio is rejected rather than guessed
+    at, because a wrong warp does not degrade a crop gracefully -- it destroys
+    it. Returns ``None`` whenever no trustworthy outline is found, so the
+    caller keeps whatever it already had.
+    """
+    if not _is_image(crop):
+        return None
+    try:
+        gray = to_gray(crop)
+        if min(gray.shape[:2]) < 16:
+            return None
+
+        quad = _plate_quad(gray)
+        if quad is None:
+            return None
+
+        top_left, top_right, bottom_right, bottom_left = _order_quad(quad)
+        ordered = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+
+        if _is_crop_border(ordered, gray.shape[:2]):
+            logger.debug("rectify_perspective: quad is the crop border, nothing to correct")
+            return None
+
+        # Size the output from the longer of each opposing pair, i.e. from the
+        # near edge, so the foreshortened far edge is stretched up to it rather
+        # than the near edge being squashed down.
+        target_w = int(
+            round(
+                max(
+                    float(np.linalg.norm(bottom_right - bottom_left)),
+                    float(np.linalg.norm(top_right - top_left)),
+                )
+            )
+        )
+        target_h = int(
+            round(
+                max(
+                    float(np.linalg.norm(top_right - bottom_right)),
+                    float(np.linalg.norm(top_left - bottom_left)),
+                )
+            )
+        )
+        if target_w < 16 or target_h < 8:
+            return None
+
+        aspect = target_w / target_h
+        if not (MIN_RECTIFIED_ASPECT <= aspect <= MAX_RECTIFIED_ASPECT):
+            logger.debug("rejecting rectified aspect %.2f, not plate-like", aspect)
+            return None
+
+        destination = np.array(
+            [
+                [0.0, 0.0],
+                [target_w - 1.0, 0.0],
+                [target_w - 1.0, target_h - 1.0],
+                [0.0, target_h - 1.0],
+            ],
+            dtype=np.float32,
+        )
+        matrix = cv2.getPerspectiveTransform(ordered, destination)
+        return cv2.warpPerspective(
+            crop,
+            matrix,
+            (target_w, target_h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+    except Exception:
+        logger.debug("rectify_perspective failed", exc_info=True)
+        return None

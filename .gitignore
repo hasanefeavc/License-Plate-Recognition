@@ -59,6 +59,14 @@ datasets/
 *.db-shm
 .env
 
+# --- Licensing --------------------------------------------------------------
+# The active licence key (a signed JWT) and the vendor-side record of every
+# key ever generated. Both are secrets: a token in either file is a working
+# licence for whoever holds it. license_history.log is also covered by *.log
+# above; it is named here so the reason is on the record.
+.license
+license_history.log
+
 # --- Vendored Windows OCR binaries (removed from the repo) ------------------
 # A ~123MB vendored Windows Tesseract-OCR binary tree used to live here.
 # The refactored pipeline uses easyocr (see requirements.txt) instead, so

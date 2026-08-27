@@ -21,6 +21,16 @@ Threading rules -- the one invariant this whole module exists to enforce:
 The legacy application called ``widget.config(...)`` straight from capture
 threads; that is what produced the intermittent "main thread is not in main
 loop" crashes this rewrite removes.
+
+Licensing
+---------
+
+The server is the authority: it halts its own pipeline when the licence is
+invalid and reports that through ``GET /api/license`` (polled) and a
+``{"type": "license"}`` WebSocket message (immediate). The client mirrors that
+state -- it freezes both camera panes, shows the reason, and opens the modal
+:class:`~lpr.ui.license_dialog.LicenseDialog`. Nothing here decides whether a
+key is valid; it only submits what the operator typed and applies the answer.
 """
 
 from __future__ import annotations
@@ -38,7 +48,9 @@ from typing import Any
 
 from lpr.logging_conf import setup_logging
 from lpr.ui.client import DEFAULT_BASE_URL, EventStream, LprApiError, LprClient
+from lpr.ui.license_dialog import LicenseDialog, format_license_state
 from lpr.ui.views import (
+    COL_BG,
     TTKBOOTSTRAP_AVAILABLE,
     TXT_APP_TITLE,
     CameraPane,
@@ -46,6 +58,7 @@ from lpr.ui.views import (
     LoginView,
     MainView,
     PlatesWindow,
+    apply_style,
     configure_styles,
 )
 
@@ -126,18 +139,28 @@ class LprApp:
         self._offline = False
         self._plates_window: PlatesWindow | None = None
         self._history_window: HistoryWindow | None = None
+        self._license: dict[str, Any] = {}
+        self._license_locked = False
+        self._license_dialog: LicenseDialog | None = None
 
         self.root = _create_root(theme)
         self.root.title(f"{TXT_APP_TITLE} - {self.api_url}")
         self.root.geometry("1280x820")
         self.root.minsize(960, 640)
         configure_styles(self.root)
+        try:
+            # Keeps the dark surface behind the dashboard right out to the
+            # window edge, including the plain-Tk fallback root.
+            self.root.configure(background=COL_BG)
+        except tk.TclError:  # pragma: no cover - exotic window manager
+            pass
 
         self.root.bind("<F11>", self._on_f11)
         self.root.bind("<Escape>", self._on_escape)
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
         self._container = ttk.Frame(self.root)
+        apply_style(self._container, "Surface.TFrame")
         self._container.pack(fill="both", expand=True)
         self.login_view: LoginView | None = None
         self.main_view: MainView | None = None
@@ -208,11 +231,15 @@ class LprApp:
                 "open_gate": self.open_gate,
                 "logout": self.logout,
                 "apply_source": self.apply_camera_source,
+                "open_license": self.open_license,
             },
         )
         self.main_view.pack(fill="both", expand=True)
         self.main_view.set_user(self.client.username or "", self.client.role or "")
         self._started_at = time.monotonic()
+        if self._license:
+            # A re-login must not hand back an unlocked UI on an expired site.
+            self._apply_license(self._license, force=True)
 
     # ------------------------------------------------------------------
     # Authentication
@@ -252,7 +279,7 @@ class LprApp:
     def logout(self) -> None:
         self._stop_workers()
         self.client.logout()
-        for window in (self._plates_window, self._history_window):
+        for window in (self._plates_window, self._history_window, self._license_dialog):
             if window is not None:
                 try:
                     window.destroy()
@@ -260,6 +287,8 @@ class LprApp:
                     pass
         self._plates_window = None
         self._history_window = None
+        self._license_dialog = None
+        self._license_locked = False
         self._show_login()
 
     # ------------------------------------------------------------------
@@ -318,6 +347,7 @@ class LprApp:
             try:
                 cameras = self.client.cameras()
                 stats = self.client.stats()
+                license_info = self.client.license_status()
             except LprApiError as exc:
                 self._post("offline", str(exc))
             except Exception:  # pragma: no cover - defensive
@@ -327,6 +357,7 @@ class LprApp:
                 self._post("online", None)
                 self._post("cameras", cameras)
                 self._post("stats", stats)
+                self._post("license", license_info)
             if self._stop.wait(STATUS_POLL_S):
                 break
 
@@ -373,6 +404,65 @@ class LprApp:
             "source_applied",
             name=f"lpr-source-{role}",
         )
+
+    # -- licence --------------------------------------------------------
+
+    def open_license(self) -> None:
+        """Show the licence dialog, raising the existing one if it is open."""
+        if self._license_dialog is not None and self._license_dialog.winfo_exists():
+            self._license_dialog.lift()
+            return
+        self._license_dialog = LicenseDialog(
+            self.root,
+            self.submit_license,
+            message=format_license_state(self._license),
+            on_close=self._on_license_dialog_closed,
+        )
+
+    def _on_license_dialog_closed(self) -> None:
+        self._license_dialog = None
+
+    def submit_license(self, key: str) -> None:
+        """Send a key to the server; the answer comes back through the queue."""
+
+        def work() -> None:
+            try:
+                info = self.client.activate_license(key)
+            except LprApiError as exc:
+                self._post("license_result", (False, str(exc), None))
+                return
+            except Exception as exc:  # pragma: no cover - unexpected client bug
+                logger.exception("Lisans etkinleştirme başarısız")
+                self._post("license_result", (False, str(exc), None))
+                return
+            self._post("license_result", (True, "", info))
+
+        self._spawn("lpr-license", work)
+
+    def _apply_license(self, info: dict[str, Any], *, force: bool = False) -> None:
+        """Mirror the server's licence state onto the widgets. Main thread only."""
+        view = self.main_view
+        if view is None:
+            return
+
+        self._license = dict(info or {})
+        valid = bool(self._license.get("valid"))
+        view.set_license_text(format_license_state(self._license), valid)
+
+        locked = not valid
+        if locked == self._license_locked and not force:
+            return
+
+        self._license_locked = locked
+        view.set_license_locked(locked, str(self._license.get("detail") or ""))
+
+        if locked:
+            logger.warning("Lisans geçersiz: arayüz kilitlendi (%s)", self._license.get("reason"))
+            self.open_license()
+            if self._license_dialog is not None:
+                self._license_dialog.set_state_text(format_license_state(self._license))
+        elif self._license_dialog is not None and self._license_dialog.winfo_exists():
+            self._license_dialog.set_result(True)
 
     # -- plates window --------------------------------------------------
 
@@ -506,6 +596,11 @@ class LprApp:
             return
 
         if kind == "frame":
+            if self._license_locked:
+                # Belt and braces: the pane ignores frames while locked, and
+                # they are dropped here too so nothing is decoded for a view
+                # that will not render it.
+                return
             role, image = payload
             pane: CameraPane | None = view.panes.get(role)
             if pane is not None:
@@ -527,6 +622,14 @@ class LprApp:
             if self._offline:
                 self._offline = False
             view.set_banner(False)
+        elif kind == "license":
+            self._apply_license(dict(payload or {}))
+        elif kind == "license_result":
+            ok, message, info = payload
+            if self._license_dialog is not None and self._license_dialog.winfo_exists():
+                self._license_dialog.set_result(bool(ok), str(message))
+            if ok and isinstance(info, dict):
+                self._apply_license(info)
         elif kind == "paused":
             self._paused = bool(payload)
             view.set_paused(self._paused)
@@ -567,6 +670,12 @@ class LprApp:
             data = message.get("data")
             if isinstance(data, dict):
                 view.set_activity(_activity_text(data))
+        elif kind == "license":
+            # Pushed the moment the server's watchdog sees the state flip, so
+            # the UI locks without waiting for the next status poll.
+            data = message.get("license")
+            if isinstance(data, dict):
+                self._apply_license(data)
         elif kind == "camera_status":
             cameras = message.get("cameras")
             if isinstance(cameras, list):

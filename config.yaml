@@ -34,7 +34,7 @@ cameras:
 
   entry:
 
-    source: "0"
+    source: "/dev/video0"
 
     width: 1280
 
@@ -120,6 +120,56 @@ detection:
 
 
 
+# Software-level image enhancement. None of this needs the model retrained --
+
+# it changes what the detector and the recogniser are shown, not what they
+
+# learned.
+
+preprocess:
+
+  # Whole-frame CLAHE + unsharp, applied on the processing thread just before
+
+  # detection. OFF by default, and the only setting here that can make things
+
+  # worse: it changes what the *detector* sees, and unlike the OCR variants
+
+  # below there is no "keep the best of several tries" fallback behind it -- a
+
+  # frame the detector fails to fire on never reaches OCR at all. Mild CLAHE
+
+  # usually helps at night and can cost recall in good light, so switch it on
+
+  # only after comparing detection counts on your own footage.
+
+  frame_enhance: false
+
+  frame_clahe_clip: 2.0
+
+  frame_unsharp_amount: 0.5
+
+  # Unsharp strength inside the OCR crop pre-pass. This one is safe to leave
+
+  # on: the recogniser reads several variants of every crop and keeps the best,
+
+  # so a variant sharpening made worse simply loses. 0 disables it.
+
+  crop_unsharp_amount: 0.6
+
+  # When no variant of a crop produces a grammatical plate, retry on a
+
+  # perspective-corrected copy: the plate's four corners are found and warped
+
+  # back to a head-on rectangle. This is what reads a plate photographed from
+
+  # the side, which deskew (rotation only) cannot fix. Costs one extra OCR
+
+  # pass, and only on crops that already failed.
+
+  rectify_perspective: true
+
+
+
 ocr:
 
   backend: easyocr
@@ -175,6 +225,52 @@ database:
   path: data/plates.db
 
   log_retention_days: 10
+
+
+
+# Event snapshots: one JPEG per gate decision, kept on a rolling window.
+
+# The images are the evidence trail for a disputed entry; the log row is only
+
+# the claim that it happened.
+
+snapshots:
+
+  enabled: true
+
+  # Empty = <app.data_dir>/snapshots. Point this at another disk if the
+
+  # images outgrow the volume holding the database.
+
+  dir: ""
+
+  # Matched to database.log_retention_days so a row and its image expire
+
+  # together. 10 days at ~200 KB/event is a few hundred MB for a busy lane.
+
+  retention_days: 10
+
+  jpeg_quality: 85
+
+  # Frames waiting to be encoded. Past this the writer drops rather than let
+
+  # a slow disk push back on the recognition threads.
+
+  queue_size: 64
+
+
+
+# Site capacity for the dashboard's "vehicles inside / capacity" counter.
+
+# This is only the default: an admin can change it from the browser
+
+# (PUT /api/parking), which stores the value in the database so every tablet
+
+# on the site reads one number. 0 = unlimited.
+
+parking:
+
+  capacity: 100
 
 
 

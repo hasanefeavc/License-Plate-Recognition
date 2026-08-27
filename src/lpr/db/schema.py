@@ -18,7 +18,8 @@ from __future__ import annotations
 from typing import Final
 
 #: Bumped whenever ``ALL_DDL`` changes shape. Stored in ``schema_meta``.
-SCHEMA_VERSION: Final[int] = 1
+#: v2 added ``system_meta`` (licence token + anti-rollback clock).
+SCHEMA_VERSION: Final[int] = 2
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -62,6 +63,18 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 )
 """
 
+#: Runtime state that is neither user data nor schema bookkeeping: the active
+#: licence token and the monotonic "last seen" wall clock the licence check
+#: uses to notice a rolled-back system clock. Deliberately a separate table
+#: from ``schema_meta`` so a schema migration can never clobber a licence.
+CREATE_SYSTEM_META: Final[str] = """
+CREATE TABLE IF NOT EXISTS system_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+
 CREATE_IDX_LOGS_TS: Final[str] = "CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts)"
 
 CREATE_IDX_LOGS_PLATE: Final[str] = "CREATE INDEX IF NOT EXISTS idx_logs_plate ON logs(plate)"
@@ -76,6 +89,7 @@ ALL_DDL: Final[tuple[str, ...]] = (
     CREATE_USERS,
     CREATE_LOGS,
     CREATE_SCHEMA_META,
+    CREATE_SYSTEM_META,
     CREATE_IDX_LOGS_TS,
     CREATE_IDX_LOGS_PLATE,
     CREATE_IDX_LOGS_CAMERA_TS,
@@ -101,3 +115,13 @@ UPSERT_SCHEMA_META: Final[str] = (
 )
 
 SELECT_SCHEMA_META: Final[str] = "SELECT value FROM schema_meta WHERE key = ?"
+
+UPSERT_SYSTEM_META: Final[str] = (
+    "INSERT INTO system_meta (key, value, updated_at) VALUES (?, ?, ?) "
+    "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+    "updated_at = excluded.updated_at"
+)
+
+SELECT_SYSTEM_META: Final[str] = "SELECT value FROM system_meta WHERE key = ?"
+
+DELETE_SYSTEM_META: Final[str] = "DELETE FROM system_meta WHERE key = ?"

@@ -32,6 +32,7 @@ from lpr.db.repository import (
     LEGACY_PREFIX,
     LogRepository,
     PlateRepository,
+    SystemMetaRepository,
     UserRepository,
     normalise_plate,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "MEMORY",
     "LogRepository",
     "PlateRepository",
+    "SystemMetaRepository",
     "UserRepository",
     "close_all",
     "database_path",

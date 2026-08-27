@@ -344,6 +344,69 @@ def test_frame_stride_of_one_runs_every_frame(db, monkeypatch, frame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pause (operator button, and the licence halt)
+# ---------------------------------------------------------------------------
+
+
+def test_pause_stops_detection_and_the_gate(db, frame) -> None:
+    """An expired licence halts the pipeline through exactly this path."""
+    PlateRepository().add("34ABC123")
+    detector = FakeDetector()
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, detector=detector, relay=relay)
+
+    pipeline.pause()
+
+    assert pipeline.paused is True
+    assert pipeline.process_frame("entry", frame) == []
+    assert detector.calls == 0, "a paused pipeline must not pay for inference"
+    assert relay.triggers == 0
+    assert pipeline.decide("entry", "34ABC123") is None
+    assert LogRepository().count_matching() == 0
+
+
+def test_resume_brings_processing_back(db, frame) -> None:
+    PlateRepository().add("34ABC123")
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay)
+
+    pipeline.pause()
+    pipeline.process_frame("entry", frame)
+    pipeline.resume()
+    events = pipeline.process_frame("entry", frame)
+
+    assert pipeline.paused is False
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert relay.triggers == 1
+
+
+def test_pause_and_resume_are_idempotent(db) -> None:
+    pipeline = _build_pipeline(db)
+    pipeline.pause()
+    pipeline.pause()
+    assert pipeline.paused is True
+    pipeline.resume()
+    pipeline.resume()
+    assert pipeline.paused is False
+
+
+def test_a_paused_camera_loop_still_publishes_frames(db, frame) -> None:
+    """The live view keeps working while processing is halted."""
+    detector = FakeDetector()
+    pipeline = _build_pipeline(db, detector=detector)
+    pipeline._cameras["entry"] = ScriptedCamera("entry", [frame] * 4)
+    pipeline.pause()
+
+    stopper = threading.Thread(target=lambda: (time.sleep(0.4), pipeline._stop_event.set()))
+    stopper.start()
+    pipeline._process_camera("entry")
+    stopper.join()
+
+    assert detector.calls == 0
+    assert pipeline.latest_frame("entry") is not None
+
+
+# ---------------------------------------------------------------------------
 # Decisions
 # ---------------------------------------------------------------------------
 

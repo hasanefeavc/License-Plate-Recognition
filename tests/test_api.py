@@ -26,6 +26,7 @@ from lpr.api import deps  # noqa: E402
 from lpr.api.main import create_app  # noqa: E402
 from lpr.api.security import create_token  # noqa: E402
 from lpr.contracts import LprEvent, utc_now_iso  # noqa: E402
+from lpr.license import LicenseError, LicenseStatus  # noqa: E402
 
 _MISSING = object()
 
@@ -143,6 +144,13 @@ class FakePipeline:
         self.telemetry_subscribers: list[Any] = []
         self._connected = connected
         self.frame = b"\xff\xd8fake-jpeg\xff\xd9"
+        self.paused = False
+
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
 
     def stats(self) -> Any:
         return types.SimpleNamespace(
@@ -204,6 +212,40 @@ class FakePipeline:
         self.running = False
 
 
+def valid_license(client: str = "Test Sitesi") -> LicenseStatus:
+    return LicenseStatus(
+        valid=True,
+        reason="ok",
+        detail="Lisans geçerli.",
+        client=client,
+        issued_at="2026-01-01T00:00:00+00:00",
+        expires_at="2099-01-01T00:00:00+00:00",
+        seconds_remaining=86400.0,
+    )
+
+
+class FakeLicenseGuard:
+    """Stand-in for ``lpr.license.LicenseGuard``: no crypto, no database.
+
+    The real guard is covered by ``tests/test_license.py``; here the point is
+    only what the endpoints do with a valid or invalid one.
+    """
+
+    def __init__(self, status: LicenseStatus | None = None) -> None:
+        self.status = status or valid_license()
+        self.activated: list[str] = []
+
+    def refresh(self, **_kwargs: Any) -> LicenseStatus:
+        return self.status
+
+    def activate(self, token: str) -> LicenseStatus:
+        if token == "gecersiz-anahtar":
+            raise LicenseError("Lisans anahtarı geçersiz.", "invalid")
+        self.activated.append(token)
+        self.status = valid_license()
+        return self.status
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -232,10 +274,24 @@ def api_app(
 ) -> Any:
     app = create_app()
     app.state.pipeline = FakePipeline()
+    # The lifespan (and therefore the licence watchdog) never runs in these
+    # tests, so the guard is installed directly. A licensed app is the
+    # baseline; ``expired_app`` covers the other half.
+    app.state.license_guard = FakeLicenseGuard()
     app.dependency_overrides[deps.get_plate_repository] = lambda: plate_repo
     app.dependency_overrides[deps.get_log_repository] = lambda: log_repo
     app.dependency_overrides[deps.get_user_repository] = lambda: user_repo
     return app
+
+
+@pytest.fixture()
+def expired_app(api_app: Any) -> Any:
+    """A licensed app whose licence has just lapsed, pipeline held paused."""
+    api_app.state.license_guard = FakeLicenseGuard(
+        LicenseStatus.failure("expired", expires_at="2026-01-01T00:00:00+00:00")
+    )
+    deps.apply_license_state(api_app, False)
+    return api_app
 
 
 @pytest.fixture()
@@ -663,6 +719,122 @@ def test_metrics_agrees_with_stats(api_client: TestClient, operator_token: str) 
     stats = api_client.get("/api/stats", headers=auth(operator_token)).json()
     for key in ("running", "plates_read", "grants", "denials", "ocr_skipped"):
         assert metrics[key] == stats[key], key
+
+
+# ---------------------------------------------------------------------------
+# Licensing
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_reports_the_licence(api_client: TestClient, operator_token: str) -> None:
+    body = api_client.get("/api/metrics", headers=auth(operator_token)).json()
+    assert body["license_valid"] is True
+    assert body["license_reason"] == "ok"
+    assert body["license_client"] == "Test Sitesi"
+    assert body["license_expires_at"] == "2099-01-01T00:00:00+00:00"
+
+
+def test_license_status_is_readable_by_any_user(
+    api_client: TestClient, operator_token: str
+) -> None:
+    response = api_client.get("/api/license", headers=auth(operator_token))
+    assert response.status_code == 200
+    assert response.json()["valid"] is True
+
+
+def test_license_status_requires_auth(api_client: TestClient) -> None:
+    assert api_client.get("/api/license").status_code == 401
+
+
+def test_expired_licence_halts_the_pipeline(expired_app: Any) -> None:
+    client = TestClient(expired_app)
+    token = create_token("admin", "admin")
+
+    body = client.get("/api/license", headers=auth(token)).json()
+    assert body["valid"] is False
+    assert body["reason"] == "expired"
+    assert body["pipeline_halted"] is True
+
+    assert expired_app.state.paused is True
+    assert expired_app.state.pipeline.paused is True
+
+
+def test_expired_licence_blocks_the_gate(expired_app: Any) -> None:
+    """The barrier is the licensed function; halting only the ML half is not
+    enough."""
+    client = TestClient(expired_app)
+    response = client.post("/api/relay/trigger", headers=auth(create_token("admin", "admin")))
+    assert response.status_code == 402
+    assert expired_app.state.pipeline.relay.triggers == 0
+
+
+def test_expired_licence_cannot_be_resumed_by_hand(expired_app: Any) -> None:
+    client = TestClient(expired_app)
+    response = client.post("/api/pipeline/resume", headers=auth(create_token("admin", "admin")))
+    assert response.status_code == 402
+    assert expired_app.state.paused is True
+
+
+def test_submitting_a_key_releases_the_halt(expired_app: Any) -> None:
+    client = TestClient(expired_app)
+    token = create_token("admin", "admin")
+
+    response = client.post(
+        "/api/license", headers=auth(token), json={"key": "yeni-lisans-anahtari-jwt"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["pipeline_halted"] is False
+    assert expired_app.state.license_halted is False
+    assert expired_app.state.paused is False
+    assert expired_app.state.pipeline.paused is False
+    assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
+
+
+def test_a_rejected_key_is_a_400_carrying_the_reason(expired_app: Any) -> None:
+    client = TestClient(expired_app)
+    response = client.post(
+        "/api/license",
+        headers=auth(create_token("admin", "admin")),
+        json={"key": "gecersiz-anahtar"},
+    )
+    assert response.status_code == 400
+    assert "geçersiz" in response.json()["error"]["detail"]
+    assert expired_app.state.paused is True
+
+
+def test_pasted_key_whitespace_is_stripped(expired_app: Any) -> None:
+    """Keys arrive wrapped across lines out of an e-mail."""
+    client = TestClient(expired_app)
+    client.post(
+        "/api/license",
+        headers=auth(create_token("admin", "admin")),
+        json={"key": "  yeni-lisans\n-anahtari-jwt  "},
+    )
+    assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
+
+
+def test_submitting_a_key_requires_admin(
+    api_client: TestClient, operator_token: str
+) -> None:
+    response = api_client.post(
+        "/api/license", headers=auth(operator_token), json={"key": "a" * 40}
+    )
+    assert response.status_code == 403
+
+
+def test_manual_pause_survives_a_licence_renewal(expired_app: Any) -> None:
+    """An operator's pause must not be undone by the licence coming back."""
+    client = TestClient(expired_app)
+    token = create_token("admin", "admin")
+
+    client.post("/api/pipeline/pause", headers=auth(token))
+    client.post("/api/license", headers=auth(token), json={"key": "yeni-anahtar-jwt-degeri"})
+
+    assert expired_app.state.license_halted is False
+    assert expired_app.state.paused is True
 
 
 # ---------------------------------------------------------------------------

@@ -22,10 +22,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from lpr.contracts import Action, LprEvent, utc_now_iso
+from lpr.contracts import Action, CameraRole, LprEvent, utc_now_iso
+from lpr.db import schema
 from lpr.db.connection import get_connection, transaction
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -232,6 +234,48 @@ class LogRepository:
         conn = get_connection()
         row = conn.execute(f"SELECT COUNT(*) AS n FROM logs{where}", params).fetchone()
         return int(row["n"])
+
+    def occupancy_since(self, ts: str) -> dict[str, int]:
+        """How many vehicles are inside, counted from the log since ``ts``.
+
+        A plate is "inside" when its most recent *granted* event in the window
+        happened at the entry camera. That is deliberately not
+        ``entries - exits``: a car that triggers the entry camera twice would
+        push a running tally up for ever, and a car that entered before the
+        window opened would push it negative. Counting distinct plates by
+        their latest direction cannot do either.
+
+        SQLite's bare-column rule makes ``camera`` here the value from the row
+        that produced ``MAX(ts)``, which is exactly the last direction seen.
+        Served by ``idx_logs_camera_ts``.
+        """
+        conn = get_connection()
+        rows = conn.execute(
+            """
+            SELECT plate, camera, MAX(ts) AS last_ts
+            FROM logs
+            WHERE ts >= ? AND action = ?
+            GROUP BY plate
+            """,
+            (ts, str(Action.GRANTED)),
+        ).fetchall()
+
+        inside = sum(1 for row in rows if row["camera"] == CameraRole.ENTRY.value)
+        totals = conn.execute(
+            """
+            SELECT camera, COUNT(*) AS n
+            FROM logs
+            WHERE ts >= ? AND action = ?
+            GROUP BY camera
+            """,
+            (ts, str(Action.GRANTED)),
+        ).fetchall()
+        counts = {row["camera"]: int(row["n"]) for row in totals}
+        return {
+            "inside": inside,
+            "entries": counts.get(CameraRole.ENTRY.value, 0),
+            "exits": counts.get(CameraRole.EXIT.value, 0),
+        }
 
     def recent(self, limit: int = 50) -> list[LprEvent]:
         conn = get_connection()
@@ -506,3 +550,70 @@ class UserRepository:
                 "UPDATE users SET password_hash = ? WHERE username = ?", (digest, username)
             )
             return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# System metadata
+# ---------------------------------------------------------------------------
+
+
+class SystemMetaRepository:
+    """Small key/value store for runtime state that is not user data.
+
+    Holds the active licence token and the anti-rollback clock (see
+    :mod:`lpr.license`). Separate from ``schema_meta`` on purpose: that table
+    belongs to the migration machinery, this one to the running system.
+
+    Every method tolerates the table not existing yet -- the licence check
+    runs on entry points (the generator, an offline GUI) that may reach a
+    database before :func:`lpr.db.init_db` has been called, and a missing
+    table there must read as "nothing stored", never as a crash.
+    """
+
+    __slots__ = ()
+
+    def get(self, key: str) -> str | None:
+        name = (key or "").strip()
+        if not name:
+            return None
+        row = self._fetch(name)
+        if row is None:
+            return None
+        value = row["value"]
+        return None if value is None else str(value)
+
+    def set(self, key: str, value: str) -> None:
+        name = (key or "").strip()
+        if not name:
+            return
+        self._ensure_table()
+        with transaction() as conn:
+            conn.execute(
+                schema.UPSERT_SYSTEM_META, (name, str(value), utc_now_iso())
+            )
+
+    def delete(self, key: str) -> bool:
+        name = (key or "").strip()
+        if not name:
+            return False
+        try:
+            with transaction() as conn:
+                cur = conn.execute(schema.DELETE_SYSTEM_META, (name,))
+                return cur.rowcount > 0
+        except sqlite3.OperationalError:
+            return False
+
+    # -- internals ---------------------------------------------------------
+
+    def _fetch(self, name: str) -> Any:
+        conn = get_connection()
+        try:
+            return conn.execute(schema.SELECT_SYSTEM_META, (name,)).fetchone()
+        except sqlite3.OperationalError:
+            # "no such table": nothing was ever stored, which is a valid state.
+            return None
+
+    @staticmethod
+    def _ensure_table() -> None:
+        with transaction() as conn:
+            conn.execute(schema.CREATE_SYSTEM_META)

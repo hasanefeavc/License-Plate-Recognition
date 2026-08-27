@@ -24,6 +24,8 @@ __all__ = [
     "ErrorOut",
     "HealthOut",
     "LogOut",
+    "LicenseIn",
+    "LicenseOut",
     "LogQuery",
     "LoginIn",
     "PlateIn",
@@ -300,6 +302,11 @@ class MetricsOut(BaseModel):
                     "cameras_connected": 2,
                     "cameras_total": 2,
                     "websocket_clients": 1,
+                    "license_valid": True,
+                    "license_reason": "ok",
+                    "license_client": "Site A",
+                    "license_expires_at": "2026-09-24T16:42:47+00:00",
+                    "license_days_remaining": 29.7,
                 }
             ]
         }
@@ -317,6 +324,87 @@ class MetricsOut(BaseModel):
     cameras_connected: int = Field(default=0, ge=0, examples=[2])
     cameras_total: int = Field(default=0, ge=0, examples=[2])
     websocket_clients: int = Field(default=0, ge=0, examples=[1])
+
+    # -- licence ---------------------------------------------------------
+    # Reported here because this is the endpoint a dashboard already scrapes:
+    # a site whose key expires in three days should show up on the same panel
+    # as its frame counters, not in a place nobody looks.
+    license_valid: bool = Field(default=False, examples=[True])
+    license_reason: str = Field(default="missing", examples=["ok"])
+    license_client: str | None = Field(default=None, examples=["Site A"])
+    license_expires_at: str | None = Field(
+        default=None, examples=["2026-09-24T16:42:47+00:00"]
+    )
+    license_days_remaining: float | None = Field(default=None, examples=[29.7])
+
+
+class LicenseIn(BaseModel):
+    """Body of ``POST /api/license``: the key the operator pasted in."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."}]},
+    )
+
+    key: str = Field(
+        min_length=16,
+        max_length=4096,
+        examples=["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."],
+    )
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def _clean(cls, value: Any) -> Any:
+        """Strip whatever the paste brought with it.
+
+        Operators paste from an e-mail or a chat window, so the key arrives
+        wrapped across lines and padded with spaces. A JWT contains no
+        whitespace at all, which makes removing every whitespace character
+        unambiguous rather than merely convenient.
+        """
+        if isinstance(value, str):
+            return "".join(value.split())
+        return value
+
+
+class LicenseOut(BaseModel):
+    """Licence state: response of ``GET`` and ``POST /api/license``.
+
+    ``reason`` is the stable machine code the desktop client switches on
+    (``ok``, ``missing``, ``expired``, ``invalid``, ``clock_rollback``,
+    ``not_yet_valid``, ``no_secret``); ``detail`` is the sentence shown to
+    the operator. The key itself is never echoed back.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "valid": True,
+                    "reason": "ok",
+                    "detail": "Lisans geçerli.",
+                    "client": "Site A",
+                    "issued_at": "2026-08-25T16:42:47+00:00",
+                    "expires_at": "2026-09-24T16:42:47+00:00",
+                    "seconds_remaining": 2566800.0,
+                    "days_remaining": 29.7,
+                    "pipeline_halted": False,
+                }
+            ]
+        }
+    )
+
+    valid: bool = Field(default=False, examples=[True])
+    reason: str = Field(default="missing", examples=["ok"])
+    detail: str = Field(default="", examples=["Lisans geçerli."])
+    client: str | None = Field(default=None, examples=["Site A"])
+    issued_at: str | None = Field(default=None, examples=["2026-08-25T16:42:47+00:00"])
+    expires_at: str | None = Field(default=None, examples=["2026-09-24T16:42:47+00:00"])
+    seconds_remaining: float | None = Field(default=None, examples=[2566800.0])
+    days_remaining: float | None = Field(default=None, examples=[29.7])
+    #: True while the pipeline is held paused *because* of the licence, so the
+    #: client can tell "expired" apart from "an operator pressed pause".
+    pipeline_halted: bool = Field(default=False, examples=[False])
 
 
 class HealthOut(BaseModel):
@@ -401,6 +489,42 @@ class RelayTriggerOut(BaseModel):
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
+
+
+class ParkingOut(BaseModel):
+    """Response of ``GET``/``PUT /api/parking``: live occupancy vs capacity."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "inside": 12,
+                    "capacity": 100,
+                    "full": False,
+                    "entries": 48,
+                    "exits": 36,
+                    "since": "2026-08-27T00:00:00+00:00",
+                }
+            ]
+        }
+    )
+
+    inside: int = Field(default=0, ge=0, examples=[12])
+    capacity: int = Field(default=0, ge=0, examples=[100])
+    #: True once ``inside`` reaches ``capacity``. Computed server-side so every
+    #: client shows the "OTOPARK DOLU" warning at the same moment.
+    full: bool = Field(default=False, examples=[False])
+    entries: int = Field(default=0, ge=0, examples=[48])
+    exits: int = Field(default=0, ge=0, examples=[36])
+    since: str = Field(default="", examples=["2026-08-27T00:00:00+00:00"])
+
+
+class ParkingIn(BaseModel):
+    """Body of ``PUT /api/parking``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capacity: int = Field(ge=0, le=100000, examples=[100])
 
 
 class LoginIn(BaseModel):
