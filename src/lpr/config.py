@@ -179,10 +179,38 @@ class OcrConfig(BaseModel):
 
 
 class VotingConfig(BaseModel):
+    """Multi-frame consensus, and how long a confirmed plate stays confirmed.
+
+    Sliding-gate deployments
+    ------------------------
+    ``cooldown_s`` is the setting that matters for an electric sliding gate
+    (*yana kayar kapı*), and it matters for a reason that does not apply to an
+    arm barrier. A sliding-gate motor is usually driven by **step-by-step pulse
+    logic**: pulse 1 opens, pulse 2 *stops mid-travel*, pulse 3 closes. The
+    cycle takes 15-25 seconds.
+
+    A car waiting at the camera is read on every pass of the pipeline. Without
+    a cooldown longer than the gate's travel time, the second confirmation of
+    the *same plate* sends a second pulse into a gate that is still opening --
+    and the driver watches it stop halfway. The default is therefore 20.0 s,
+    chosen to cover a typical full open cycle rather than to be a round number.
+
+    Tune it to your own gate: time the motor from closed to fully open and set
+    this at or just above that. Too short re-triggers mid-travel; too long only
+    delays a legitimate second entry by the same vehicle, which is the far
+    cheaper mistake.
+
+    An arm barrier has no such constraint -- its pulse is idempotent and the
+    cycle is ~2 s -- so a barrier site can safely run this down at 3-5 s.
+    """
+
     window: int = 5
     min_votes: int = 3
     ttl_s: float = 4.0
-    cooldown_s: float = 10.0
+    #: How long a confirmed plate is suppressed on the same camera. See the
+    #: class docstring: on a sliding gate this must exceed the motor's travel
+    #: time, or the second confirmation stops the gate mid-open.
+    cooldown_s: float = 20.0
     #: OCR passes one tracked plate may cost before it is muted for
     #: ``cooldown_s``. 0 disables the cap (every visible plate is re-read until
     #: it confirms). Only applies when ``detection.track`` is on.
@@ -192,11 +220,31 @@ class VotingConfig(BaseModel):
 
 
 class RelayConfig(BaseModel):
+    """The dry-contact gate relay.
+
+    Sliding-gate deployments
+    ------------------------
+    ``pulse_ms`` is a **momentary dry-contact closure**, not a hold. The relay
+    closes the circuit for this long and opens it again; the motor controller
+    reads that closure as one press of its own button. 1000 ms is the default
+    because it is comfortably above the debounce window of every step-by-step
+    controller in common use, while staying short enough that the controller
+    cannot read it as a held button (which some units treat as a separate
+    "hold to run" mode).
+
+    Do not raise this to try to keep a sliding gate open longer -- it has no
+    such effect. The gate's open duration is set on the motor controller, not
+    here. What governs re-triggering from this side is
+    ``voting.cooldown_s``; see :class:`VotingConfig`.
+    """
+
     enabled: bool = True
     port: str = "auto"
     baud: int = 9600
     open_byte: str = "A"
     close_byte: str = "a"
+    #: Dry-contact closure length in milliseconds. One pulse = one button
+    #: press at the motor controller.
     pulse_ms: int = 1000
     mock: bool = False
 

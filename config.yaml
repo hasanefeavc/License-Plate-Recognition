@@ -226,7 +226,39 @@ voting:
 
   ttl_s: 4.0
 
-  cooldown_s: 3.0
+  # How long a confirmed plate is suppressed on the same camera.
+
+  #
+
+  # THIS IS THE SLIDING-GATE SETTING. A sliding-gate motor (yana kayar kapi)
+
+  # is driven by step-by-step pulse logic: pulse 1 opens, pulse 2 STOPS it
+
+  # mid-travel, pulse 3 closes. A full cycle takes 15-25 seconds.
+
+  #
+
+  # A car waiting at the camera is re-read on every pass. If this cooldown is
+
+  # shorter than the gate's travel time, the same plate confirms a second time
+
+  # while the gate is still opening, a second pulse goes out, and the gate
+
+  # stops halfway with the driver sitting under it.
+
+  #
+
+  # Time your own motor from closed to fully open and set this at or just
+
+  # above that. Too short re-triggers mid-travel; too long merely delays a
+
+  # genuine second entry by the same car, which is much the cheaper mistake.
+
+  # An arm barrier has no such constraint (idempotent pulse, ~2 s cycle) and
+
+  # can safely run at 3-5 s.
+
+  cooldown_s: 20.0
 
   # Per-track OCR budget (only used when detection.track is on): a plate that
 
@@ -249,6 +281,22 @@ relay:
   open_byte: "A"
 
   close_byte: "a"
+
+  # Momentary dry-contact closure length, in milliseconds. One pulse = one
+
+  # press of the motor controller's own button. 1000 ms clears the debounce
+
+  # window of every step-by-step controller in common use while staying short
+
+  # enough not to be read as a held button.
+
+  #
+
+  # Raising this does NOT keep a sliding gate open longer -- the open duration
+
+  # lives on the motor controller. Re-triggering is governed by
+
+  # voting.cooldown_s above.
 
   pulse_ms: 1000
 
@@ -364,7 +412,7 @@ api:
 
 system_update:
 
-  enabled: false
+  enabled: true
 
   # Working directory for the git and compose commands (the repo root).
 

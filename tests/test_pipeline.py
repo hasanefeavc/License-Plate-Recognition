@@ -17,6 +17,7 @@ import pytest
 
 from lpr.contracts import Action, CameraStatus, PlateRead
 from lpr.db import LogRepository, PlateRepository, init_db
+from lpr.pipeline import orchestrator as orchestrator_module
 from lpr.pipeline.camera import CameraWorker
 from lpr.pipeline.orchestrator import SUBSCRIBER_QUEUE_SIZE, PipelineOrchestrator
 
@@ -497,6 +498,64 @@ def test_cooldown_is_per_camera_and_plate(db, monkeypatch) -> None:
     # A different camera and a different plate each have their own window.
     assert pipeline.decide("exit", "34ABC123").action == str(Action.DENIED)
     assert pipeline.decide("entry", "06XYZ99").action == str(Action.DENIED)
+
+
+def test_no_second_pulse_during_a_full_sliding_gate_cycle(db, monkeypatch, frame) -> None:
+    """A car idling through a 20 s open cycle must produce exactly one pulse.
+
+    This is the sliding-gate failure mode in miniature. The motor uses
+    step-by-step logic -- pulse 1 opens, pulse 2 *stops* it mid-travel -- and
+    the car sitting under the camera re-confirms on every pass of the pipeline
+    for the whole 15-25 s the gate takes to open. Anything that lets a second
+    pulse out during that window halts the gate on top of the driver.
+
+    Virtual time, because the point is to cover the *whole* cycle: the
+    orchestrator's cooldown reads ``time.monotonic``, so the clock is walked
+    forward a second at a time rather than actually waiting.
+    """
+    settings = db
+    settings.voting.cooldown_s = 20.0  # the shipped sliding-gate default
+    PlateRepository().add("34ABC123")
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: clock["now"])
+
+    relay = FakeRelay()
+    pipeline = _build_pipeline(settings, relay=relay)
+
+    # Second 0: the car arrives and the gate is told to open.
+    pipeline.process_frame("entry", frame)
+    assert relay.triggers == 1
+
+    # Seconds 1..19: still opening, and the plate is still in frame.
+    for _ in range(19):
+        clock["now"] += 1.0
+        pipeline.process_frame("entry", frame)
+
+    assert relay.triggers == 1, (
+        "a second pulse inside the travel window would stop the gate mid-open"
+    )
+
+    # Past the cycle the gate is at rest, so re-triggering is legitimate again.
+    clock["now"] += 1.5
+    pipeline.process_frame("entry", frame)
+    assert relay.triggers == 2
+
+
+def test_a_second_car_is_not_blocked_by_the_first_cars_cooldown(db, monkeypatch) -> None:
+    """The cooldown is per plate, not a gate-wide lockout.
+
+    Worth pinning explicitly: it is what makes the window safe to lengthen to
+    a sliding gate's travel time without stranding the next vehicle -- and it
+    is also the limit of what this setting protects against.
+    """
+    settings = db
+    settings.voting.cooldown_s = 20.0
+    pipeline = _build_pipeline(settings)
+
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.DENIED)
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.COOLDOWN)
+    assert pipeline.decide("entry", "06MNP99").action == str(Action.DENIED)
 
 
 def test_cooldown_expires(db, monkeypatch) -> None:

@@ -620,9 +620,9 @@ class VersionOut(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "version": "0.1.0",
-                    "commit": "e46933f0c2a1b8d4e5f60718293a4b5c6d7e8f90",
-                    "short_commit": "e46933f",
+                    "version": "v1.0.0-2-g6845136",
+                    "commit": "6845136fc5071a3e0bdd11d112182c4917bd6f39",
+                    "short_commit": "6845136",
                     "branch": "main",
                     "dirty": False,
                     "update_enabled": True,
@@ -631,11 +631,21 @@ class VersionOut(BaseModel):
         }
     )
 
-    version: str = Field(examples=["0.1.0"])
+    #: Human-readable, from ``git describe --tags --always``: ``v1.0.0`` on a
+    #: tagged release, ``v1.0.0-2-g6845136`` between releases, a bare short
+    #: hash in a repository that has never been tagged, and the packaged
+    #: version when the deployment is not a git checkout at all. This is the
+    #: field to display; it is a label, not an identity.
+    version: str = Field(examples=["v1.0.0-2-g6845136", "v1.0.0", "0.1.0"])
     #: ``None`` when the deployment is not a git checkout (image built from a
-    #: tarball, git binary absent). The UI falls back to ``version``.
-    commit: str | None = Field(default=None, examples=["e46933f0c2a1b8d4"])
-    short_commit: str | None = Field(default=None, examples=["e46933f"])
+    #: tarball, git binary absent).
+    #:
+    #: This, not ``version``, identifies the running build -- tagging a commit
+    #: that is already deployed changes the version string without deploying
+    #: anything, so the dashboard watches this to tell that an OTA update
+    #: really did replace the process.
+    commit: str | None = Field(default=None, examples=["6845136fc5071a3e0bdd11d1"])
+    short_commit: str | None = Field(default=None, examples=["6845136"])
     branch: str | None = Field(default=None, examples=["main"])
     #: Uncommitted local changes are present, which will block a --ff-only pull.
     dirty: bool = Field(default=False, examples=[False])

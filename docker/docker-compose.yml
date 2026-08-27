@@ -6,58 +6,31 @@ services:
     image: lpr-api:latest
     container_name: lpr-api
     restart: unless-stopped
+    user: "0:0"
     ports:
       - "8000:8000"
     devices:
       - "/dev/video0:/dev/video0"
+      # Röle cihazını USB'ye taktığında aşağıdaki satırın başındaki '#' işaretini kaldır:
+      # - "/dev/ttyUSB0:/dev/ttyUSB0"
     volumes:
       - ../data:/app/data
       - ../models:/app/models
       - ../config.yaml:/app/config.yaml:ro
-    # Optional: create a `.env` file next to this compose file (or in the
-    # repo root and reference it as ../.env) for secrets like
-    # LPR_API__SECRET_KEY. Safe to leave absent -- compose just skips it.
+      # The repo itself, so `git pull` has a checkout to work in:
+      - ..:/repo
+      # The Docker socket, so the container can rebuild its own stack:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      LPR_SYSTEM_UPDATE__REPO_DIR: /repo
     env_file:
       - path: .env
         required: false
 
     # --- Serial relay passthrough (Linux hosts only) --------------------
     # Uncomment to expose a physical serial gate relay to the container.
-    # This only works when the Docker daemon runs on Linux (bind-mounting a
-    # host device node is a Linux-only Docker feature); on Windows there is
-    # no equivalent device passthrough into Linux containers. On Windows
-    # hosts, run the relay driver on the host itself (outside Docker) and
-    # set LPR_RELAY__MOCK=true here (or leave relay.mock as configured in
-    # config.yaml) so the containerised API doesn't try to open a serial
-    # port that isn't reachable from inside the container.
     # devices:
     #   - "/dev/ttyUSB0:/dev/ttyUSB0"
-
-    # --- Remote OTA self-update (optional) -------------------------------
-    # Required only if you set `system_update.enabled: true` in config.yaml.
-    # Without these two mounts the endpoint still answers, but the update
-    # fails with a clear message: the image has no .git directory to pull
-    # into and no Docker socket to rebuild through.
-    #
-    # READ THIS FIRST. Mounting docker.sock gives this container the ability
-    # to start any container on the host, with any mount, as root. That is
-    # root on the host, laundered through the API process. If the API is
-    # reachable from an untrusted network, or you cannot vouch for everyone
-    # holding an admin password, run the updater on the host instead (a
-    # cron/systemd unit polling `git fetch`) and leave this commented out.
-    #
-    # volumes:
-    #   - ../data:/app/data
-    #   - ../models:/app/models
-    #   - ../config.yaml:/app/config.yaml:ro
-    #   # The repo itself, so `git pull` has a checkout to work in:
-    #   - ..:/repo
-    #   # The Docker socket, so the container can rebuild its own stack:
-    #   - /var/run/docker.sock:/var/run/docker.sock
-    #
-    # ...and point the updater at the mounted checkout:
-    # environment:
-    #   LPR_SYSTEM_UPDATE__REPO_DIR: /repo
 
     # --- GPU acceleration (optional) -------------------------------------
     # Requires the NVIDIA Container Toolkit on the host and a CUDA-enabled

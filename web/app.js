@@ -21,7 +21,7 @@
  * The gate opens itself: `PipelineOrchestrator.decide()` pulses the relay the
  * moment a recognised plate matches the whitelist, on the pipeline thread.
  * This page must never trigger it on a `granted` event -- every open browser
- * would fire its own extra pulse for the same car. "Bariyeri Aç" is the
+ * would fire its own extra pulse for the same car. "Kapıyı Aç" is the
  * manual override for a vehicle the cameras could not read, nothing more.
  *
  * A browser cannot put an Authorization header on an <img> or a WebSocket
@@ -117,9 +117,18 @@
     feedCount: 0,
     licenceValid: true,
     closing: false,
-    /** Short commit of the running server, used to detect that an OTA update
-     *  actually replaced the process rather than merely restarting it. */
+    /** Wall-clock ms until the manual gate button is usable again. Zero when
+     *  the gate is not known to be moving. */
+    gateBusyUntil: 0,
+    gateTimer: null,
+    /** Human-readable version of the running server (a tag like `v1.0.0`, or
+     *  a bare commit hash in an untagged repo). Display only. */
     version: "",
+    /** Full commit hash of the running server. This -- not `version` -- is
+     *  what says an OTA update actually replaced the process: tagging a
+     *  commit that is already deployed changes the version string without
+     *  deploying anything. */
+    commit: "",
     /** Last rows fetched into the history modal. The CSV is built from
      *  exactly what the operator is looking at, not from a second query that
      *  could return something else. */
@@ -141,7 +150,8 @@
     "cdn-warning",
     "uptime", "user-label", "conn-dot", "conn-label", "feed", "feed-empty",
     "feed-count", "activity", "stat-read", "stat-grant", "stat-deny",
-    "license-label", "btn-gate", "btn-pause", "btn-history", "btn-logout",
+    "license-label", "btn-gate", "btn-gate-label", "gate-spinner",
+    "btn-pause", "btn-history", "btn-logout",
     "toast", "cam-entry", "cam-exit",
     // Plate-management modal
     "modal-plates", "btn-plates", "plate-form", "plate-input", "note-input",
@@ -553,12 +563,15 @@
 
   function updateControls() {
     const isAdmin = state.role === "admin";
-    const gateBlocked = !isAdmin || !state.licenceValid;
+    const gateBusy = state.gateBusyUntil > Date.now();
+    const gateBlocked = !isAdmin || !state.licenceValid || gateBusy;
     if (el["btn-gate"]) {
       el["btn-gate"].disabled = gateBlocked;
       el["btn-gate"].title = !isAdmin
-        ? "Bariyeri yalnızca yönetici açabilir"
-        : (!state.licenceValid ? "Lisans geçersiz" : "");
+        ? "Kapıyı yalnızca yönetici açabilir"
+        : (!state.licenceValid
+            ? "Lisans geçersiz"
+            : (gateBusy ? "Kapı hareket hâlinde" : ""));
     }
     if (el["btn-pause"]) {
       el["btn-pause"].disabled = !isAdmin;
@@ -566,15 +579,67 @@
     }
   }
 
+  /** How long the manual button stays busy after a pulse, in ms.
+   *
+   *  This is the sliding gate's travel time, and it is a hardware fact, not a
+   *  UI preference: the motor uses step-by-step logic where a second pulse
+   *  *stops* the gate mid-travel instead of re-opening it. Holding the button
+   *  down for the cycle is what stops an operator watching a slow gate from
+   *  pressing again and halting it halfway.
+   *
+   *  Keep this in step with `voting.cooldown_s` in config.yaml, which does the
+   *  same job for plate-triggered pulses. */
+  const GATE_BUSY_MS = 20000;
+
+  /** Put the gate button into (or out of) its post-pulse busy state.
+   *
+   *  Counts down in the label so the wait reads as "the gate is moving"
+   *  rather than as a frozen button. */
+  function setGateBusy(busy) {
+    if (state.gateTimer) {
+      clearInterval(state.gateTimer);
+      state.gateTimer = null;
+    }
+    if (el["gate-spinner"]) el["gate-spinner"].hidden = !busy;
+
+    if (!busy) {
+      state.gateBusyUntil = 0;
+      setText(el["btn-gate-label"], "Kapıyı Aç");
+      updateControls();
+      return;
+    }
+
+    state.gateBusyUntil = Date.now() + GATE_BUSY_MS;
+
+    const tick = () => {
+      const remaining = Math.ceil((state.gateBusyUntil - Date.now()) / 1000);
+      if (remaining <= 0 || state.closing) {
+        setGateBusy(false);
+        return;
+      }
+      setText(el["btn-gate-label"], `Kapı Açılıyor... ${remaining}s`);
+    };
+    tick();
+    state.gateTimer = setInterval(tick, 1000);
+    updateControls();
+  }
+
   async function openGate() {
-    el["btn-gate"].disabled = true;
+    if (state.gateBusyUntil > Date.now()) return;
+
+    // Busy immediately, before the request goes out: the double-press this
+    // guards against happens in the second or two while the POST is still in
+    // flight, not after it has come back.
+    setGateBusy(true);
     try {
       await api("/api/relay/trigger", { method: "POST" });
-      toast("Bariyer açıldı.", "ok");
+      toast("Kapı açılıyor.", "ok");
     } catch (err) {
+      // The pulse never went out, so the gate is not moving: release the
+      // button rather than making the operator wait out a cycle that is not
+      // happening.
+      setGateBusy(false);
       toast(err.message, "bad");
-    } finally {
-      updateControls();
     }
   }
 
@@ -818,11 +883,7 @@
       const info = await api("/api/system/version");
       section.hidden = !info.update_enabled;
 
-      setText(el["update-version"], info.short_commit || info.version || "—");
-      setText(el["update-branch"], info.branch || "—");
-      if (el["update-dirty-row"]) el["update-dirty-row"].hidden = !info.dirty;
-
-      state.version = info.short_commit || info.version || "";
+      applyVersion(info);
       if (!info.update_enabled) return;
 
       setUpdateBusy(false);
@@ -837,6 +898,21 @@
   }
 
   const EVENT_TONES = { error: "bad", warning: "warn", info: "muted" };
+
+  /** Paint one `/api/system/version` payload into the panel and remember it.
+   *
+   *  `version` is what the server calls itself -- `v1.0.0`, or
+   *  `v1.0.0-2-g6845136` between releases, or a bare hash in a repo that has
+   *  never been tagged. `commit` is kept separately because it, not the
+   *  label, is what identifies the running build. */
+  function applyVersion(info) {
+    state.version = info.version || info.short_commit || "";
+    state.commit = info.commit || info.short_commit || "";
+
+    setText(el["update-version"], state.version || "—");
+    setText(el["update-branch"], info.branch || "—");
+    if (el["update-dirty-row"]) el["update-dirty-row"].hidden = !info.dirty;
+  }
 
   /** Render the OTA audit trail: what the nightly job did, newest first. */
   async function refreshUpdateHistory() {
@@ -902,7 +978,7 @@
     );
     if (!confirmed) return;
 
-    const before = state.version;
+    const before = state.commit;
     setUpdateBusy(true, "Güncelleniyor...");
     updateStatusText("Güncelleme başlatılıyor...", "accent");
     updateLog([]);
@@ -940,13 +1016,11 @@
         continue;
       }
 
-      const now = info.short_commit || info.version || "";
+      const now = info.commit || info.short_commit || "";
       if (before && now && now !== before) {
         setUpdateBusy(false);
-        state.version = now;
-        setText(el["update-version"], now);
-        setText(el["update-branch"], info.branch || "—");
-        updateStatusText(`Güncelleme tamamlandı. Yeni sürüm: ${now}`, "ok");
+        applyVersion(info);
+        updateStatusText(`Güncelleme tamamlandı. Yeni sürüm: ${state.version}`, "ok");
         refreshUpdateHistory();
         return;
       }

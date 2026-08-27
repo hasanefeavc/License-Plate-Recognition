@@ -4,7 +4,7 @@
 # NOT part of this image -- it runs natively on the operator's desktop
 # (Windows 11 / Ubuntu 24.04) and talks to this container over HTTP/WS.
 #
-# Build:  docker build -f docker/Dockerfile -t lpr-api .   (context = repo root)
+# Build:  docker build -f docker/Dockerfile -t lpr-api .    (context = repo root)
 # Or via docker/docker-compose.yml (build.context: .. handles that for you).
 
 ARG PYTHON_VERSION=3.12
@@ -45,8 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
-# Native libraries required at runtime by opencv-python-headless and torch.
-# (No compilers, no dev headers -- those stayed in the builder stage.)
+# Native libraries required at runtime by opencv-python-headless, torch and git.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
@@ -54,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxext6 \
         libgomp1 \
         curl \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin lpr

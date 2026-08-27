@@ -175,7 +175,7 @@ snapshots:
 | `POST /api/relay/trigger` · `/api/pipeline/pause` · `/resume` | admin | manual control |
 | `GET /api/license` · `POST /api/license` | user · admin | licence state; install a new key |
 | `GET /api/stream/{camera}` | bearer | MJPEG preview (capped ~10 fps) |
-| `GET /api/system/version` | user | deployed version, git commit and branch |
+| `GET /api/system/version` | user | deployed version (`git describe`), commit and branch |
 | `GET/POST /api/system/update` | admin | OTA update status; trigger an update (202) |
 | `GET /api/system/events` | admin | operational audit trail (nightly OTA activity) |
 | `WS /ws/events?token=` | token | live plate events as JSON |
@@ -450,6 +450,60 @@ whether the gate may move. Both weight by confidence and both merge spellings on
 apart, but at different scales — a plate confused the same way in every view of one frame
 is still only *one* vote at the temporal layer.
 
+### Gate hardware: sliding gate vs arm barrier
+
+The two need different timing, and the difference is not cosmetic.
+
+An **arm barrier** takes ~2 seconds and its open pulse is idempotent — a second
+pulse while it is rising does nothing.
+
+An **electric sliding gate** (*yana kayar kapı*) takes **15–25 seconds** and is
+usually driven by **step-by-step pulse logic**:
+
+```
+pulse 1 → open        pulse 2 → STOP mid-travel        pulse 3 → close
+```
+
+A car waiting at the camera is re-read on every pass of the pipeline. If the
+re-trigger window is shorter than the gate's travel time, the same plate
+confirms a second time while the gate is still opening, a second pulse goes
+out, and the gate halts with the driver sitting under it.
+
+| Setting | Shipped default | Why |
+|---|---|---|
+| `voting.cooldown_s` | **20.0** | Must exceed the motor's full open cycle. Time your own gate from closed to fully open and set this at or just above it. Too short re-triggers mid-travel; too long only delays a genuine second entry by the same car — much the cheaper mistake. An arm barrier can run at 3–5 s. |
+| `relay.pulse_ms` | **1000** | A *momentary* dry-contact closure — one pulse equals one press of the controller's own button. 1000 ms clears the debounce filter of every step-by-step controller in common use while staying short enough not to register as a held button. |
+
+Raising `pulse_ms` does **not** hold a sliding gate open longer. The open
+duration lives on the motor controller; `pulse_ms` only sets how long the
+contact is closed.
+
+**What the cooldown does and does not cover.** It is keyed on
+*(camera, plate)*, so it stops the same vehicle re-triggering — the case that
+actually happens at a gate. It does **not** lock the gate out globally: a
+*different* plate confirming while the gate is moving, or an operator pressing
+the manual button, will still send a pulse. That is deliberate (a second car
+must not be stranded behind the first car's window, and an operator may need to
+stop the gate on purpose), but if your site needs a hardware-level lockout it
+has to sit in the relay layer, not here.
+
+### Manual gate control
+
+`POST /api/relay/trigger` (admin, licence-gated) sends one pulse and records it
+as a `granted` event for plate `MANUAL`, so the audit trail shows who opened
+the gate and when.
+
+The dashboard's **Kapıyı Aç** button goes busy *before* the request is sent —
+the accidental double-press happens in the second or two while the POST is
+still in flight, not after it returns — and counts down for the gate's travel
+time (`GATE_BUSY_MS` in `web/app.js`, kept in step with `voting.cooldown_s`).
+A failed trigger releases the button immediately, since no pulse went out and
+the gate is not moving.
+
+Note that this means the dashboard will not send a second pulse for ~20 s,
+so it cannot be used to *stop* a sliding gate mid-travel. If you want that,
+lower `GATE_BUSY_MS`; the endpoint itself is not rate-limited.
+
 The temporal layer is tuned by `voting.window` (how many reads are retained),
 `voting.min_votes` (how many must agree) and `voting.ttl_s` (how long a vote survives).
 Shipped defaults are 5 / 3 / 4.0s. **Shortening `ttl_s` makes confirmation stricter, not
@@ -553,6 +607,37 @@ Docker socket (so the container can rebuild its own stack).
 Without those mounts the endpoint still answers; the update just fails with a
 specific message rather than a traceback — *"… bir git deposu değil"* or
 *"Docker soketine erişim reddedildi"*.
+
+### How the deployed version is named
+
+`GET /api/system/version` reports two different things, and the difference
+matters:
+
+| Field | From | For |
+|---|---|---|
+| `version` | `git describe --tags --always` | **Display.** A label a human can read out over the phone. |
+| `commit` / `short_commit` | `git rev-parse HEAD` | **Identity.** Which build is actually running. |
+
+`git describe --tags --always` returns the most meaningful name the repository
+can offer for the current commit, degrading one step at a time:
+
+| Repository state | `version` |
+|---|---|
+| HEAD is tagged | `v1.0.0` |
+| two commits past a tag | `v1.0.0-2-g6845136` |
+| never tagged | `6845136` — a bare hash, via `--always` |
+| not a git checkout | the packaged version, e.g. `0.1.0` |
+
+`--tags` is load-bearing: a release cut with plain `git tag v1.0.0` is a
+*lightweight* tag, and `git describe` without it silently ignores lightweight
+tags — which would put a hash back on exactly the builds that were supposed to
+read nicely. `--always` is what keeps an untagged repository from failing the
+call outright. There is no repository state in which `version` comes back empty.
+
+The dashboard detects a completed OTA update by watching **`commit`**, never
+`version`. Tagging a commit that is already deployed changes the describe
+string without deploying anything; a client watching the label would report a
+successful update that never happened.
 
 ### Why the POST returns 202, not 200
 
@@ -725,7 +810,7 @@ make fmt
 
 ### Test suite
 
-**555 passing tests** across 17 modules (557 collected: 555 pass, 1 skipped, 1 known
+**582 passing tests** across 18 modules (584 collected: 582 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
@@ -736,23 +821,24 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
 | `test_api.py` | 62 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
-| `test_pipeline.py` | 37 | Queue semantics, frame stride, thread lifecycle, subscriber fan-out |
+| `test_pipeline.py` | 39 | Queue semantics, frame stride, thread lifecycle, subscriber fan-out, sliding-gate cooldown |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
 | `test_db.py` | 35 | Repositories, migrations, retention, system-event trail |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
-| `test_web_ui.py` | 26 | Browser dashboard endpoints, update panel gating |
+| `test_web_ui.py` | 33 | Browser dashboard endpoints, update panel gating, manual gate button |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_parking.py` | 18 | Occupancy accounting |
 | `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
-| `test_updater.py` | 29 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check |
+| `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
 | `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
+| `test_config.py` | 10 | Shipped defaults: sliding-gate cooldown and pulse width |
 | `test_preprocess_pipeline.py` | 11 | Preprocessing wiring: escalation staging, frame-hook injection |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 557 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 584 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

@@ -226,7 +226,7 @@ def test_the_page_never_triggers_the_relay_from_an_event() -> None:
 
     If this page also fired on a `granted` event, every open browser would add
     its own extra relay pulse for the same car. The manual endpoint must only
-    ever be reached from the "Bariyeri Aç" click handler.
+    ever be reached from the "Kapıyı Aç" click handler.
     """
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     callers = re.findall(r"[^\n]*\"/api/relay/trigger\"[^\n]*", script)
@@ -319,3 +319,82 @@ def test_the_audit_trail_is_rendered_as_text_not_markup() -> None:
     body = body[: body.index("\n  }\n")]
     assert "innerHTML" not in body
     assert "textContent" in body
+
+
+def test_the_panel_displays_the_version_but_tracks_the_commit() -> None:
+    """The label and the identity are different fields and must stay separate.
+
+    Showing `commit` was the original complaint (a raw hash reads as noise);
+    tracking `version` would be worse, because tagging an already-deployed
+    commit would then look like a completed update.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    body = script[script.index("function applyVersion") :]
+    body = body[: body.index("\n  }\n")]
+    assert "update-version" in body and "info.version" in body
+
+    poll = script[script.index("async function pollForRestart") :]
+    poll = poll[: poll.index("\n  }\n")]
+    assert "info.commit" in poll, "restart detection must watch the commit hash"
+
+
+# ---------------------------------------------------------------------------
+# Manual gate control (sliding gate)
+# ---------------------------------------------------------------------------
+
+
+def test_the_gate_button_is_labelled_for_a_sliding_gate() -> None:
+    """"Kapı" (gate), not "Bariyer" (barrier) -- this drives a sliding gate."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    start = html.index('id="btn-gate"')
+    button = html[start : html.index("</button>", start)]
+    assert "Kapıyı Aç" in button
+    assert "Bariyeri Aç" not in html
+
+
+def test_the_gate_button_goes_busy_before_the_request_is_sent() -> None:
+    """The accidental double-press happens while the POST is still in flight.
+
+    Waiting for the response to arrive before disabling the button would leave
+    exactly the window this is meant to close.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function openGate") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert body.index("setGateBusy(true)") < body.index('"/api/relay/trigger"')
+
+
+def test_a_repeat_press_inside_the_busy_window_sends_nothing() -> None:
+    """A second pulse mid-travel stops a step-by-step gate; it must not leave."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function openGate") :]
+    body = body[: body.index("\n  }\n")]
+    assert "if (state.gateBusyUntil > Date.now()) return;" in body
+
+
+def test_a_failed_trigger_releases_the_button() -> None:
+    """No pulse went out, so the gate is not moving and the wait is wrong."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function openGate") :]
+    body = body[: body.index("\n  }\n")]
+    catch = body[body.index("catch (err)") :]
+    assert "setGateBusy(false)" in catch
+
+
+def test_the_busy_window_covers_a_sliding_gate_cycle() -> None:
+    """Client-side guard and server-side cooldown protect the same hardware."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    match = re.search(r"const GATE_BUSY_MS = (\d+);", script)
+    assert match, "GATE_BUSY_MS not found"
+    assert int(match.group(1)) >= 15000
+
+
+def test_the_busy_state_counts_down_rather_than_freezing() -> None:
+    """A dead button for 20 s reads as a bug; a countdown reads as a gate."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="gate-spinner"' in html
+    assert 'id="btn-gate-label"' in html
+    assert "Kapı Açılıyor" in script
