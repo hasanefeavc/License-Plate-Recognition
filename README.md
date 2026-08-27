@@ -90,6 +90,44 @@ lpr-gui --api-url http://127.0.0.1:8000               # separate process/machine
 
 ---
 
+## Secrets
+
+Nothing tracked in this repository contains a real credential. Three files are
+committed and all three are templates:
+
+| File | Holds | Rule |
+|---|---|---|
+| `config.yaml` | Operational settings | No secrets. `smtp.password` stays `""`; `api.secret_key` stays `change-me`, which is what makes `LPR_ENV=production` refuse to boot unconfigured. |
+| `.env.example` | Variable names and placeholders | Every value is a placeholder. Copy to `.env` and fill that in. |
+| `docker/docker-compose.yml` | Service definition | Reads `.env`; carries no values of its own. |
+
+`.gitignore` ignores `.env` **and** `.env.*` while keeping `!.env.example`. The
+wildcard matters as much as the plain name — `.env.production`, `.env.local`
+and the `.env.save` an editor leaves behind all carry live credentials, and the
+last of those is the one that gets committed by accident. The negation must
+come *after* the wildcard: git applies the last matching rule, so reversing the
+two lines would silently ignore the template as well.
+
+`LPR_API__SECRET_KEY` and `LPR_LICENSE_SECRET` must be **different values**.
+The first signs API sessions, the second signs deployment licences; sharing one
+secret means a single leak forges both, and rotating either forces you to
+rotate the other.
+
+`tests/test_secrets.py` enforces all of this. The checks are shape-based rather
+than a denylist — a long hex run, an opaque credential-shaped value, a
+non-placeholder assignment to anything named `*SECRET*` or `*PASSWORD*` — because
+a denylist only catches the secret you already know about.
+
+### If a secret does get committed
+
+Scrubbing the file does not help: the value is in the history and on every
+clone and fork. **Rotate it.** Revoke a Gmail app password at
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords);
+regenerate a signing key with `openssl rand -hex 32`. Rewriting history with
+`git filter-repo` is optional cleanup afterwards, not the fix.
+
+---
+
 ## Configuration
 
 `config.yaml` holds the defaults; environment variables override it and win.
@@ -169,7 +207,7 @@ snapshots:
 |---|---|---|
 | `GET /health` | none | liveness; reports `degraded` when the pipeline is down |
 | `POST /api/auth/login` · `/register` | none · first-user-or-admin | JWT bearer token |
-| `GET/POST /api/plates` · `DELETE /api/plates/{plate}` | user · admin | allow-list CRUD |
+| `GET/POST /api/plates` · `PATCH`/`DELETE /api/plates/{plate}` | user · admin | allow-list CRUD, partial edit |
 | `POST /api/plates/import` · `GET /api/plates/export` | admin | bulk CSV in/out |
 | `GET /api/events/export` | user | access history as CSV |
 | `GET /api/logs` · `/api/logs/dates` | user | history, filterable by camera/plate/date |
@@ -577,15 +615,85 @@ a full disk costs the photograph but never the alert.
 
 Two things worth being deliberate about before enabling it:
 
-- **`smtp.password` in a YAML file is a credential at rest.** Prefer
-  `LPR_SMTP__PASSWORD`, which overrides the file and keeps the secret out of
-  the repository and out of config backups.
+- **`smtp.password` must stay empty in `config.yaml`.** That file is committed,
+  so a value written there is published to everyone with repository access —
+  and it stays in the git history after you delete it. Set
+  `LPR_SMTP__PASSWORD` in `.env` (gitignored), which overrides the file. A
+  configured `user` with no password is treated as *unusable*: the notifier
+  refuses to start with one warning rather than failing authentication once per
+  refused vehicle.
 - **The snapshot is personal data in most jurisdictions.** Send it to a mailbox
   the site operator controls, and keep `to_emails` short.
 
 Repeat alerts are already bounded by `voting.cooldown_s`: a car idling at the
 gate re-confirms constantly but decides once, so one refused vehicle is one
 email, not one per frame.
+
+---
+
+## Dashboard: sessions and plate management
+
+### Signing in
+
+Username and password only — nobody is ever asked to paste a token. The JWT
+comes back from `POST /api/auth/login`, goes into `localStorage`, and is
+replayed on the next visit against `GET /api/auth/me`: a stored token is a
+*claim*, and the server decides whether it is still good. A rejected token is
+cleared and the login screen returns, so an expired session cannot leave the
+dashboard half-alive.
+
+The navbar carries the username and a role chip (**Yönetici** / **Operatör**),
+which is the fastest answer to "why can't I press that?".
+
+**What an operator does not see.** Role gating is mirrored in the UI so an
+operator sees why a control is inert rather than collecting 403s — the add
+form, the CSV import/export row, and every row action are hidden or disabled;
+the OTA update panel is hidden outright; the capacity block in Ayarlar is
+hidden while the stream-quality selector beside it stays, because that is a
+per-device preference an operator legitimately sets. This is presentation
+only: every one of those endpoints re-checks the role server-side.
+
+### Plate management
+
+`GET /api/plates` returns both shapes in one request — `plates` as bare strings
+(what the desktop client has always consumed) and `records` with the schema-v4
+resident data. Additive, so nothing that predates it breaks.
+
+The table renders a plate badge, owner and apartment on one line with the note
+beneath, a status badge, the expiry date (or *Süresiz*), and row actions:
+
+| Badge | Meaning |
+|---|---|
+| **Aktif** (green) | On the list, no expiry |
+| **Misafir** (blue) | Temporary permit, still valid |
+| **Süresi Doldu** (orange) | Permit lapsed — the gate refuses it |
+| **Engelli** (red) | Barred deliberately; outranks expiry |
+
+**Status is derived server-side**, in `plate_status()`. Expiry decides whether
+the barrier opens, and that comparison is made against the *server's* clock — a
+dashboard on a machine with a wrong clock must not show a badge that
+contradicts what the gate will do.
+
+**Search** filters on plate, owner, apartment and note, over the records
+already loaded rather than a request per keystroke: a resident list is hundreds
+of rows, so filtering locally is both faster and more reliable. Plate matching
+ignores spacing, so typing `34ABC` finds the row displayed as `34 ABC 123`.
+
+**The block toggle is a partial write.** `PATCH /api/plates/{plate}` with
+`{"blocked": true}` changes the flag and nothing else. A full-overwrite PUT
+would blank the owner, apartment, note and expiry the toggle never asked about,
+which is why `PlateRepository.update()` exists alongside `upsert()` — the
+latter writes every column by design, and that is exactly wrong here.
+
+Deletion asks for confirmation; blocking does not, because blocking is
+reversible from the same button and deletion is not. A blocked plate stays
+visible and auditable rather than vanishing and being silently re-addable by
+the next CSV import.
+
+**Date pickers submit `YYYY-MM-DD`**, which is widened to `T23:59:59+00:00` on
+the way in. Stored as bare midnight, a permit "valid until 1 January" would
+lapse as 31 December ended — a full day early, refusing a resident on the day
+their sticker says they are fine.
 
 ---
 
@@ -917,26 +1025,27 @@ make fmt
 
 ### Test suite
 
-**677 passing tests** across 20 modules (679 collected: 677 pass, 1 skipped, 1 known
+**742 passing tests** across 21 modules (744 collected: 742 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
+| `test_api.py` | 88 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
-| `test_api.py` | 73 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
+| `test_web_ui.py` | 54 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
 | `test_pipeline.py` | 47 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
+| `test_db.py` | 42 | Repositories, migrations, retention, system-event trail, partial plate updates |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
 | `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
-| `test_db.py` | 35 | Repositories, migrations, retention, system-event trail |
-| `test_web_ui.py` | 34 | Browser dashboard endpoints, update panel gating, manual gate button, CSV controls |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
+| `test_notify.py` | 27 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
-| `test_notify.py` | 24 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
+| `test_secrets.py` | 20 | No credentials in tracked templates; `.env*` ignore rules |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_parking.py` | 18 | Occupancy accounting |
@@ -947,7 +1056,7 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 679 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 744 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

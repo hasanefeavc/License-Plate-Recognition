@@ -57,7 +57,18 @@ datasets/
 *.db
 *.db-wal
 *.db-shm
+
+# --- Local secrets ----------------------------------------------------------
+# Every .env variant is ignored, .env.example alone is kept. The wildcard
+# matters as much as the plain name: .env.production, .env.local and the
+# .env.save an editor leaves behind all carry the same live credentials, and
+# only the committed template is safe to publish.
+#
+# The negation must come *after* the wildcard -- git applies the last matching
+# rule, so reversing these two lines would silently ignore the template too.
 .env
+.env.*
+!.env.example
 
 # --- Licensing --------------------------------------------------------------
 # The active licence key (a signed JWT) and the vendor-side record of every

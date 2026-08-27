@@ -421,3 +421,208 @@ def test_the_busy_state_counts_down_rather_than_freezing() -> None:
     assert 'id="gate-spinner"' in html
     assert 'id="btn-gate-label"' in html
     assert "Kapı Açılıyor" in script
+
+
+# ---------------------------------------------------------------------------
+# Plate management redesign
+# ---------------------------------------------------------------------------
+
+
+def test_the_add_form_carries_every_schema_v4_field() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    for field_id in (
+        "plate-input", "owner-input", "apartment-input",
+        "note-input", "expires-input", "blocked-input",
+    ):
+        assert f'id="{field_id}"' in html, field_id
+
+
+def test_the_expiry_field_is_a_real_date_picker() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    start = html.index('id="expires-input"')
+    assert 'type="date"' in html[start - 200 : start + 200]
+
+
+def test_the_add_form_omits_blank_optional_fields() -> None:
+    """`PlateIn` forbids extra keys, so a blank input must not be sent as null."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function addPlate") :]
+    body = body[: body.index("\n  }\n")]
+    assert "if (value) body[key] = value;" in body
+
+
+def test_the_table_renders_all_four_status_badges() -> None:
+    """Aktif / Engelli / Süresi Doldu / Misafir, each visually distinct."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    block = script[script.index("const PLATE_STATUS") :]
+    block = block[: block.index("\n  };")]
+
+    for status, label in (
+        ("active", "Aktif"),
+        ("blocked", "Kara Liste"),
+        ("expired", "Süresi Doldu"),
+        ("guest", "Misafir"),
+    ):
+        assert status in block and label in block
+
+    for tone in ("text-ok", "text-bad", "text-warn", "text-accent"):
+        assert tone in block, f"{tone} missing: the badges must be distinguishable"
+
+
+def test_the_status_badge_comes_from_the_server() -> None:
+    """A browser with a wrong clock must not contradict the gate's own ruling."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderPlates") :]
+    body = body[: body.index("\n  }\n")]
+    assert "record.status" in body
+    assert "Date.now()" not in body, "expiry must not be recomputed client-side"
+
+
+def test_a_plate_without_an_expiry_reads_as_open_ended() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function formatExpiry") :]
+    body = body[: body.index("\n  }\n")]
+    assert "Süresiz" in body
+
+
+def test_the_search_box_covers_every_visible_field() -> None:
+    """Searching only the plate would be useless on a list sorted by plate."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="plate-search"' in html
+
+    body = script[script.index("function filterPlates") :]
+    body = body[: body.index("\n  }\n")]
+    for field in ("plate", "owner", "apartment", "note"):
+        assert f"record.{field}" in body, field
+
+
+def test_the_search_ignores_plate_spacing() -> None:
+    """The table shows "34 ABC 123"; nobody types the spaces to find it."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function filterPlates") :]
+    body = body[: body.index("\n  }\n")]
+    assert "replace(/\\s+/g" in body
+
+
+def test_the_search_filters_locally_without_a_round_trip() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function filterPlates") :]
+    body = body[: body.index("\n  }\n")]
+    assert "state.plateRecords" in body
+    assert "api(" not in body, "a request per keystroke would be slower, not faster"
+
+
+def test_the_block_toggle_sends_only_the_blocked_flag() -> None:
+    """A full overwrite would blank the owner and expiry the toggle never saw."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function setPlateBlocked") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert '"PATCH"' in body
+    assert "JSON.stringify({ blocked })" in body
+    for field in ("owner", "apartment", "note", "expires_at"):
+        assert field not in body, f"{field} must not be part of a block toggle"
+
+
+def test_deleting_a_plate_asks_first() -> None:
+    """It is irreversible and sits next to a toggle that is not."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function removePlate") :]
+    body = body[: body.index("\n  }\n")]
+    assert body.index("window.confirm") < body.index('method: "DELETE"')
+
+
+def test_row_actions_are_dispatched_by_name_not_position() -> None:
+    """Three buttons share one delegated handler; position would be fragile."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    for action in ("delete", "block", "unblock"):
+        assert f'=== "{action}"' in script
+
+
+# ---------------------------------------------------------------------------
+# Role gating
+# ---------------------------------------------------------------------------
+
+
+def test_every_plate_write_control_is_admin_gated() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function applyPlatePermissions") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert 'state.role === "admin"' in body
+    assert "plate-form" in body, "the add form must be hidden, not just disabled"
+    assert "plates-io" in body, "import/export must be hidden for an operator"
+    assert "button[data-plate]" in body, "row actions must be disabled too"
+
+
+def test_the_search_stays_available_to_an_operator() -> None:
+    """Reading the list is an operator's job; only writing is restricted."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("const PLATE_FORM_INPUTS") :]
+    body = body[: body.index("\n  }\n", body.index("function applyPlatePermissions"))]
+    assert "plate-search" not in body
+
+
+def test_the_admin_only_settings_block_is_hidden_from_an_operator() -> None:
+    """Capacity is server-side config; stream quality is a device preference.
+
+    Hiding the whole modal would take a legitimate control away from operators,
+    so only the capacity block goes.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="capacity-section"' in html
+
+    body = script[script.index("function openSettings") :]
+    body = body[: body.index("\n  }\n")]
+    assert "capacity-section" in body
+    assert "quality-select" in body, "the per-device preference must survive"
+
+
+def test_the_navbar_shows_the_role_as_a_badge() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderUserBadge") :]
+    body = body[: body.index("\n  }\n")]
+    assert "Yönetici" in body and "Operatör" in body
+    assert "state.username" in body
+
+
+def test_the_session_is_restored_from_local_storage_and_verified() -> None:
+    """A stored token is a claim; the server decides whether it is still good."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function restoreSession") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "localStorage.getItem(TOKEN_KEY)" in body
+    assert "/api/auth/me" in body
+    assert "localStorage.removeItem(TOKEN_KEY)" in body, "a rejected token must be cleared"
+
+
+def test_the_login_form_takes_credentials_not_a_token() -> None:
+    """Nobody should ever be asked to paste a JWT."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="login-username"' in html
+    assert 'id="login-password"' in html
+    assert 'type="password"' in html
+    assert "token" not in html[html.index('id="login-form"') : html.index("</form>")].lower()
+
+
+def test_the_owner_column_reads_as_a_name_with_the_flat_in_brackets() -> None:
+    """`Ahmet Yılmaz (Daire 12)` — the name is what the eye scans for."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function formatResident") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "(${labelled})" in body
+    assert "Daire ${flat}" in body, "a bare number should be labelled"
+    # Either half can be missing: an operator adding a plate at the barrier
+    # often has neither.
+    assert 'if (!name && !flat) return "—";' in body
+    assert "if (!flat) return name;" in body
+
+
+def test_the_logout_button_is_labelled_for_the_operator() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    button = html[html.index('id="btn-logout"') :]
+    assert "Çıkış Yap" in button[: button.index("</button>")]

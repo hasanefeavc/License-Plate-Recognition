@@ -167,10 +167,32 @@ smtp:
   # 587 = STARTTLS (use_tls), 465 = örtük TLS (otomatik algılanır), 25 = düz.
   port: 587
   user: "hasanefeavc@gmail.com"
-  password: "123456789"
+  # LEAVE THIS EMPTY. config.yaml is committed to git, so a value written
+
+  # here is a credential published to everyone with repository access -- and
+
+  # it stays in the history even after you delete it.
+
+  #
+
+  # Set the app password in `.env` instead (gitignored), where the
+
+  # environment source overrides whatever this file says:
+
+  #
+
+  #   LPR_SMTP__PASSWORD="your-16-char-app-password"
+
+  #
+
+  # Gmail needs an *app password*, not the account password, and only once
+
+  # 2-step verification is on: https://myaccount.google.com/apppasswords
+
+  password: ""
   # Boşsa user kullanılır; çoğu sağlayıcı zaten bunu şart koşar.
   from_email: "hasanefeavc@gmail.com"
-  to_emails: [hasanefeavc@gmail.com]
+  to_emails: ["hasanefeavc@gmail.com"]
   # Listede hiç olmayan plaka.
   notify_on_unauthorized: true
   # Listede olan ama engellenmiş (blocked) plaka.

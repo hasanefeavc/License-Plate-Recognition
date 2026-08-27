@@ -18,6 +18,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from lpr.contracts import utc_now_iso
+
 __all__ = [
     "CameraSourceIn",
     "CameraStatusOut",
@@ -28,9 +30,11 @@ __all__ = [
     "LicenseOut",
     "LogQuery",
     "LoginIn",
+    "PlateDetailOut",
     "PlateIn",
     "PlateListOut",
     "PlateOut",
+    "PlateUpdateIn",
     "PipelineStateOut",
     "RegisterIn",
     "RelayTriggerOut",
@@ -62,6 +66,40 @@ def normalize_plate(value: str) -> str:
 
 PlateStr = Annotated[str, Field(min_length=2, max_length=16, examples=["34ABC123"])]
 
+#: A bare calendar date, as an ``<input type="date">`` submits it.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _end_of_day(value: str | None) -> str | None:
+    """Widen a bare ``YYYY-MM-DD`` to the last instant of that day, in UTC.
+
+    A date picker submits ``2027-01-01``. Stored as-is it compares equal to
+    midnight, so a permit "valid until 1 January" would expire as 31 December
+    ended -- a full day early, and the resident is refused at the gate on the
+    day their sticker says they are fine. Anything already carrying a time is
+    left exactly as the caller sent it.
+    """
+    if not value or not _DATE_ONLY_RE.match(value):
+        return value
+    return f"{value}T23:59:59+00:00"
+
+
+def plate_status(row: dict[str, Any], now: str | None = None) -> str:
+    """Classify one plate row for display: active / blocked / expired / guest.
+
+    ``blocked`` outranks expiry: a barred plate whose permit also lapsed is
+    still barred, and that is the more important thing to show. A plate with a
+    future end date is a *guest* (a temporary permit) rather than merely
+    active, because those are the rows a manager reviews.
+    """
+    if row.get("blocked"):
+        return "blocked"
+    expires = str(row.get("expires_at") or "").strip()
+    if not expires:
+        return "active"
+    # Lexical comparison on fixed-width ISO-8601 UTC, as everywhere else here.
+    return "expired" if expires <= (now or utc_now_iso()) else "guest"
+
 
 # ---------------------------------------------------------------------------
 # Plates
@@ -69,15 +107,49 @@ PlateStr = Annotated[str, Field(min_length=2, max_length=16, examples=["34ABC123
 
 
 class PlateIn(BaseModel):
-    """Body of ``POST /api/plates``."""
+    """Body of ``POST /api/plates``.
+
+    Everything past ``plate`` is optional, so the one-field form an operator
+    uses at the gate ("just let this car in") still works unchanged; the
+    resident fields are for the management screen.
+    """
 
     model_config = ConfigDict(
         extra="forbid",
-        json_schema_extra={"examples": [{"plate": "34ABC123", "note": "Müdür aracı"}]},
+        json_schema_extra={
+            "examples": [
+                {
+                    "plate": "34ABC123",
+                    "owner": "Ahmet Yılmaz",
+                    "apartment": "B Blok D:12",
+                    "note": "Müdür aracı",
+                    "expires_at": "2027-01-01",
+                    "blocked": False,
+                }
+            ]
+        },
     )
 
     plate: PlateStr
     note: str | None = Field(default=None, max_length=200, examples=["Müdür aracı"])
+    owner: str | None = Field(default=None, max_length=120, examples=["Ahmet Yılmaz"])
+    apartment: str | None = Field(default=None, max_length=60, examples=["B Blok D:12"])
+    #: Permit end date. A bare ``YYYY-MM-DD`` from a date picker is widened to
+    #: the end of that day, so a permit dated today is valid all of today.
+    expires_at: str | None = Field(default=None, max_length=40, examples=["2027-01-01"])
+    blocked: bool = Field(default=False, examples=[False])
+
+    @field_validator("owner", "apartment", "expires_at", mode="before")
+    @classmethod
+    def _strip_optional(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("expires_at", mode="after")
+    @classmethod
+    def _widen_date(cls, value: str | None) -> str | None:
+        return _end_of_day(value)
 
     @field_validator("plate", mode="before")
     @classmethod
@@ -113,6 +185,73 @@ class PlateOut(BaseModel):
         return value
 
 
+class PlateUpdateIn(BaseModel):
+    """Body of ``PATCH /api/plates/{plate}`` -- a partial update.
+
+    Only the fields actually present in the request are written. That is what
+    lets the dashboard's block toggle send ``{"blocked": true}`` without
+    blanking the owner and expiry it never asked about.
+    """
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"blocked": True}]})
+
+    note: str | None = Field(default=None, max_length=200)
+    owner: str | None = Field(default=None, max_length=120)
+    apartment: str | None = Field(default=None, max_length=60)
+    expires_at: str | None = Field(default=None, max_length=40)
+    blocked: bool | None = Field(default=None, examples=[True])
+
+    @field_validator("owner", "apartment", "expires_at", "note", mode="before")
+    @classmethod
+    def _strip_optional(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("expires_at", mode="after")
+    @classmethod
+    def _widen_date(cls, value: str | None) -> str | None:
+        return _end_of_day(value)
+
+    def changes(self) -> dict[str, Any]:
+        """Only the fields the caller actually sent."""
+        return {name: getattr(self, name) for name in self.model_fields_set}
+
+
+class PlateDetailOut(BaseModel):
+    """One resident record, as the management screen renders it."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "plate": "34ABC123",
+                    "owner": "Ahmet Yılmaz",
+                    "apartment": "B Blok D:12",
+                    "note": "Müdür aracı",
+                    "expires_at": "2027-01-01T23:59:59+00:00",
+                    "blocked": False,
+                    "added_at": "2026-08-27T09:14:02+00:00",
+                    "status": "active",
+                }
+            ]
+        }
+    )
+
+    plate: PlateStr
+    owner: str | None = None
+    apartment: str | None = None
+    note: str | None = None
+    expires_at: str | None = None
+    blocked: bool = False
+    added_at: str | None = None
+    #: Derived here rather than in the browser, deliberately. Expiry decides
+    #: whether the gate opens, and that comparison is made against the
+    #: *server's* clock -- a dashboard on a machine with a wrong clock must not
+    #: show a badge that contradicts what the barrier will do.
+    status: Literal["active", "blocked", "expired", "guest"] = "active"
+
+
 class PlateListOut(BaseModel):
     """Response of ``GET /api/plates``."""
 
@@ -123,6 +262,10 @@ class PlateListOut(BaseModel):
     )
 
     plates: list[str] = Field(default_factory=list, examples=[["06XYZ42", "34ABC123"]])
+    #: The same plates with their resident data. Additive: ``plates`` stays a
+    #: bare list of strings so the desktop client, which only ever wanted the
+    #: strings, keeps working against this endpoint unchanged.
+    records: list[PlateDetailOut] = Field(default_factory=list)
     count: int = Field(default=0, ge=0, examples=[2])
 
     @field_validator("plates", mode="before")

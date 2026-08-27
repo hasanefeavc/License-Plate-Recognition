@@ -116,6 +116,10 @@
     feedCount: 0,
     licenceValid: true,
     closing: false,
+    /** Resident records from the last /api/plates load. Search filters this
+     *  in place rather than re-querying: a resident list is hundreds of rows,
+     *  and a round trip per keystroke would be slower and less reliable. */
+    plateRecords: [],
     /** Wall-clock ms until the manual gate button is usable again. Zero when
      *  the gate is not known to be moving. */
     gateBusyUntil: 0,
@@ -154,7 +158,8 @@
     "toast", "cam-entry", "cam-exit",
     // Plate-management modal
     "modal-plates", "btn-plates", "plate-form", "plate-input", "note-input",
-    "plate-add", "plate-rows", "plates-empty", "plates-count", "plates-status",
+    "plate-form", "plate-add", "plate-rows", "plates-empty", "plates-count", "plates-status",
+    "owner-input", "apartment-input", "expires-input", "blocked-input", "plate-search",
     "plates-io", "plate-import-file", "plate-import-overwrite", "plate-export",
     // History modal
     "modal-history", "history-day", "history-camera", "history-refresh",
@@ -163,6 +168,7 @@
     // Settings modal + capacity
     "modal-settings", "btn-settings", "settings-form", "settings-save",
     "settings-status", "capacity-input", "capacity-hint", "quality-select",
+    "capacity-section", "capacity-divider",
     "occupancy", "capacity", "full-banner",
     // System update (inside the settings modal)
     "update-section", "update-version", "update-branch", "update-dirty-row",
@@ -599,10 +605,35 @@
   /** Relay and pause are admin-only server-side; reflect that in the UI so an
    *  operator sees a disabled button instead of collecting 403s. */
   function applyRole() {
-    setText(el["user-label"], state.username ? `${state.username} (${state.role})` : "");
+    renderUserBadge();
     updateControls();
     applyPlatePermissions();
     el["capacity-input"].disabled = state.role !== "admin";
+  }
+
+  /** Username plus a coloured role chip, rather than "name (role)" in text.
+   *
+   *  The chip is the fastest way to answer "why can I not press that?", which
+   *  is the question an operator asks first on a dashboard with admin-only
+   *  controls hidden. */
+  function renderUserBadge() {
+    const node = el["user-label"];
+    if (!node) return;
+    node.textContent = "";
+    if (!state.username) return;
+
+    const name = document.createElement("span");
+    name.className = "font-bold text-ink";
+    name.textContent = state.username;
+
+    const isAdmin = state.role === "admin";
+    const chip = document.createElement("span");
+    chip.className =
+      "ml-2 rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider " +
+      (isAdmin ? "border-accent/50 bg-accent/10 text-accent" : "border-line bg-row text-muted");
+    chip.textContent = isAdmin ? "Yönetici" : "Operatör";
+
+    node.append(name, chip);
   }
 
   function updateControls() {
@@ -763,13 +794,17 @@
   function openSettings() {
     openModal("modal-settings");
     const isAdmin = state.role === "admin";
+
+    // Capacity is server-side configuration and admin-only; the stream quality
+    // below it is a per-device preference an operator legitimately sets, so
+    // only the capacity block is withheld.
+    if (el["capacity-section"]) el["capacity-section"].hidden = !isAdmin;
+    if (el["capacity-divider"]) el["capacity-divider"].hidden = !isAdmin;
+
     el["capacity-input"].value = state.parking.capacity ? String(state.parking.capacity) : "0";
     el["capacity-input"].disabled = !isAdmin;
     el["quality-select"].value = String(state.quality);
-    setText(
-      el["capacity-hint"],
-      isAdmin ? `Şu an içeride: ${state.parking.inside}` : "Değiştirmek için yönetici yetkisi gerekli"
-    );
+    setText(el["capacity-hint"], isAdmin ? `Şu an içeride: ${state.parking.inside}` : "");
     modalStatus(el["settings-status"], "");
     refreshUpdatePanel();
   }
@@ -1101,62 +1136,213 @@
 
   /** Adding and removing are admin-only server-side. Reflect that here so an
    *  operator sees why the controls are inert instead of collecting 403s. */
+  /** Every field a plate form writes. Kept in one list so adding an input to
+   *  the markup cannot leave it enabled for an operator by omission. */
+  const PLATE_FORM_INPUTS = [
+    "plate-input", "owner-input", "apartment-input",
+    "note-input", "expires-input", "blocked-input",
+  ];
+
+  /** Mirror the server's rules so an operator sees why a control is inert
+   *  instead of collecting 403s. This is presentation, not enforcement: every
+   *  one of these endpoints checks the role again. */
   function applyPlatePermissions() {
     const isAdmin = state.role === "admin";
-    const reason = isAdmin ? "" : "Plaka eklemek/silmek için yönetici yetkisi gerekli";
+    const reason = isAdmin ? "" : "Plaka yönetimi için yönetici yetkisi gerekli";
+
     el["plate-add"].disabled = !isAdmin;
     el["plate-add"].title = reason;
-    // Both bulk operations are admin-only server-side; hide the whole row for
-    // an operator rather than showing controls that only collect 403s.
+    PLATE_FORM_INPUTS.forEach((id) => { if (el[id]) el[id].disabled = !isAdmin; });
+
+    // The whole add form and the bulk row are admin-only server-side; hide
+    // them outright rather than showing controls that can only ever fail.
+    const form = el["plate-form"];
+    if (form) form.hidden = !isAdmin;
     if (el["plates-io"]) el["plates-io"].hidden = !isAdmin;
-    el["plate-input"].disabled = !isAdmin;
-    el["note-input"].disabled = !isAdmin;
+
+    // Search stays available to everyone: reading the list is an operator's job.
     el["plate-rows"].querySelectorAll("button[data-plate]").forEach((button) => {
       button.disabled = !isAdmin;
-      button.title = reason;
+      if (!isAdmin) button.title = reason;
     });
   }
 
-  function renderPlates(plates) {
+  /** Status badge vocabulary. Server-derived, so the badge cannot contradict
+   *  what the gate will actually do (see `plate_status` in schemas.py). */
+  const PLATE_STATUS = {
+    active:  { label: "Aktif",        classes: "border-ok/50 bg-ok/10 text-ok" },
+    blocked: { label: "Kara Liste",   classes: "border-bad/50 bg-bad/10 text-bad" },
+    expired: { label: "Süresi Doldu", classes: "border-warn/50 bg-warn/10 text-warn" },
+    guest:   { label: "Misafir",      classes: "border-accent/50 bg-accent/10 text-accent" },
+  };
+
+  /** `2027-01-01T23:59:59+00:00` -> `01.01.2027`; blank -> "Süresiz". */
+  function formatExpiry(value) {
+    if (!value) return "Süresiz";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(parsed.getDate())}.${pad(parsed.getMonth() + 1)}.${parsed.getFullYear()}`;
+  }
+
+  /** The plate itself, as a badge that reads like a plate. */
+  function plateBadge(plate) {
+    const badge = document.createElement("span");
+    badge.className =
+      "inline-block rounded-md border-2 border-ink/70 bg-ink/5 px-2.5 py-1 " +
+      "font-mono text-base font-bold tracking-wider text-ink";
+    badge.textContent = formatPlate(plate);
+    return badge;
+  }
+
+  function statusBadge(status) {
+    const spec = PLATE_STATUS[status] || PLATE_STATUS.active;
+    const badge = document.createElement("span");
+    badge.className =
+      `inline-block rounded-full border px-2.5 py-0.5 text-xs font-bold ${spec.classes}`;
+    badge.textContent = spec.label;
+    return badge;
+  }
+
+  /** `Ahmet Yılmaz (Daire 12)`.
+   *
+   *  The apartment is parenthesised rather than joined with a dash so the name
+   *  stays the thing the eye lands on when scanning a column of them. A bare
+   *  number is prefixed with "Daire"; anything already carrying its own label
+   *  ("B Blok D:12") is left as the manager typed it. Either half may be
+   *  missing — an operator adding a plate at the barrier often has neither. */
+  function formatResident(owner, apartment) {
+    const name = (owner || "").trim();
+    const flat = (apartment || "").trim();
+    if (!name && !flat) return "—";
+    if (!flat) return name;
+
+    const labelled = /^\d+$/.test(flat) ? `Daire ${flat}` : flat;
+    return name ? `${name} (${labelled})` : labelled;
+  }
+
+  /** Owner on top, apartment and note beneath: the scannable line is the name. */
+  function ownerCell(record) {
+    const cell = document.createElement("td");
+    cell.className = "px-3 py-2.5";
+
+    const primary = document.createElement("div");
+    primary.className = "font-semibold text-ink";
+    primary.textContent = formatResident(record.owner, record.apartment);
+    cell.append(primary);
+
+    if (record.note) {
+      const sub = document.createElement("div");
+      sub.className = "mt-0.5 truncate text-xs text-muted";
+      sub.style.maxWidth = "22rem";
+      sub.textContent = record.note;
+      sub.title = record.note;  // the full text, for a note wider than the cell
+      cell.append(sub);
+    }
+    return cell;
+  }
+
+  function actionButton(label, plate, action, classes, title) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className =
+      `rounded-md border px-2.5 py-1 text-xs font-bold transition disabled:cursor-not-allowed ` +
+      `disabled:opacity-40 ${classes}`;
+    button.textContent = label;
+    // The raw plate, not the spaced display form: it goes into the URL.
+    button.dataset.plate = plate;
+    button.dataset.action = action;
+    if (title) button.title = title;
+    return button;
+  }
+
+  function renderPlates(records) {
     const body = el["plate-rows"];
     body.textContent = "";
-    plates.forEach((plate, index) => {
+
+    records.forEach((record) => {
+      const plate = String(record.plate || "");
+      const status = String(record.status || "active");
+
       const row = document.createElement("tr");
       row.className = "text-sm";
 
-      const number = document.createElement("td");
-      number.className = "px-6 py-2.5 font-mono text-muted";
-      number.textContent = String(index + 1);
+      const plateCell = document.createElement("td");
+      plateCell.className = "px-4 py-2.5 sm:px-6";
+      plateCell.append(plateBadge(plate));
 
-      const name = document.createElement("td");
-      name.className = "px-3 py-2.5 font-mono text-base font-bold tracking-wide";
-      name.textContent = formatPlate(plate);
+      const statusCell = document.createElement("td");
+      statusCell.className = "px-3 py-2.5";
+      statusCell.append(statusBadge(status));
+
+      const expiry = document.createElement("td");
+      expiry.className = "px-3 py-2.5 font-mono text-xs text-muted";
+      expiry.textContent = formatExpiry(record.expires_at);
 
       const actions = document.createElement("td");
-      actions.className = "px-6 py-2.5 text-right";
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className =
-        "rounded-md border border-bad/50 px-3 py-1 text-xs font-bold text-bad transition hover:bg-bad hover:text-white disabled:cursor-not-allowed disabled:opacity-40";
-      remove.textContent = "Sil";
-      // The raw plate, not the spaced display form: it goes into the URL.
-      remove.dataset.plate = plate;
-      actions.append(remove);
+      actions.className = "whitespace-nowrap px-4 py-2.5 text-right sm:px-6";
+      actions.append(
+        actionButton(
+          record.blocked ? "Aç" : "Engelle",
+          plate,
+          record.blocked ? "unblock" : "block",
+          record.blocked
+            ? "border-ok/50 text-ok hover:bg-ok hover:text-ground"
+            : "border-warn/50 text-warn hover:bg-warn hover:text-ground",
+          record.blocked ? "Engeli kaldır" : "Kara listeye al"
+        ),
+        actionButton(
+          "Sil", plate, "delete",
+          "ml-1.5 border-bad/50 text-bad hover:bg-bad hover:text-white"
+        )
+      );
 
-      row.append(number, name, actions);
+      row.append(plateCell, ownerCell(record), statusCell, expiry, actions);
       body.append(row);
     });
 
-    el["plates-empty"].hidden = plates.length > 0;
-    setText(el["plates-count"], String(plates.length));
+    const total = state.plateRecords.length;
+    el["plates-empty"].hidden = records.length > 0;
+    el["plates-empty"].textContent = total
+      ? "Aramayla eşleşen plaka yok."
+      : "Kayıtlı plaka yok.";
+    setText(
+      el["plates-count"],
+      records.length === total ? String(total) : `${records.length}/${total}`
+    );
     applyPlatePermissions();
+  }
+
+  /** Case-insensitive substring match over plate, owner, apartment and note.
+   *
+   *  The plate is matched with its spacing stripped as well as with it, so
+   *  typing "34ABC" finds a plate the table shows as "34 ABC 123". */
+  function filterPlates() {
+    const needle = (el["plate-search"] ? el["plate-search"].value : "").trim().toLowerCase();
+    if (!needle) return state.plateRecords;
+
+    const bare = needle.replace(/\s+/g, "");
+    return state.plateRecords.filter((record) => {
+      const plate = String(record.plate || "").toLowerCase();
+      if (plate.includes(bare)) return true;
+      return [record.owner, record.apartment, record.note].some(
+        (value) => value && String(value).toLowerCase().includes(needle)
+      );
+    });
+  }
+
+  function refreshPlateTable() {
+    renderPlates(filterPlates());
   }
 
   async function loadPlates() {
     modalStatus(el["plates-status"], "Yükleniyor...", "muted");
     try {
       const result = await api("/api/plates");
-      renderPlates(result.plates || []);
+      // `records` carries the resident data; older servers send only `plates`.
+      state.plateRecords = result.records
+        || (result.plates || []).map((plate) => ({ plate, status: "active" }));
+      refreshPlateTable();
       modalStatus(el["plates-status"], "");
     } catch (err) {
       modalStatus(el["plates-status"], err.message, "bad");
@@ -1167,17 +1353,27 @@
     event.preventDefault();
     const plate = el["plate-input"].value.trim().toUpperCase();
     if (!plate) return;
-    const note = el["note-input"].value.trim();
+
+    // `PlateIn` forbids extra keys, so blank optional fields are omitted
+    // rather than sent as null.
+    const body = { plate };
+    const optional = {
+      owner: el["owner-input"],
+      apartment: el["apartment-input"],
+      note: el["note-input"],
+      expires_at: el["expires-input"],
+    };
+    Object.entries(optional).forEach(([key, input]) => {
+      const value = input && input.value.trim();
+      if (value) body[key] = value;
+    });
+    if (el["blocked-input"] && el["blocked-input"].checked) body.blocked = true;
 
     el["plate-add"].disabled = true;
     modalStatus(el["plates-status"], "Ekleniyor...", "muted");
     try {
-      // `PlateIn` forbids extra keys, so `note` is omitted rather than null
-      // when the operator left it blank.
-      const body = note ? { plate, note } : { plate };
       const result = await api("/api/plates", { method: "POST", body: JSON.stringify(body) });
-      el["plate-input"].value = "";
-      el["note-input"].value = "";
+      clearPlateForm();
       await loadPlates();
       modalStatus(el["plates-status"], `${formatPlate(result.plate)} eklendi.`, "ok");
     } catch (err) {
@@ -1188,7 +1384,16 @@
     }
   }
 
+  function clearPlateForm() {
+    ["plate-input", "owner-input", "apartment-input", "note-input", "expires-input"]
+      .forEach((id) => { if (el[id]) el[id].value = ""; });
+    if (el["blocked-input"]) el["blocked-input"].checked = false;
+  }
+
   async function removePlate(plate) {
+    if (!window.confirm(`${formatPlate(plate)} kalıcı olarak silinecek.\n\nDevam edilsin mi?`)) {
+      return;
+    }
     modalStatus(el["plates-status"], "Siliniyor...", "muted");
     try {
       await api(`/api/plates/${encodeURIComponent(plate)}`, { method: "DELETE" });
@@ -1199,8 +1404,31 @@
     }
   }
 
+  /** Flip the blocked flag.
+   *
+   *  PATCH with only `blocked`, so the owner, apartment, note and expiry the
+   *  toggle never asked about are left exactly as they were. */
+  async function setPlateBlocked(plate, blocked) {
+    modalStatus(el["plates-status"], blocked ? "Engelleniyor..." : "Engel kaldırılıyor...", "muted");
+    try {
+      await api(`/api/plates/${encodeURIComponent(plate)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ blocked }),
+      });
+      await loadPlates();
+      modalStatus(
+        el["plates-status"],
+        `${formatPlate(plate)} ${blocked ? "engellendi" : "tekrar aktif"}.`,
+        blocked ? "warn" : "ok"
+      );
+    } catch (err) {
+      modalStatus(el["plates-status"], err.message, "bad");
+    }
+  }
+
   function openPlates() {
     openModal("modal-plates");
+    if (el["plate-search"]) el["plate-search"].value = "";
     loadPlates();
   }
 
@@ -1558,8 +1786,14 @@
     // would mean rebinding on every refresh too.
     el["plate-rows"].addEventListener("click", (event) => {
       const button = event.target.closest("button[data-plate]");
-      if (button && !button.disabled) removePlate(button.dataset.plate);
+      if (!button || button.disabled) return;
+      const plate = button.dataset.plate;
+      if (button.dataset.action === "delete") removePlate(plate);
+      else if (button.dataset.action === "block") setPlateBlocked(plate, true);
+      else if (button.dataset.action === "unblock") setPlateBlocked(plate, false);
     });
+
+    if (el["plate-search"]) el["plate-search"].addEventListener("input", refreshPlateTable);
 
     el["history-refresh"].addEventListener("click", loadHistory);
     el["history-day"].addEventListener("change", loadHistory);

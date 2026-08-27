@@ -148,7 +148,8 @@
     </div>
 
     <div class="flex items-center justify-end gap-2 sm:gap-4">
-      <span id="user-label" class="hidden text-sm font-bold sm:inline"></span>
+      <!-- Username plus a role chip; filled by renderUserBadge(). -->
+      <span id="user-label" class="hidden items-center text-sm sm:inline-flex"></span>
       <span class="flex items-center gap-1.5">
         <span id="conn-dot" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
         <span id="conn-label" class="text-xs font-bold text-bad sm:text-sm">Bağlı Değil</span>
@@ -274,7 +275,7 @@
     <span id="toast" class="order-last w-full text-sm font-bold sm:order-none sm:w-auto" role="status" aria-live="polite"></span>
     <button id="btn-logout" type="button"
             class="min-h-[44px] flex-1 rounded-lg border-2 border-bad px-4 font-bold text-bad transition hover:bg-bad hover:text-white sm:ml-auto sm:flex-none sm:px-5 sm:py-3">
-      Oturumu Kapat
+      Çıkış Yap
     </button>
   </footer>
 </div>
@@ -310,34 +311,78 @@
       CSV sütunları: plate, owner, apartment, notes, expires_at
     </p>
 
+    <!-- Add form. Collapsed to plate + owner on a phone; the rest wraps onto
+         its own row rather than shrinking below a usable tap target. -->
     <form id="plate-form" class="shrink-0 border-b border-line px-4 py-4 sm:px-6">
-      <div class="flex flex-wrap items-end gap-3">
-        <div class="min-w-[8rem] flex-1">
-          <label for="plate-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">PLAKA</label>
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div class="col-span-2 sm:col-span-1">
+          <label for="plate-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">PLAKA *</label>
           <input id="plate-input" name="plate" type="text" required maxlength="16" data-autofocus
                  placeholder="34ABC123" autocomplete="off" spellcheck="false"
                  class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 font-mono text-lg font-bold uppercase tracking-wide text-ink outline-none transition placeholder:font-sans placeholder:text-base placeholder:font-normal placeholder:tracking-normal placeholder:text-muted/60 focus:border-accent">
         </div>
-        <div class="min-w-[10rem] flex-[2]">
+        <div class="col-span-2 sm:col-span-2">
+          <label for="owner-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">SAHİBİ</label>
+          <input id="owner-input" name="owner" type="text" maxlength="120"
+                 placeholder="Ahmet Yılmaz" autocomplete="off"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+        </div>
+        <div>
+          <label for="apartment-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">DAİRE</label>
+          <input id="apartment-input" name="apartment" type="text" maxlength="60"
+                 placeholder="B Blok D:12" autocomplete="off"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+        </div>
+        <div class="col-span-2 sm:col-span-2">
           <label for="note-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">NOT</label>
           <input id="note-input" name="note" type="text" maxlength="200"
                  placeholder="Müdür aracı" autocomplete="off"
                  class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
         </div>
-        <button id="plate-add" type="submit"
-                class="min-h-[44px] w-full rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto">
-          Ekle
-        </button>
+        <div>
+          <label for="expires-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">GEÇERLİLİK</label>
+          <input id="expires-input" name="expires_at" type="date"
+                 class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition focus:border-accent">
+        </div>
+        <div class="flex items-end gap-3">
+          <label class="flex min-h-[44px] cursor-pointer items-center gap-2 text-sm text-muted">
+            <input id="blocked-input" type="checkbox"
+                   class="h-4 w-4 rounded border-line bg-void accent-bad">
+            Engelli
+          </label>
+          <button id="plate-add" type="submit"
+                  class="ml-auto min-h-[44px] rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+            Ekle
+          </button>
+        </div>
       </div>
     </form>
 
+    <!-- Instant filter. Client-side over the already-loaded list: a resident
+         list is hundreds of rows, not thousands, so a round trip per keystroke
+         would be slower and less reliable than filtering what is in hand. -->
+    <div class="shrink-0 border-b border-line px-4 py-3 sm:px-6">
+      <label for="plate-search" class="sr-only">Ara</label>
+      <div class="relative">
+        <svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted"
+             viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path>
+        </svg>
+        <input id="plate-search" type="search" autocomplete="off"
+               placeholder="Plaka, sahibi, daire veya notta ara..."
+               class="min-h-[44px] w-full rounded-lg border border-line bg-void pl-10 pr-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+      </div>
+    </div>
+
     <div class="scroll-thin min-h-0 flex-1 overflow-auto">
-      <table class="w-full min-w-[22rem] border-collapse text-left">
+      <table class="w-full min-w-[40rem] border-collapse text-left">
         <thead class="sticky top-0 z-10 bg-chrome">
           <tr class="text-[11px] font-bold tracking-wider text-muted">
-            <th scope="col" class="w-12 px-4 py-2.5 sm:px-6">#</th>
-            <th scope="col" class="px-3 py-2.5">PLAKA</th>
-            <th scope="col" class="w-24 px-4 py-2.5 text-right sm:px-6">İŞLEM</th>
+            <th scope="col" class="px-4 py-2.5 sm:px-6">PLAKA</th>
+            <th scope="col" class="px-3 py-2.5">SAHİBİ / DAİRE</th>
+            <th scope="col" class="w-32 px-3 py-2.5">DURUM</th>
+            <th scope="col" class="w-32 px-3 py-2.5">GEÇERLİLİK</th>
+            <th scope="col" class="w-28 px-4 py-2.5 text-right sm:px-6">İŞLEM</th>
           </tr>
         </thead>
         <tbody id="plate-rows" class="divide-y divide-line/60"></tbody>
@@ -346,7 +391,7 @@
     </div>
 
     <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">
-      <span id="plates-count" class="font-mono text-sm font-bold text-accent">0</span>
+      <span id="plates-count" class="shrink-0 font-mono text-sm font-bold text-accent">0</span>
       <!-- Bulk transfer. Admin-only, and hidden outright for an operator so
            nobody is offered a button that can only ever return 403. -->
       <div id="plates-io" hidden class="flex w-full flex-wrap items-center gap-2 sm:w-auto">
@@ -473,8 +518,10 @@
     </header>
 
     <form id="settings-form" class="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-4 py-5 sm:px-6">
-      <!-- Capacity: server-side, so every tablet on the site agrees. -->
-      <div>
+      <!-- Capacity: server-side, so every tablet on the site agrees -- and
+           admin-only, so the whole block is hidden for an operator. The stream
+           quality below it is a per-device preference and stays visible. -->
+      <div id="capacity-section">
         <label for="capacity-input" class="block text-sm font-bold">Otopark Kapasitesi</label>
         <p class="mt-0.5 text-xs text-muted">
           Sunucuda saklanır ve tüm cihazlarda geçerlidir. Doluluk bu sayıya ulaşınca
@@ -488,7 +535,7 @@
         </div>
       </div>
 
-      <div class="h-px bg-line"></div>
+      <div id="capacity-divider" class="h-px bg-line"></div>
 
       <!-- Stream quality: a per-device display preference, so localStorage is
            the right home for it. A phone on mobile data wants a lighter

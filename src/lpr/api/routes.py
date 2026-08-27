@@ -51,8 +51,10 @@ from lpr.api.schemas import (
     PipelineStateOut,
     PlateIn,
     PlateListOut,
+    PlateDetailOut,
     PlateImportOut,
     PlateOut,
+    PlateUpdateIn,
     RegisterIn,
     RelayTriggerOut,
     StatsOut,
@@ -62,6 +64,7 @@ from lpr.api.schemas import (
     UserOut,
     VersionOut,
     normalize_plate,
+    plate_status,
 )
 from lpr.api.security import (
     ADMIN_ROLE,
@@ -145,6 +148,17 @@ def _camera_status_dicts(pipeline: Any) -> list[dict[str, Any]]:
 async def _in_thread(func: Any, *args: Any) -> Any:
     """Run a blocking repository/pipeline call off the event loop."""
     return await asyncio.get_running_loop().run_in_executor(None, func, *args)
+
+
+async def _in_thread_kw(func: Any, *args: Any, **kwargs: Any) -> Any:
+    """As :func:`_in_thread`, for calls that need keyword arguments.
+
+    ``run_in_executor`` takes positional arguments only, so the call is closed
+    over instead. Separate from ``_in_thread`` rather than replacing it: the
+    positional form is used on nearly every route and does not need the extra
+    lambda.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, lambda: func(*args, **kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +340,41 @@ async def list_users(_: AdminUser, user_repo: deps.UserRepo) -> list[UserOut]:
     summary="Kayıtlı plakalar",
 )
 async def list_plates(_: CurrentUser, plate_repo: deps.PlateRepo) -> PlateListOut:
-    plates = await _in_thread(plate_repo.all)
-    return PlateListOut(plates=list(plates), count=len(plates))
+    """Every registered plate, as bare strings *and* as resident records.
+
+    Both shapes come back from one request. ``plates`` is what the desktop
+    client has always consumed and stays a list of strings; ``records`` carries
+    the owner, apartment, expiry and derived status the management screen
+    renders. Serving them together keeps the screen to a single round trip and
+    guarantees the two views cannot disagree.
+    """
+    rows = await _in_thread(_plate_records, plate_repo)
+    return PlateListOut(
+        plates=[row["plate"] for row in rows],
+        records=[PlateDetailOut.model_validate(row) for row in rows],
+        count=len(rows),
+    )
+
+
+def _plate_records(plate_repo: Any) -> list[dict[str, Any]]:
+    """Detailed rows with ``status`` attached, or bare plates on an old repo.
+
+    ``all_detailed`` is the richer call; a repository that predates it (or a
+    test double standing in for one) still yields a usable list rather than an
+    error, because the plate list is the screen an operator opens first.
+    """
+    detailed = getattr(plate_repo, "all_detailed", None)
+    if not callable(detailed):
+        return [{"plate": plate} for plate in plate_repo.all()]
+
+    now = utc_now_iso()
+    rows: list[dict[str, Any]] = []
+    for row in detailed():
+        record = dict(row)
+        record["blocked"] = bool(record.get("blocked"))
+        record["status"] = plate_status(record, now)
+        rows.append(record)
+    return rows
 
 
 @router.post(
@@ -338,7 +385,28 @@ async def list_plates(_: CurrentUser, plate_repo: deps.PlateRepo) -> PlateListOu
     summary="Plaka ekle",
 )
 async def add_plate(payload: PlateIn, _: AdminUser, plate_repo: deps.PlateRepo) -> PlateOut:
-    added = await _in_thread(plate_repo.add, payload.plate, payload.note)
+    """Register one plate, with resident details when the caller supplied them.
+
+    Still a 409 on a duplicate rather than a silent overwrite: adding a plate
+    that is already there is a mistake worth telling the operator about. Bulk
+    replacement is what ``POST /api/plates/import?overwrite=true`` is for.
+    """
+    upsert = getattr(plate_repo, "upsert", None)
+    if callable(upsert):
+        outcome = await _in_thread_kw(
+            upsert,
+            payload.plate,
+            owner=payload.owner,
+            apartment=payload.apartment,
+            note=payload.note,
+            expires_at=payload.expires_at,
+            blocked=payload.blocked,
+            overwrite=False,
+        )
+        added = outcome == "added"
+    else:  # pragma: no cover - repository predating the resident columns
+        added = await _in_thread(plate_repo.add, payload.plate, payload.note)
+
     if not added:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -346,6 +414,54 @@ async def add_plate(payload: PlateIn, _: AdminUser, plate_repo: deps.PlateRepo) 
         )
     logger.info("Plaka eklendi: %s", payload.plate)
     return PlateOut(plate=payload.plate, registered=True)
+
+
+@router.patch(
+    "/api/plates/{plate}",
+    response_model=PlateDetailOut,
+    tags=["plates"],
+    summary="Plaka kaydını güncelle",
+)
+async def update_plate(
+    payload: PlateUpdateIn,
+    _: AdminUser,
+    plate_repo: deps.PlateRepo,
+    plate: Annotated[str, Path(min_length=1, max_length=32, examples=["34ABC123"])],
+) -> PlateDetailOut:
+    """Patch one resident record. Only the fields sent are written.
+
+    This is what the dashboard's block toggle uses: ``{"blocked": true}``
+    changes the flag and leaves owner, apartment, note and expiry exactly as
+    they were. A full-overwrite PUT would make the toggle destructive.
+    """
+    normalized = normalize_plate(plate)
+    changes = payload.changes()
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Güncellenecek alan belirtilmedi",
+        )
+
+    updater = getattr(plate_repo, "update", None)
+    if not callable(updater):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Plaka güncelleme desteklenmiyor",
+        )
+
+    changed = await _in_thread_kw(updater, normalized, **changes)
+    if not changed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plaka bulunamadı: {normalized}",
+        )
+
+    row = await _in_thread(plate_repo.get, normalized) or {"plate": normalized}
+    record = dict(row)
+    record["blocked"] = bool(record.get("blocked"))
+    record["status"] = plate_status(record)
+    logger.info("Plaka güncellendi: %s (%s)", normalized, ", ".join(changes))
+    return PlateDetailOut.model_validate(record)
 
 
 @router.delete(
