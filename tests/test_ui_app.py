@@ -43,6 +43,21 @@ class StubLogPane:
         self.events.append(event)
 
 
+class StubPane:
+    def __init__(self) -> None:
+        self.images: list[Any] = []
+        self.connected: list[bool] = []
+
+    def set_image(self, image: Any) -> None:
+        self.images.append(image)
+
+    def set_connected(self, connected: bool, fps: float = 0.0) -> None:
+        self.connected.append(connected)
+
+    def clear_image(self) -> None:
+        self.images.clear()
+
+
 class StubView:
     def __init__(self) -> None:
         self.log_pane = StubLogPane()
@@ -50,6 +65,15 @@ class StubView:
         self.cameras: list[Any] = []
         self.banners: list[tuple[bool, str]] = []
         self.uptime: list[str] = []
+        self.panes: dict[str, StubPane] = {"entry": StubPane(), "exit": StubPane()}
+        self.license_texts: list[tuple[str, bool]] = []
+        self.license_locks: list[tuple[bool, str]] = []
+
+    def set_license_text(self, text: str, ok: bool = True) -> None:
+        self.license_texts.append((text, ok))
+
+    def set_license_locked(self, locked: bool, message: str = "") -> None:
+        self.license_locks.append((locked, message))
 
     def set_activity(self, text: str) -> None:
         self.activity.append(text)
@@ -84,6 +108,9 @@ def make_app(messages: list[dict[str, Any]] | None = None) -> tuple[LprApp, Stub
     app._events = StubStream(messages or [])  # type: ignore[attr-defined]
     app._started_at = 0.0  # type: ignore[attr-defined]
     app._last_uptime_second = -1  # type: ignore[attr-defined]
+    app._license = {}  # type: ignore[attr-defined]
+    app._license_locked = False  # type: ignore[attr-defined]
+    app._license_dialog = None  # type: ignore[attr-defined]
     return app, root, view
 
 
@@ -185,6 +212,111 @@ def test_events_are_dropped_when_no_view_is_mounted() -> None:
     app, _root, _view = make_app()
     app.main_view = None  # type: ignore[attr-defined]
     app._handle_event({"type": "event", "data": {"plate": "34ABC123"}})
+
+
+# ---------------------------------------------------------------------------
+# Licence lockdown
+# ---------------------------------------------------------------------------
+
+
+def _watch_license_dialog(app: LprApp) -> list[int]:
+    """Replace ``open_license`` so no real Toplevel is built."""
+    opened: list[int] = []
+    app.open_license = lambda: opened.append(1)  # type: ignore[method-assign]
+    return opened
+
+
+def test_an_invalid_licence_freezes_the_view_and_asks_for_a_key() -> None:
+    app, _root, view = make_app()
+    opened = _watch_license_dialog(app)
+
+    app._apply_license(
+        {"valid": False, "reason": "expired", "detail": "Lisans süresi doldu."}
+    )
+
+    assert app._license_locked is True
+    assert view.license_locks == [(True, "Lisans süresi doldu.")]
+    assert opened == [1], "the operator must be prompted for a new key"
+
+
+def test_a_frozen_view_renders_no_further_frames() -> None:
+    app, _root, view = make_app()
+    _watch_license_dialog(app)
+    app._apply_license({"valid": False, "reason": "expired", "detail": "bitti"})
+
+    app._handle("frame", ("entry", object()))
+
+    assert view.panes["entry"].images == []
+
+
+def test_a_valid_licence_thaws_the_view() -> None:
+    app, _root, view = make_app()
+    _watch_license_dialog(app)
+    app._apply_license({"valid": False, "reason": "expired", "detail": "bitti"})
+    view.license_locks.clear()
+
+    app._apply_license(
+        {"valid": True, "reason": "ok", "detail": "Lisans geçerli.", "days_remaining": 12.0}
+    )
+
+    assert app._license_locked is False
+    assert view.license_locks == [(False, "Lisans geçerli.")]
+    assert view.license_texts[-1][1] is True
+
+    marker = object()
+    app._handle("frame", ("entry", marker))
+    assert view.panes["entry"].images == [marker]
+
+
+def test_the_lock_state_is_not_reapplied_on_every_poll() -> None:
+    """Two identical polls must not re-open the dialog."""
+    app, _root, view = make_app()
+    opened = _watch_license_dialog(app)
+    payload = {"valid": False, "reason": "expired", "detail": "bitti"}
+
+    app._apply_license(dict(payload))
+    app._apply_license(dict(payload))
+
+    assert opened == [1]
+    assert len(view.license_locks) == 1
+
+
+def test_a_pushed_licence_event_locks_immediately() -> None:
+    """The WebSocket path, so a site locks without waiting for a poll."""
+    app, _root, view = make_app()
+    _watch_license_dialog(app)
+
+    app._handle_event(
+        {"type": "license", "license": {"valid": False, "reason": "expired", "detail": "bitti"}}
+    )
+
+    assert view.license_locks == [(True, "bitti")]
+
+
+def test_a_rejected_key_leaves_the_view_locked() -> None:
+    app, _root, view = make_app()
+    _watch_license_dialog(app)
+    app._apply_license({"valid": False, "reason": "expired", "detail": "bitti"})
+    view.license_locks.clear()
+
+    app._handle("license_result", (False, "[400] Lisans anahtarı geçersiz.", None))
+
+    assert app._license_locked is True
+    assert view.license_locks == []
+
+
+def test_an_accepted_key_unlocks_the_view() -> None:
+    app, _root, view = make_app()
+    _watch_license_dialog(app)
+    app._apply_license({"valid": False, "reason": "expired", "detail": "bitti"})
+
+    app._handle(
+        "license_result",
+        (True, "", {"valid": True, "reason": "ok", "detail": "Lisans geçerli."}),
+    )
+
+    assert app._license_locked is False
+    assert view.license_locks[-1][0] is False
 
 
 # ---------------------------------------------------------------------------

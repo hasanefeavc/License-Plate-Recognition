@@ -5,7 +5,8 @@ This is the object the API and the GUI both drive. It owns, per camera:
 * a :class:`~lpr.pipeline.camera.CameraWorker` capture thread, and
 * a processing thread that consumes that camera's queue.
 
-and, process-wide, a retention thread that trims the ``logs`` table.
+and, process-wide, a snapshot-writer thread and a retention thread that
+trims both the ``logs`` table and the snapshot folder.
 
 Dependency injection on purpose
 -------------------------------
@@ -18,12 +19,16 @@ wires the real implementations in.
 
 What runs where
 ---------------
-Nothing slow happens on the capture path. The detector only sees every
-``detection.frame_stride``-th frame (the main CPU saving), JPEG encoding
+Nothing slow happens on the capture path. Frame enhancement, when it is
+enabled, runs here on the processing thread and only on the frames that have
+already passed the motion gate and the stride filter. The detector only sees
+every ``detection.frame_stride``-th frame (the main CPU saving), JPEG encoding
 happens lazily in :meth:`PipelineOrchestrator.latest_frame_jpeg` when a
 viewer actually asks for a frame, and the relay pulse is fire-and-forget.
-Subscriber queues are bounded and drop their oldest item when full, so a
-slow WebSocket client degrades its own stream instead of stalling
+Event snapshots follow the same rule: the decision path only queues the
+frame, and :mod:`lpr.pipeline.snapshots` encodes and writes it on its own
+thread. Subscriber queues are bounded and drop their oldest item when full,
+so a slow WebSocket client degrades its own stream instead of stalling
 recognition.
 """
 
@@ -33,6 +38,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from lpr.contracts import (
@@ -54,6 +60,7 @@ from lpr.contracts import (
 from lpr.db import LogRepository, PlateRepository, init_db
 from lpr.db.connection import close_all as close_thread_connection
 from lpr.pipeline.camera import CameraWorker
+from lpr.pipeline.snapshots import SnapshotWriter
 
 if TYPE_CHECKING:  # pragma: no cover
     from lpr.config import CameraConfig, Settings
@@ -81,6 +88,7 @@ class PipelineOrchestrator:
         recognizer: Recognizer,
         voter: Voter,
         relay: Relay,
+        frame_preprocessor: Callable[[Frame], Frame] | None = None,
     ) -> None:
         if settings is None:  # convenience for callers that have no Settings yet
             from lpr.config import get_settings
@@ -92,6 +100,10 @@ class PipelineOrchestrator:
         self._recognizer = recognizer
         self._voter = voter
         self._relay = relay
+        #: Optional whole-frame enhancement, applied on the processing thread
+        #: just before detection. Injected by :mod:`lpr.pipeline.factory` so
+        #: this module keeps its "imports nothing from lpr.detect" property.
+        self._frame_preprocessor = frame_preprocessor
 
         # Optional capabilities, probed once. A detector that tracks gets one
         # tracker state per camera; a voter that understands tracks gets to
@@ -113,9 +125,25 @@ class PipelineOrchestrator:
         self._plates = PlateRepository()
         self._logs = LogRepository()
 
+        # Evidence retention. Built here (so it is available to tests that
+        # never call start()), started and stopped with the pipeline.
+        snapshots = settings.snapshots
+        self._snapshots = SnapshotWriter(
+            settings.paths.snapshots_dir,
+            quality=snapshots.jpeg_quality,
+            queue_size=snapshots.queue_size,
+            retention_days=snapshots.retention_days,
+            enabled=snapshots.enabled,
+        )
+
         self._cameras: dict[str, CameraWorker] = {}
         self._threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
+        #: Set = inference and gate decisions are suspended. Capture keeps
+        #: running so the live view stays available and so resuming is
+        #: instant; only the expensive, side-effecting half is gated. Used by
+        #: the operator's pause button *and* by the licence watchdog.
+        self._pause_event = threading.Event()
         self._lifecycle_lock = threading.RLock()
         self._running = False
 
@@ -150,6 +178,7 @@ class PipelineOrchestrator:
 
             init_db()
             self._stop_event.clear()
+            self._snapshots.start()
             self._warmup()
 
             for role, camera_config in self._camera_configs():
@@ -198,6 +227,12 @@ class PipelineOrchestrator:
                 if thread.is_alive():
                     logger.warning("Thread %s did not stop within the timeout", thread.name)
 
+            # After the processing threads are joined, so nothing can queue
+            # a snapshot while the writer is draining. Given a floor of its
+            # own rather than whatever is left of the budget: shutting down
+            # should not routinely discard the last image of the day.
+            self._snapshots.stop(timeout=max(0.5, deadline - time.monotonic()))
+
             self._cameras.clear()
             self._threads.clear()
             self._running = False
@@ -215,6 +250,33 @@ class PipelineOrchestrator:
     @property
     def running(self) -> bool:
         return self._running
+
+    # ------------------------------------------------------------------
+    # Pause / resume
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Suspend detection, OCR and gate decisions. Idempotent.
+
+        Frames keep being captured and published (the operator can still see
+        the cameras), but nothing is inferred, no relay is triggered and no
+        decision is written. This is what an expired licence halts, and it is
+        deliberately not ``stop()``: threads stay alive so a new key resumes
+        processing without a restart.
+        """
+        if not self._pause_event.is_set():
+            self._pause_event.set()
+            logger.info("Pipeline paused: detection and relay suspended")
+
+    def resume(self) -> None:
+        """Undo :meth:`pause`. Idempotent."""
+        if self._pause_event.is_set():
+            self._pause_event.clear()
+            logger.info("Pipeline resumed")
+
+    @property
+    def paused(self) -> bool:
+        return self._pause_event.is_set()
 
     # ------------------------------------------------------------------
     # Introspection
@@ -407,6 +469,12 @@ class PipelineOrchestrator:
                 with self._frame_lock:
                     self._latest_frames[role] = frame
 
+                if self._pause_event.is_set():
+                    # Paused (operator, or an invalid licence): the frame is
+                    # still published for the live view, but it costs nothing
+                    # further -- no detector, no OCR, no relay.
+                    continue
+
                 frame_index += 1
                 if frame_index % self._frame_stride != 0:
                     continue
@@ -427,7 +495,15 @@ class PipelineOrchestrator:
         pipeline deterministically without threads.
         """
         events: list[LprEvent] = []
-        detections = self._detect(camera, frame)
+        if self._pause_event.is_set():
+            # Also checked here, not only in the loop: process_frame() is
+            # public and is what the tests and any future caller drive.
+            return events
+
+        # Detection (and therefore every crop cut out of it) runs on the
+        # enhanced frame; `frame` itself stays untouched, so the live view and
+        # the snapshot written further down remain what the camera saw.
+        detections = self._detect(camera, self._prepare_frame(frame))
         if not detections:
             return events
 
@@ -488,12 +564,53 @@ class PipelineOrchestrator:
             event = self.decide(camera, confirmed, read.confidence)
             if event is not None:
                 events.append(event)
+                self._capture_snapshot(camera, event, frame)
                 if self._track_voter is not None:
                     self._track_voter.note_decision(camera, track_id, confirmed)
 
         return events
 
+    def _capture_snapshot(self, camera: str, event: LprEvent, frame: Frame) -> None:
+        """Queue the frame behind one decision as evidence.
+
+        Cooldown events are skipped on purpose: a car idling under the camera
+        re-confirms its plate on every pass, and photographing each one would
+        fill the disk with the same bumper. Refusals *are* photographed --
+        an unregistered vehicle at the barrier is exactly what an operator
+        goes looking for afterwards.
+        """
+        if event.action == str(Action.COOLDOWN):
+            return
+        self._snapshots.submit(event.plate, frame, camera=camera)
+
+    @property
+    def snapshots(self) -> SnapshotWriter:
+        """The evidence writer, for the API's stats and for tests."""
+        return self._snapshots
+
     # -- optional-capability shims --------------------------------------
+
+    def _prepare_frame(self, frame: Frame) -> Frame:
+        """Apply the injected frame preprocessor, if there is one.
+
+        Runs on the per-camera *processing* thread, never on the capture
+        thread: the capture loop's only job is to keep draining the camera, and
+        anything slow there shows up as dropped frames rather than as latency.
+        By the time a frame reaches here it has already survived the motion
+        gate and the ``frame_stride`` decimation, so the cost is paid on the
+        handful of frames per second that are actually going to be looked at.
+
+        Failures fall back to the original frame -- a preprocessor that throws
+        must cost one frame's enhancement, not the frame.
+        """
+        if self._frame_preprocessor is None:
+            return frame
+        try:
+            enhanced = self._frame_preprocessor(frame)
+        except Exception:
+            logger.debug("frame preprocessing failed; using the raw frame", exc_info=True)
+            return frame
+        return enhanced if enhanced is not None else frame
 
     def _detect(self, camera: str, frame: Frame) -> list[PlateDetection]:
         """Detect, giving each camera its own tracker state where supported."""
@@ -515,6 +632,12 @@ class PipelineOrchestrator:
         Returns the event that was produced, or the cooldown event when the
         same plate is still inside its ``voting.cooldown_s`` window.
         """
+        if self._pause_event.is_set():
+            # Last line of defence for the gate itself: whatever path reaches
+            # a decision while paused, the barrier does not move.
+            logger.debug("Camera %s: %s ignored, pipeline paused", camera, plate)
+            return None
+
         key = (camera, plate)
         now = time.monotonic()
 
@@ -594,11 +717,15 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
 
     def _retention_loop(self) -> None:
-        """Purge old log rows now, then once a day.
+        """Purge old log rows and old snapshots now, then once a day.
 
         Runs on its own thread so the (potentially slow) first delete does
         not delay startup, and uses ``Event.wait`` so ``stop()`` interrupts
         it immediately instead of after up to 24 hours.
+
+        Both stores are trimmed from this one thread rather than from two:
+        they share a cadence, and a single pass keeps a log row and the image
+        it refers to expiring together.
         """
         days = int(self._settings.database.log_retention_days)
         try:
@@ -607,6 +734,10 @@ class PipelineOrchestrator:
                     self._logs.purge_older_than(days)
                 except Exception:
                     logger.exception("Log retention pass failed")
+                try:
+                    self._snapshots.purge_older_than()
+                except Exception:
+                    logger.exception("Snapshot retention pass failed")
                 if self._stop_event.wait(RETENTION_INTERVAL_S):
                     break
         finally:

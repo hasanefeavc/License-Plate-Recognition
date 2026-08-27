@@ -17,9 +17,12 @@ np = pytest.importorskip("numpy", reason="numpy is required for detection tests"
 from lpr.detect.preprocess import (  # noqa: E402  (must follow the skip guards)
     crop_with_padding,
     deskew,
+    enhance_frame,
     enhance_plate,
     letterbox,
+    rectify_perspective,
     sharpness,
+    unsharp_mask,
 )
 from lpr.detect.yolo import plausible_box  # noqa: E402
 
@@ -238,6 +241,184 @@ def test_deskew_returns_the_input_when_it_cannot_estimate() -> None:
     assert deskew(flat) is flat
     tiny = np.zeros((3, 3, 3), dtype=np.uint8)
     assert deskew(tiny) is tiny
+
+
+# ---------------------------------------------------------------------------
+# unsharp_mask
+# ---------------------------------------------------------------------------
+
+
+def make_soft_plate(height: int = 60, width: int = 240) -> "np.ndarray":
+    """A plate crop whose glyph edges have been blurred, as a soft optic would."""
+    return cv2.GaussianBlur(make_plate_crop(height, width), (5, 5), 0)
+
+
+def test_unsharp_mask_raises_edge_contrast() -> None:
+    """The point of sharpening: measurably crisper edges than the input."""
+    soft = make_soft_plate()
+    assert sharpness(unsharp_mask(soft, amount=0.8)) > sharpness(soft)
+
+
+def test_unsharp_mask_is_a_no_op_at_zero_amount() -> None:
+    crop = make_soft_plate()
+    assert unsharp_mask(crop, amount=0.0) is crop
+
+
+def test_unsharp_mask_does_not_modify_its_input() -> None:
+    """Frames are shared with the live view and the snapshot writer."""
+    crop = make_soft_plate()
+    before = crop.copy()
+    unsharp_mask(crop, amount=1.0)
+    assert np.array_equal(crop, before)
+
+
+def test_unsharp_mask_threshold_protects_flat_regions() -> None:
+    """Sensor noise on a flat plate background must not be amplified."""
+    noisy_flat = np.full((60, 240), 128, dtype=np.uint8)
+    rng = np.random.default_rng(0)
+    noisy_flat = np.clip(
+        noisy_flat.astype(np.int16) + rng.integers(-2, 3, noisy_flat.shape), 0, 255
+    ).astype(np.uint8)
+
+    guarded = unsharp_mask(noisy_flat, amount=2.0, threshold=6)
+    unguarded = unsharp_mask(noisy_flat, amount=2.0, threshold=0)
+    assert float(guarded.std()) < float(unguarded.std())
+
+
+def test_unsharp_mask_saturates_instead_of_wrapping() -> None:
+    """uint8 overflow would turn a highlight into a black hole."""
+    crop = make_plate_crop()
+    assert unsharp_mask(crop, amount=3.0).max() <= 255
+
+
+def test_unsharp_mask_never_raises_on_junk() -> None:
+    assert unsharp_mask(None) is None  # type: ignore[arg-type]
+    empty = np.zeros((0, 0), dtype=np.uint8)
+    assert unsharp_mask(empty) is empty
+
+
+# ---------------------------------------------------------------------------
+# enhance_frame
+# ---------------------------------------------------------------------------
+
+
+def make_dark_frame(height: int = 240, width: int = 320) -> "np.ndarray":
+    """A low-contrast night frame: everything squeezed into a narrow band."""
+    rng = np.random.default_rng(1)
+    return rng.integers(40, 90, (height, width, 3), dtype=np.uint8)
+
+
+def test_enhance_frame_expands_contrast() -> None:
+    frame = make_dark_frame()
+    assert float(enhance_frame(frame).std()) > float(frame.std())
+
+
+def test_enhance_frame_preserves_shape_and_dtype() -> None:
+    frame = make_dark_frame()
+    enhanced = enhance_frame(frame)
+    assert enhanced.shape == frame.shape
+    assert enhanced.dtype == frame.dtype
+
+
+def test_enhance_frame_does_not_modify_its_input() -> None:
+    """The untouched frame is what the live view and the snapshot record."""
+    frame = make_dark_frame()
+    before = frame.copy()
+    enhance_frame(frame)
+    assert np.array_equal(frame, before)
+
+
+def test_enhance_frame_handles_a_grayscale_frame() -> None:
+    gray = cv2.cvtColor(make_dark_frame(), cv2.COLOR_BGR2GRAY)
+    enhanced = enhance_frame(gray)
+    assert enhanced.shape == gray.shape
+    assert enhanced.ndim == 2
+
+
+def test_enhance_frame_leaves_colour_roughly_alone() -> None:
+    """CLAHE runs on LAB lightness, so hue must not swing wildly."""
+    frame = make_dark_frame()
+    enhanced = enhance_frame(frame)
+    before = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 0].astype(float)
+    after = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)[:, :, 0].astype(float)
+    assert abs(float(before.mean()) - float(after.mean())) < 15.0
+
+
+def test_enhance_frame_never_raises_on_junk() -> None:
+    assert enhance_frame(None) is None  # type: ignore[arg-type]
+    empty = np.zeros((0, 0, 3), dtype=np.uint8)
+    assert enhance_frame(empty) is empty
+
+
+# ---------------------------------------------------------------------------
+# rectify_perspective
+# ---------------------------------------------------------------------------
+
+
+def make_plate_scene(height: int = 60, width: int = 240) -> "np.ndarray":
+    """A bordered plate sitting on a dark bumper, i.e. with an outline to find."""
+    scene = np.full((height + 40, width + 80, 3), 40, dtype=np.uint8)
+    plate = np.full((height, width, 3), 240, dtype=np.uint8)
+    cv2.rectangle(plate, (0, 0), (width - 1, height - 1), (30, 30, 30), 2)
+    for index in range(6):
+        x = 15 + index * 38
+        plate[12 : height - 12, x : x + 16] = 20
+    scene[20 : 20 + height, 40 : 40 + width] = plate
+    return scene
+
+
+def skew(scene: "np.ndarray", pinch: int = 10) -> "np.ndarray":
+    """Squash the left edge vertically, as a plate seen from the side would be."""
+    height, width = scene.shape[:2]
+    source = np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]])
+    target = np.float32(
+        [[0, pinch], [width - 1, 0], [width - 1, height - 1], [0, height - 1 - pinch]]
+    )
+    return cv2.warpPerspective(
+        scene,
+        cv2.getPerspectiveTransform(source, target),
+        (width, height),
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def test_rectify_perspective_flattens_an_angled_plate() -> None:
+    """The whole point: a side-view plate comes back plate-shaped."""
+    rectified = rectify_perspective(skew(make_plate_scene()))
+    assert rectified is not None
+    aspect = rectified.shape[1] / rectified.shape[0]
+    assert 1.2 <= aspect <= 8.0
+
+
+def test_rectify_perspective_output_is_more_rectangular_than_the_input() -> None:
+    """The far edge is stretched back up towards the near one."""
+    skewed = skew(make_plate_scene(), pinch=14)
+    rectified = rectify_perspective(skewed)
+    assert rectified is not None
+    # The plate occupied ~4:1 before the skew; rectification should land nearer
+    # that than the skewed crop's own bounding box does.
+    assert rectified.shape[0] > 8 and rectified.shape[1] > 16
+
+
+def test_rectify_perspective_declines_when_there_is_no_outline() -> None:
+    """No trustworthy quad means None, so the caller keeps what it had."""
+    assert rectify_perspective(np.full((60, 240, 3), 200, dtype=np.uint8)) is None
+
+
+def test_rectify_perspective_rejects_the_crop_border_as_a_quad() -> None:
+    """Edge detection finds the crop's own rectangle; warping it is a no-op."""
+    rng = np.random.default_rng(0)
+    noise = rng.integers(0, 255, (60, 240, 3), dtype=np.uint8)
+    assert rectify_perspective(noise) is None
+
+
+def test_rectify_perspective_declines_on_a_crop_too_small_to_judge() -> None:
+    assert rectify_perspective(np.zeros((8, 8, 3), dtype=np.uint8)) is None
+
+
+def test_rectify_perspective_never_raises_on_junk() -> None:
+    assert rectify_perspective(None) is None  # type: ignore[arg-type]
+    assert rectify_perspective(np.zeros((0, 0, 3), dtype=np.uint8)) is None
 
 
 # ---------------------------------------------------------------------------

@@ -73,6 +73,10 @@ WORKDIR /app
 
 COPY src/ /app/src/
 COPY config.yaml /app/config.yaml
+# The browser dashboard is static content served at /web. It is part of the
+# image, not a volume: it ships with the code it talks to and nothing writes
+# to it at runtime.
+COPY web/ /app/web/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

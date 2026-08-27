@@ -45,6 +45,7 @@ __all__ = [
     "CameraInfo",
     "EventStream",
     "HealthInfo",
+    "LicenseInfo",
     "LogEntry",
     "LprApiError",
     "LprClient",
@@ -97,6 +98,18 @@ class StatsInfo(TypedDict, total=False):
     grants: int
     denials: int
     cameras: list[CameraInfo]
+
+
+class LicenseInfo(TypedDict, total=False):
+    valid: bool
+    reason: str
+    detail: str
+    client: str | None
+    issued_at: str | None
+    expires_at: str | None
+    seconds_remaining: float | None
+    days_remaining: float | None
+    pipeline_halted: bool
 
 
 class HealthInfo(TypedDict, total=False):
@@ -310,6 +323,27 @@ class LprClient:
         """Flat operational counters: uptime, reads, and the work skipped."""
         data = self._request("GET", "/api/metrics", expected=(200,))
         return data if isinstance(data, dict) else {}
+
+    # -- licence --------------------------------------------------------
+
+    def license_status(self) -> LicenseInfo:
+        """Current licence state as the server sees it."""
+        data = self._request("GET", "/api/license", expected=(200,))
+        return data if isinstance(data, dict) else {}  # type: ignore[return-value]
+
+    def activate_license(self, key: str) -> LicenseInfo:
+        """Submit a new licence key. Raises :class:`LprApiError` if rejected.
+
+        A 400 here is the normal, expected answer for a mistyped or expired
+        key: its ``detail`` is the sentence to show the operator.
+        """
+        data = self._request(
+            "POST",
+            "/api/license",
+            json_body={"key": "".join((key or "").split())},
+            expected=(200, 201),
+        )
+        return data if isinstance(data, dict) else {}  # type: ignore[return-value]
 
     def cameras(self) -> list[CameraInfo]:
         data = self._request("GET", "/api/cameras", expected=(200,))

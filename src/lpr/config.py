@@ -47,6 +47,10 @@ class AppConfig(BaseModel):
     log_level: str = "INFO"
     data_dir: str = "data"
     models_dir: str = "models"
+    #: Browser dashboard served at ``/web``. Unlike the other two this is
+    #: read-only content that ships with the source, so it is never created
+    #: -- a missing directory just means the web UI is not served.
+    web_dir: str = "web"
 
 
 class CameraConfig(BaseModel):
@@ -123,6 +127,37 @@ class DetectionConfig(BaseModel):
     prefer_onnx: bool = True
 
 
+class PreprocessConfig(BaseModel):
+    """Software-level image enhancement, applied before detection and OCR.
+
+    The crop-level settings (``crop_*``, ``rectify_perspective``) are on by
+    default: they only ever affect what the *recogniser* sees, and the
+    recogniser keeps the best read across several variants, so a variant that
+    an enhancement made worse simply loses.
+
+    ``frame_enhance`` is different and therefore defaults to off. It changes
+    what the *detector* sees, and the detector is a trained CNN with no
+    corresponding voting fallback -- a frame it fails to fire on is a plate
+    that never reaches OCR at all. Mild CLAHE usually helps in low light and
+    can cost recall in good light, so turn it on only after checking detection
+    counts against your own footage.
+    """
+
+    #: Run CLAHE + unsharp over the whole frame before the detector sees it.
+    frame_enhance: bool = False
+    #: CLAHE clip limit for the whole-frame pass. Higher lifts shadows harder
+    #: and amplifies sensor noise with them.
+    frame_clahe_clip: float = Field(default=2.0, ge=0.1, le=10.0)
+    #: Unsharp strength for the whole-frame pass. Kept below the crop-level
+    #: amount: the detector wants a natural-looking frame, not a crisp one.
+    frame_unsharp_amount: float = Field(default=0.5, ge=0.0, le=3.0)
+    #: Unsharp strength inside the OCR crop pre-pass. 0 disables sharpening.
+    crop_unsharp_amount: float = Field(default=0.6, ge=0.0, le=3.0)
+    #: Retry a failed read on a perspective-corrected copy of the crop. Costs
+    #: an extra OCR pass, but only on crops that produced no valid plate.
+    rectify_perspective: bool = True
+
+
 class OcrConfig(BaseModel):
     backend: str = "easyocr"
     gpu: bool = False
@@ -168,6 +203,32 @@ class RelayConfig(BaseModel):
 class DatabaseConfig(BaseModel):
     path: str = "data/plates.db"
     log_retention_days: int = 10
+
+
+class SnapshotsConfig(BaseModel):
+    """Event snapshots: one JPEG per gate decision, on a rolling window."""
+
+    enabled: bool = True
+    #: Empty means ``<app.data_dir>/snapshots``. Set an absolute (or
+    #: cwd-relative) path to put the images -- which grow far faster than the
+    #: database -- on another disk.
+    dir: str = ""
+    #: Days of evidence to keep. Matches ``database.log_retention_days`` by
+    #: default so an image and its log row expire together.
+    retention_days: int = 10
+    jpeg_quality: int = 85
+    #: Frames awaiting encoding. Beyond this the writer drops rather than
+    #: letting a slow disk push back on the recognition threads.
+    queue_size: int = 64
+
+
+class ParkingConfig(BaseModel):
+    """Site capacity, used for the "vehicles inside / capacity" counter."""
+
+    #: Default only. An admin can change it at runtime through
+    #: ``PUT /api/parking``, which stores the value in the ``system_meta``
+    #: table so every browser and tablet on the site agrees on one number.
+    capacity: int = Field(default=100, ge=0, le=100000)
 
 
 class ApiConfig(BaseModel):
@@ -249,10 +310,13 @@ class Settings(BaseSettings):
     app: AppConfig = Field(default_factory=AppConfig)
     cameras: CamerasConfig = Field(default_factory=CamerasConfig)
     detection: DetectionConfig = Field(default_factory=DetectionConfig)
+    preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
     voting: VotingConfig = Field(default_factory=VotingConfig)
     relay: RelayConfig = Field(default_factory=RelayConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    snapshots: SnapshotsConfig = Field(default_factory=SnapshotsConfig)
+    parking: ParkingConfig = Field(default_factory=ParkingConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
@@ -329,6 +393,19 @@ class ResolvedPaths:
     def database(self) -> Path:
         p = Path(self._settings.database.path).expanduser().resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def snapshots_dir(self) -> Path:
+        """Where event snapshots are written; ``<data_dir>/snapshots`` by default.
+
+        Derived from ``data_dir`` rather than hard-coded so that anything
+        repointing the data directory -- a test fixture, a container volume --
+        moves the images with it.
+        """
+        configured = str(self._settings.snapshots.dir).strip()
+        p = Path(configured).expanduser().resolve() if configured else self.data_dir / "snapshots"
+        p.mkdir(parents=True, exist_ok=True)
         return p
 
 

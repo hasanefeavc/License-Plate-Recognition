@@ -49,7 +49,7 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
 
     # Imported here, never at module scope -- see the module docstring.
     try:
-        from lpr.detect import build_detector
+        from lpr.detect import build_detector, build_frame_preprocessor
         from lpr.ocr import build_recognizer, build_voter
     except ImportError as exc:
         logger.error("Cannot build the pipeline: %s (%s)", _ML_HINT, exc)
@@ -72,12 +72,18 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
     # recognition still runs.
     relay = build_relay(settings)
 
+    # None unless preprocess.frame_enhance is on. This is the one place that
+    # may hand the orchestrator something from lpr.detect, which is how the
+    # orchestrator gets whole-frame enhancement without importing cv2 itself.
+    frame_preprocessor = build_frame_preprocessor(settings)
+
     logger.info(
-        "Pipeline built (detector=%s, recognizer=%s, voter=%s, relay=%s)",
+        "Pipeline built (detector=%s, recognizer=%s, voter=%s, relay=%s, frame_enhance=%s)",
         type(detector).__name__,
         type(recognizer).__name__,
         type(voter).__name__,
         type(relay).__name__,
+        frame_preprocessor is not None,
     )
     return PipelineOrchestrator(
         settings=settings,
@@ -85,4 +91,5 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
         recognizer=recognizer,
         voter=voter,
         relay=relay,
+        frame_preprocessor=frame_preprocessor,
     )

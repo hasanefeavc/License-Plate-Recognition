@@ -4,10 +4,13 @@ Two interchangeable implementations of the :class:`~lpr.contracts.Recognizer`
 protocol, EasyOCR and PaddleOCR, selected by ``settings.ocr.backend``. Both
 share the same strategy, which is where the accuracy comes from:
 
-1. Build several views of the same crop -- CLAHE'd grayscale, an
+1. Build several views of the same crop -- CLAHE'd and sharpened grayscale, an
    adaptive-threshold binarisation, and a deskewed version. These fail in
    different ways, so a plate that one view garbles another usually reads
-   cleanly.
+   cleanly. If none of them yields a *grammatical* plate, escalate to a
+   perspective-corrected copy of the crop and try again; that second stage is
+   what recovers a plate photographed from the side, and it is skipped
+   entirely on the plates the cheap views already read.
 2. Run the recogniser over every view, parse *each* text fragment as well as
    the concatenation of them (plates are frequently split into two boxes at
    the province/letters boundary).
@@ -28,12 +31,18 @@ reject threshold, and the voter owns the "was it seen repeatedly" question.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from lpr.contracts import PlateRead
-from lpr.detect.preprocess import deskew, enhance_plate
+from lpr.detect.preprocess import (
+    UNSHARP_AMOUNT,
+    deskew,
+    enhance_plate,
+    rectify_perspective,
+)
 from lpr.ocr.normalize import normalize_plate
 
 if TYPE_CHECKING:
@@ -51,14 +60,38 @@ def _synthetic_crop() -> np.ndarray:
     return np.full((64, 200, 3), 255, dtype=np.uint8)
 
 
-def _crop_variants(crop: np.ndarray) -> list[np.ndarray]:
+def _usable(images: list[np.ndarray | None]) -> list[np.ndarray]:
+    """Drop anything that is not a non-empty array."""
+    return [img for img in images if isinstance(img, np.ndarray) and img.size > 0]
+
+
+def _crop_variants(crop: np.ndarray, unsharp_amount: float = UNSHARP_AMOUNT) -> list[np.ndarray]:
     """Grayscale, binarised and deskewed views of one plate crop."""
-    enhanced = enhance_plate(crop)
-    variants = list(enhanced.variants)
+    enhanced = enhance_plate(crop, unsharp_amount=unsharp_amount)
+    variants: list[np.ndarray | None] = list(enhanced.variants)
     straightened = deskew(enhanced.gray)
     if straightened is not enhanced.gray:
         variants.append(straightened)
-    return [v for v in variants if isinstance(v, np.ndarray) and v.size > 0]
+    return _usable(variants)
+
+
+def _rectified_variants(
+    crop: np.ndarray, unsharp_amount: float = UNSHARP_AMOUNT
+) -> list[np.ndarray]:
+    """Perspective-corrected views of one plate crop, or ``[]`` if it has none.
+
+    Rectification finds the plate's four-corner outline and warps it back to a
+    head-on rectangle, which is the one correction :func:`deskew` cannot make:
+    deskew rotates, and a plate photographed from the side needs its
+    foreshortened far edge stretched, not turned. Running the standard
+    enhancement over the flattened crop afterwards gives the recogniser the
+    same grayscale/binarised pair it gets on the first pass.
+    """
+    flattened = rectify_perspective(crop)
+    if flattened is None:
+        return []
+    enhanced = enhance_plate(flattened, unsharp_amount=unsharp_amount)
+    return _usable(list(enhanced.variants))
 
 
 def _weighted_confidence(fragments: list[tuple[str, float]]) -> float:
@@ -78,6 +111,23 @@ def _weighted_confidence(fragments: list[tuple[str, float]]) -> float:
 class _BaseRecognizer:
     """Shared candidate-selection logic for the concrete backends."""
 
+    #: Overridden per instance from ``settings.preprocess`` by each backend's
+    #: ``__init__``. Class-level defaults keep the base class usable on its own,
+    #: which is what the tests subclass.
+    _unsharp_amount: float = UNSHARP_AMOUNT
+    _rectify_enabled: bool = True
+
+    def _configure_preprocessing(self, settings: "Settings") -> None:
+        """Read the crop-preprocessing knobs off ``settings``.
+
+        ``getattr`` throughout, so a Settings object predating the
+        ``preprocess`` section (or a test double standing in for one) keeps the
+        built-in defaults instead of raising.
+        """
+        cfg = getattr(settings, "preprocess", None)
+        self._unsharp_amount = float(getattr(cfg, "crop_unsharp_amount", UNSHARP_AMOUNT))
+        self._rectify_enabled = bool(getattr(cfg, "rectify_perspective", True))
+
     def _read_fragments(self, image: np.ndarray) -> list[tuple[str, float]]:  # pragma: no cover
         raise NotImplementedError
 
@@ -87,37 +137,70 @@ class _BaseRecognizer:
             return _EMPTY
 
         best: PlateRead | None = None
-        try:
-            variants = _crop_variants(crop)
-        except Exception:
-            logger.debug("crop preprocessing failed; using the raw crop", exc_info=True)
-            variants = [crop]
-
-        for image in variants:
-            try:
-                fragments = self._read_fragments(image)
-            except Exception:
-                logger.debug("%s failed on one crop variant", type(self).__name__, exc_info=True)
-                continue
-            if not fragments:
-                continue
-
-            candidates: list[tuple[str, float]] = []
-            # The joined fragments: a plate split across two boxes.
-            joined = " ".join(text for text, _ in fragments if text)
-            if joined:
-                candidates.append((joined, _weighted_confidence(fragments)))
-            # And each fragment on its own: the plate plus surrounding noise.
-            for text, conf in fragments:
-                if text:
-                    candidates.append((text, conf))
-
-            for raw_text, confidence in candidates:
-                read = normalize_plate(raw_text, confidence)
-                if best is None or _score(read) > _score(best):
-                    best = read
+        for stage in self._variant_stages(crop):
+            for image in stage:
+                best = self._best_of(image, best)
+            # Escalate only while nothing grammatical has turned up. The later
+            # stages exist for the crops the cheap views could not read; running
+            # them on a plate that already parsed would double the OCR cost of
+            # every ordinary car at the gate for no gain.
+            if best is not None and best.valid:
+                break
 
         return best if best is not None else _EMPTY
+
+    def _variant_stages(self, crop: np.ndarray) -> Iterator[list[np.ndarray]]:
+        """Views of ``crop`` to try, in order, cheapest and likeliest first.
+
+        A generator rather than a list: the caller stops pulling as soon as it
+        has a valid read, so a stage nobody asks for is never computed.
+        """
+        try:
+            standard = _crop_variants(crop, self._unsharp_amount)
+        except Exception:
+            logger.debug("crop preprocessing failed; using the raw crop", exc_info=True)
+            standard = []
+        yield standard or [crop]
+
+        if not self._rectify_enabled:
+            return
+        try:
+            rectified = _rectified_variants(crop, self._unsharp_amount)
+        except Exception:
+            logger.debug("perspective rectification failed for one crop", exc_info=True)
+            return
+        if rectified:
+            logger.debug(
+                "%s: no valid read from the standard views, retrying perspective-corrected",
+                type(self).__name__,
+            )
+            yield rectified
+
+    def _best_of(self, image: np.ndarray, best: PlateRead | None) -> PlateRead | None:
+        """Read one crop variant and return whichever of it and ``best`` wins."""
+        try:
+            fragments = self._read_fragments(image)
+        except Exception:
+            logger.debug("%s failed on one crop variant", type(self).__name__, exc_info=True)
+            return best
+        if not fragments:
+            return best
+
+        candidates: list[tuple[str, float]] = []
+        # The joined fragments: a plate split across two boxes.
+        joined = " ".join(text for text, _ in fragments if text)
+        if joined:
+            candidates.append((joined, _weighted_confidence(fragments)))
+        # And each fragment on its own: the plate plus surrounding noise.
+        for text, conf in fragments:
+            if text:
+                candidates.append((text, conf))
+
+        for raw_text, confidence in candidates:
+            read = normalize_plate(raw_text, confidence)
+            if best is None or _score(read) > _score(best):
+                best = read
+        return best
 
     def warmup(self) -> None:
         """Run one recognition on a synthetic crop to pay the lazy-init cost."""
@@ -142,6 +225,7 @@ class EasyOcrRecognizer(_BaseRecognizer):
 
             settings = get_settings()
         self._settings = settings
+        self._configure_preprocessing(settings)
         cfg = settings.ocr
         self.allowlist = cfg.allowlist
         self.gpu = bool(cfg.gpu)
@@ -192,6 +276,7 @@ class PaddleOcrRecognizer(_BaseRecognizer):
 
             settings = get_settings()
         self._settings = settings
+        self._configure_preprocessing(settings)
 
         try:
             from paddleocr import PaddleOCR
