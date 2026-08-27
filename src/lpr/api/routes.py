@@ -83,6 +83,7 @@ from lpr.api.security import (
     user_from_token,
 )
 from lpr.contracts import CameraRole, LprEvent, utc_now_iso
+from lpr.user_license import license_for
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from lpr.config import Settings
@@ -372,8 +373,6 @@ def _user_out(row: dict[str, Any]) -> UserOut:
     since expired should show as expired without anybody having to run a
     sweep.
     """
-    from lpr.user_license import license_for
-
     ttl = row.get("token_ttl_min")
     role = str(row.get("role") or "operator")
     state = license_for(role, row)
@@ -385,6 +384,8 @@ def _user_out(row: dict[str, Any]) -> UserOut:
         license_status=state.status,
         license_expires_at=state.expires_at or (row.get("license_expires_at") or None),
         license_key=(row.get("license_key") or None),
+        license_activated_at=state.activated_at,
+        license_duration_days=state.duration_days,
     )
 
 
@@ -969,14 +970,10 @@ async def pause_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
 )
 async def resume_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
     request.app.state.manual_paused = False
-    # An expired site must not be able to resume itself through this endpoint;
-    # the only way out is a valid key via POST /api/license.
-    guard = deps.get_license_guard(request.app)
-    if deps.is_license_halted(request.app) or not guard.status.valid:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=guard.status.detail,
-        )
+    # Deliberately not gated on the deployment licence any more: access control
+    # is the per-user model, and an installation-wide expiry that leaves an
+    # administrator unable to restart their own gate is an outage, not a
+    # commercial control.
     paused = deps.set_paused(request.app, False)
     pipeline = deps.get_pipeline_optional(request)
     return PipelineStateOut(paused=paused, running=bool(getattr(pipeline, "running", False)))
@@ -1060,21 +1057,12 @@ async def submit_license(
 )
 async def trigger_relay(
     request: Request,
-    user: AdminUser,
+    user: LicensedUser,
     log_repo: deps.LogRepo,
 ) -> RelayTriggerOut:
     """Open the gate by hand and record it as a ``granted`` event for plate
     ``MANUAL`` so the audit trail shows who opened the barrier and when.
     """
-    guard = deps.get_license_guard(request.app)
-    if not guard.status.valid:
-        # The gate is the licensed function. Refusing here closes the obvious
-        # hole in halting only the ML half of the pipeline.
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=guard.status.detail,
-        )
-
     pipeline = deps.get_pipeline(request)
     trigger = getattr(pipeline, "trigger_relay", None)
     if not callable(trigger):
@@ -1504,8 +1492,6 @@ async def my_license(user: CurrentUser, user_repo: deps.UserRepo) -> UserLicense
     exactly who needs to read this, and gating it would leave the dashboard
     unable to explain why everything else is refusing.
     """
-    from lpr.user_license import license_for
-
     row = await _in_thread(user_repo.get, user.username) if hasattr(user_repo, "get") else None
     return _user_license_out(license_for(user.role, row or {"username": user.username}))
 
@@ -1527,17 +1513,25 @@ async def activate_user_license(
     binding an operator could activate a colleague's key and inherit its
     validity.
     """
-    from lpr.user_license import STATUS_ACTIVE, verify_key
+    from lpr.user_license import activate
 
-    state = verify_key(payload.key, user.username)
+    state = await _in_thread(activate, payload.key, user.username)
     if not state.valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=state.detail or "Lisans anahtarı geçersiz",
         )
 
-    stored = await _in_thread(
-        user_repo.set_license, user.username, payload.key, state.expires_at, STATUS_ACTIVE
+    # This is where the countdown starts -- the expiry is computed here, from
+    # now plus the duration the key carries, and written once.
+    stored = await _in_thread_kw(
+        user_repo.set_license,
+        user.username,
+        payload.key,
+        state.expires_at,
+        state.status,
+        duration_days=state.duration_days,
+        activated_at=state.activated_at,
     )
     if not stored:  # pragma: no cover - account deleted mid-request
         raise HTTPException(
@@ -1545,7 +1539,12 @@ async def activate_user_license(
             detail=f"Kullanıcı bulunamadı: {user.username}",
         )
 
-    logger.info("Lisans etkinleştirildi: %s (%s)", user.username, state.expires_at)
+    logger.info(
+        "Lisans etkinleştirildi: %s (%s gün, bitiş %s)",
+        user.username,
+        state.duration_days,
+        state.expires_at,
+    )
     return _user_license_out(state)
 
 
@@ -1571,7 +1570,7 @@ async def generate_user_license(
     Refuses for an administrator: they are exempt by construction, and a key
     that would never be checked is a misleading thing to hand somebody.
     """
-    from lpr.user_license import STATUS_ACTIVE, issue_key, requires_license, verify_key
+    from lpr.user_license import issue_key, requires_license
 
     name = username.strip()
     row = await _in_thread(user_repo.get, name) if hasattr(user_repo, "get") else None
@@ -1586,7 +1585,7 @@ async def generate_user_license(
         )
 
     try:
-        key, expires_at = await _in_thread(issue_key, name, payload.days)
+        key = await _in_thread(issue_key, name, payload.days)
     except RuntimeError as exc:
         # No signing secret: say so rather than handing over a key that will
         # fail at activation.
@@ -1594,9 +1593,13 @@ async def generate_user_license(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
 
-    await _in_thread(user_repo.set_license, name, key, expires_at, STATUS_ACTIVE)
-    logger.info("Lisans üretildi: %s (%d gün, bitiş %s)", name, payload.days, expires_at)
-    return _user_license_out(verify_key(key, name), key=key)
+    # Nothing is written. Generating a key says what an operator *may* have;
+    # it is their activation that says what they now have, and starting the
+    # countdown here would burn the days between handing the key over and the
+    # operator's first shift.
+    logger.info("Lisans anahtarı üretildi: %s (%d gün)", name, payload.days)
+    current = license_for(str(row.get("role") or "operator"), row)
+    return _user_license_out(current, key=key)
 
 
 @router.delete(
@@ -1625,12 +1628,14 @@ async def revoke_user_license(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Kullanıcı bulunamadı: {name}"
         )
 
-    await _in_thread(
+    await _in_thread_kw(
         user_repo.set_license,
         name,
         row.get("license_key"),
         row.get("license_expires_at"),
         STATUS_REVOKED,
+        duration_days=row.get("license_duration_days"),
+        activated_at=row.get("license_activated_at"),
     )
     logger.warning("Lisans iptal edildi: %s", name)
     return _user_license_out(

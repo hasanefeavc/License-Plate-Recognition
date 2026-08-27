@@ -679,10 +679,17 @@ def test_relay_trigger_writes_manual_event(
     assert log_repo.written[0].action == "granted"
 
 
-def test_relay_trigger_requires_admin(api_client: TestClient, operator_token: str) -> None:
-    assert (
-        api_client.post("/api/relay/trigger", headers=auth(operator_token)).status_code == 403
-    )
+def test_an_operator_may_open_the_gate(
+    api_client: TestClient, operator_token: str, api_app: Any
+) -> None:
+    """Opening the barrier is the operator's job; that is what they are there for."""
+    response = api_client.post("/api/relay/trigger", headers=auth(operator_token))
+    assert response.status_code == 200
+    assert api_app.state.pipeline.relay.triggers == 1
+
+
+def test_opening_the_gate_still_requires_authentication(api_client: TestClient) -> None:
+    assert api_client.post("/api/relay/trigger").status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -775,33 +782,34 @@ def test_license_status_requires_auth(api_client: TestClient) -> None:
     assert api_client.get("/api/license").status_code == 401
 
 
-def test_expired_licence_halts_the_pipeline(expired_app: Any) -> None:
-    client = TestClient(expired_app)
-    token = create_token("admin", "admin")
+def test_an_expired_deployment_licence_no_longer_halts_the_pipeline(
+    expired_app: Any
+) -> None:
+    """The installation-wide licence is reported, not enforced.
 
-    body = client.get("/api/license", headers=auth(token)).json()
-    assert body["valid"] is False
-    assert body["reason"] == "expired"
-    assert body["pipeline_halted"] is True
+    Access control lives in the per-user model now. An expiry that stops a site
+    recognising plates -- with an administrator standing there unable to
+    restart it -- is an outage, not a commercial control.
+    """
+    assert expired_app.state.paused is False
+    assert expired_app.state.pipeline.paused is False
 
-    assert expired_app.state.paused is True
-    assert expired_app.state.pipeline.paused is True
 
-
-def test_expired_licence_blocks_the_gate(expired_app: Any) -> None:
-    """The barrier is the licensed function; halting only the ML half is not
-    enough."""
+def test_an_expired_deployment_licence_no_longer_blocks_the_gate(
+    expired_app: Any
+) -> None:
     client = TestClient(expired_app)
     response = client.post("/api/relay/trigger", headers=auth(create_token("admin", "admin")))
-    assert response.status_code == 402
-    assert expired_app.state.pipeline.relay.triggers == 0
+    assert response.status_code == 200
+    assert expired_app.state.pipeline.relay.triggers == 1
 
 
-def test_expired_licence_cannot_be_resumed_by_hand(expired_app: Any) -> None:
+def test_an_expired_deployment_licence_does_not_block_resume(expired_app: Any) -> None:
+    """There is nothing to recover from: the licence never paused anything."""
     client = TestClient(expired_app)
     response = client.post("/api/pipeline/resume", headers=auth(create_token("admin", "admin")))
-    assert response.status_code == 402
-    assert expired_app.state.paused is True
+    assert response.status_code == 200
+    assert expired_app.state.paused is False
 
 
 def test_submitting_a_key_releases_the_halt(expired_app: Any) -> None:
@@ -822,16 +830,18 @@ def test_submitting_a_key_releases_the_halt(expired_app: Any) -> None:
     assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
 
 
-def test_a_rejected_key_is_a_400_carrying_the_reason(expired_app: Any) -> None:
+def test_a_rejected_deployment_key_is_a_400_carrying_the_reason(
+    expired_app: Any
+) -> None:
+    """The endpoint still validates keys; it just no longer gates anything."""
     client = TestClient(expired_app)
     response = client.post(
         "/api/license",
+        json={"key": "gecersiz-anahtar"},  # what FakeLicenseGuard refuses
         headers=auth(create_token("admin", "admin")),
-        json={"key": "gecersiz-anahtar"},
     )
     assert response.status_code == 400
     assert "geçersiz" in response.json()["error"]["detail"]
-    assert expired_app.state.paused is True
 
 
 def test_pasted_key_whitespace_is_stripped(expired_app: Any) -> None:
@@ -1590,11 +1600,15 @@ class ManagedUserRepository:
         name = (username or "").strip()
         if not name or name in self.rows:
             return False
+        from lpr.user_license import STATUS_PENDING, requires_license
+
         self.rows[name] = {
             "username": name,
             "role": role,
             "created_at": "2026-08-27T00:00:00+00:00",
             "token_ttl_min": token_ttl_min,
+            # Mirrors the real repository: an operator starts waiting for a key.
+            "license_status": STATUS_PENDING if requires_license(role) else None,
         }
         self.passwords[name] = password
         return True
@@ -1614,7 +1628,13 @@ class ManagedUserRepository:
         return self.rows.pop(name, None) is not None
 
     def set_license(
-        self, username: str, key: str | None, expires_at: str | None, status: str
+        self,
+        username: str,
+        key: str | None,
+        expires_at: str | None,
+        status: str,
+        duration_days: int | None = None,
+        activated_at: str | None = None,
     ) -> bool:
         row = self.rows.get((username or "").strip())
         if row is None:
@@ -1622,6 +1642,8 @@ class ManagedUserRepository:
         row["license_key"] = key
         row["license_expires_at"] = expires_at
         row["license_status"] = status
+        row["license_duration_days"] = duration_days
+        row["license_activated_at"] = activated_at
         return True
 
 
@@ -1892,10 +1914,14 @@ def test_an_admin_is_never_blocked(license_client: TestClient) -> None:
 def test_a_licensed_operator_passes(
     license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
 ) -> None:
-    from lpr.user_license import STATUS_ACTIVE, issue_key
+    from lpr.user_license import activate, issue_key
 
-    key, expires_at = issue_key("bekci", 30, licensing)
-    users_repo.set_license("bekci", key, expires_at, STATUS_ACTIVE)
+    key = issue_key("bekci", 30, licensing)
+    state = activate(key, "bekci", licensing)
+    users_repo.set_license(
+        "bekci", key, state.expires_at, state.status,
+        duration_days=state.duration_days, activated_at=state.activated_at,
+    )
 
     response = license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
@@ -1907,15 +1933,19 @@ def test_a_revoked_licence_blocks_immediately(
     license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
 ) -> None:
     """Revocation is a database fact; the signed key cannot be un-signed."""
-    from lpr.user_license import STATUS_ACTIVE, STATUS_REVOKED, issue_key
+    from lpr.user_license import STATUS_REVOKED, activate, issue_key
 
-    key, expires_at = issue_key("bekci", 30, licensing)
-    users_repo.set_license("bekci", key, expires_at, STATUS_ACTIVE)
+    key = issue_key("bekci", 30, licensing)
+    state = activate(key, "bekci", licensing)
+    users_repo.set_license(
+        "bekci", key, state.expires_at, state.status,
+        duration_days=state.duration_days, activated_at=state.activated_at,
+    )
     assert license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
     ).status_code == 201
 
-    users_repo.set_license("bekci", key, expires_at, STATUS_REVOKED)
+    users_repo.set_license("bekci", key, state.expires_at, STATUS_REVOKED)
     assert license_client.post(
         "/api/plates", json={"plate": "06MNP99"}, headers=operator_auth()
     ).status_code == 402
@@ -1925,7 +1955,7 @@ def test_reading_your_own_licence_is_never_gated(license_client: TestClient) -> 
     """An operator whose licence lapsed is exactly who needs to read this."""
     response = license_client.get("/api/license/me", headers=operator_auth())
     assert response.status_code == 200
-    assert response.json()["status"] == "missing"
+    assert response.json()["status"] == "pending_activation"
 
 
 def test_an_admin_reads_an_unlimited_licence(license_client: TestClient) -> None:
@@ -1941,12 +1971,16 @@ def test_activating_a_key_is_never_gated(
     """It is the way *out* of being unlicensed, so it cannot require a licence."""
     from lpr.user_license import issue_key
 
-    key, _ = issue_key("bekci", 30, licensing)
     response = license_client.post(
-        "/api/license/activate", json={"key": key}, headers=operator_auth()
+        "/api/license/activate",
+        json={"key": issue_key("bekci", 30, licensing)},
+        headers=operator_auth(),
     )
     assert response.status_code == 200
-    assert response.json()["status"] == "active"
+    body = response.json()
+    assert body["status"] == "active"
+    assert body["activated_at"], "activation is what starts the countdown"
+    assert body["expires_at"]
 
 
 def test_activating_someone_elses_key_is_refused(
@@ -1954,9 +1988,10 @@ def test_activating_someone_elses_key_is_refused(
 ) -> None:
     from lpr.user_license import issue_key
 
-    key, _ = issue_key("baskasi", 30, licensing)
     response = license_client.post(
-        "/api/license/activate", json={"key": key}, headers=operator_auth()
+        "/api/license/activate",
+        json={"key": issue_key("baskasi", 30, licensing)},
+        headers=operator_auth(),
     )
     assert response.status_code == 400
 
@@ -1970,8 +2005,11 @@ def test_activation_unblocks_the_operator(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
     ).status_code == 402
 
-    key, _ = issue_key("bekci", 30, licensing)
-    license_client.post("/api/license/activate", json={"key": key}, headers=operator_auth())
+    license_client.post(
+        "/api/license/activate",
+        json={"key": issue_key("bekci", 30, licensing)},
+        headers=operator_auth(),
+    )
 
     assert license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
@@ -1988,19 +2026,36 @@ def test_generating_a_licence_requires_admin(license_client: TestClient) -> None
     assert response.status_code == 403
 
 
-def test_an_admin_generates_a_key_and_gets_it_back(
+def test_generating_a_key_does_not_activate_the_account(
     license_client: TestClient, users_repo: ManagedUserRepository
 ) -> None:
-    """Returned once so the admin can hand it over; also stored on the row."""
+    """Generation hands over an artefact; it must not start the countdown.
+
+    An admin cutting a key on Friday for a Monday start would otherwise burn
+    the weekend off the operator's licence.
+    """
     response = license_client.post(
         "/api/users/bekci/license", json={"days": 90}, headers=admin_auth()
     )
     assert response.status_code == 201
     body = response.json()
+
     assert body["key"], "the admin has to be able to pass the key on"
-    assert body["status"] == "active"
-    assert 89 < body["days_remaining"] <= 90
-    assert users_repo.rows["bekci"]["license_key"] == body["key"]
+    assert body["status"] == "pending_activation", "the account is untouched"
+    assert body["expires_at"] is None
+
+    row = users_repo.rows["bekci"]
+    assert row.get("license_key") is None, "nothing is written until activation"
+    assert row.get("license_expires_at") is None
+
+
+def test_a_generated_key_still_leaves_the_operator_blocked(
+    license_client: TestClient
+) -> None:
+    license_client.post("/api/users/bekci/license", json={"days": 90}, headers=admin_auth())
+    assert license_client.post(
+        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+    ).status_code == 402
 
 
 def test_generating_a_licence_for_an_admin_is_refused(
@@ -2028,24 +2083,37 @@ def test_revoking_requires_admin(license_client: TestClient) -> None:
 
 
 def test_revoking_keeps_the_key_but_changes_the_status(
-    license_client: TestClient, users_repo: ManagedUserRepository
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
 ) -> None:
     """Keeping it lets an admin see what was revoked."""
-    license_client.post("/api/users/bekci/license", json={"days": 30}, headers=admin_auth())
-    issued = users_repo.rows["bekci"]["license_key"]
+    from lpr.user_license import issue_key
+
+    key = issue_key("bekci", 30, licensing)
+    license_client.post("/api/license/activate", json={"key": key}, headers=operator_auth())
+    assert users_repo.rows["bekci"]["license_key"] == key
 
     response = license_client.delete("/api/users/bekci/license", headers=admin_auth())
     assert response.status_code == 200
     assert response.json()["status"] == "revoked"
-    assert users_repo.rows["bekci"]["license_key"] == issued
+    assert users_repo.rows["bekci"]["license_key"] == key
 
 
 def test_the_user_listing_reports_live_licence_state(
-    license_client: TestClient, users_repo: ManagedUserRepository
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
 ) -> None:
-    license_client.post("/api/users/bekci/license", json={"days": 30}, headers=admin_auth())
-    rows = {row["username"]: row for row in license_client.get("/api/users", headers=admin_auth()).json()}
+    from lpr.user_license import issue_key
 
-    assert rows["mudur"]["license_status"] == "unlimited"
-    assert rows["bekci"]["license_status"] == "active"
-    assert rows["bekci"]["license_expires_at"]
+    def listing() -> dict[str, Any]:
+        return {r["username"]: r for r in license_client.get("/api/users", headers=admin_auth()).json()}
+
+    assert listing()["mudur"]["license_status"] == "unlimited"
+    assert listing()["bekci"]["license_status"] == "pending_activation"
+
+    license_client.post(
+        "/api/license/activate",
+        json={"key": issue_key("bekci", 30, licensing)},
+        headers=operator_auth(),
+    )
+    row = listing()["bekci"]
+    assert row["license_status"] == "active"
+    assert row["license_expires_at"] and row["license_activated_at"]

@@ -134,28 +134,29 @@ def is_license_halted(app: "Starlette") -> bool:
 
 
 def apply_license_state(app: "Starlette", valid: bool) -> bool:
-    """Halt or release the pipeline to match the licence state.
+    """Record the deployment licence state. **No longer halts the pipeline.**
 
-    Returns whether the pipeline is currently held for licence reasons. Safe
-    to call on every check: the transitions are idempotent, and it never
-    resumes a pipeline that an operator paused by hand.
+    The deployment licence used to pause recognition and refuse the gate when
+    it lapsed. Access control now lives entirely in the per-user model
+    (:mod:`lpr.user_license`): administrators are unlimited, operators hold
+    their own keys, and neither is affected by the installation-wide licence.
+
+    The state is still tracked and still reported by ``GET /api/license``,
+    because the desktop client polls it and an installer wants to see it. What
+    it no longer does is stop a working barrier -- an expiry that locks an
+    administrator out of their own site is not a commercial control, it is an
+    outage.
+
+    Always returns ``False`` (never held for licence reasons); kept as a
+    function, and still called, so re-enabling the hold is one edit here rather
+    than a hunt through the lifespan and the routes.
     """
-    halted = is_license_halted(app)
-
-    if not valid:
-        app.state.license_halted = True
-        if not halted:
-            logger.error("Lisans geçersiz: görüntü işleme durduruluyor")
-        set_paused(app, True)
-        return True
-
     app.state.license_halted = False
-    if halted:
-        logger.info("Lisans geçerli: görüntü işleme devam ediyor")
-        # Only the licence hold is released here. If the operator had also
-        # pressed pause, ``manual_paused`` keeps the pipeline down.
-        if not bool(getattr(app.state, "manual_paused", False)):
-            set_paused(app, False)
+    if not valid:
+        logger.warning(
+            "Dağıtım lisansı geçersiz (görüntü işleme etkilenmiyor; "
+            "erişim kontrolü kullanıcı lisanslarında)"
+        )
     return False
 
 
