@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -534,3 +535,91 @@ def test_a_long_message_is_truncated_rather_than_rejected(db: Any) -> None:
     row = repo.recent()[0]
     assert len(row["message"]) <= 512
     assert len(row["detail"]) <= 4000
+
+
+# ---------------------------------------------------------------------------
+# Partial plate updates
+# ---------------------------------------------------------------------------
+
+
+def test_update_writes_only_the_named_columns(db: Any) -> None:
+    """The whole reason update() exists next to upsert().
+
+    ``upsert`` writes every column, so a dashboard toggling the blocked flag
+    through it would blank the owner and expiry it never sent.
+    """
+    from lpr.db import PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("34ABC123", owner="Ali", apartment="B-12", note="Kiracı",
+                expires_at="2027-01-01T00:00:00+00:00")
+    assert repo.update("34ABC123", blocked=True) is True
+
+    row = repo.get("34ABC123")
+    assert row["blocked"] == 1
+    assert row["owner"] == "Ali"
+    assert row["apartment"] == "B-12"
+    assert row["note"] == "Kiracı"
+    assert row["expires_at"] == "2027-01-01T00:00:00+00:00"
+
+
+def test_update_leaves_added_at_alone(db: Any) -> None:
+    """It records when the plate was first admitted, not when it was edited."""
+    from lpr.db import PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("34ABC123")
+    original = repo.get("34ABC123")["added_at"]
+    repo.update("34ABC123", owner="Yeni")
+    assert repo.get("34ABC123")["added_at"] == original
+
+
+def test_update_reports_an_unknown_plate(db: Any) -> None:
+    from lpr.db import PlateRepository
+
+    assert PlateRepository().update("99ZZZ99", blocked=True) is False
+
+
+def test_update_with_nothing_to_write_is_a_no_op(db: Any) -> None:
+    from lpr.db import PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("34ABC123")
+    assert repo.update("34ABC123") is False
+
+
+def test_update_ignores_columns_it_does_not_own(db: Any) -> None:
+    """Column names come from a fixed list, never from the caller.
+
+    That list is what makes the ``SET`` clause safe to build by interpolation:
+    an unrecognised key contributes nothing to the SQL at all.
+    """
+    from lpr.db import PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("34ABC123")
+    original = repo.get("34ABC123")
+
+    assert repo.update("34ABC123", added_at="tampered", nonsense=1) is False
+    assert repo.get("34ABC123") == original
+
+
+def test_update_ignores_unknown_keys_but_still_applies_known_ones(db: Any) -> None:
+    from lpr.db import PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("34ABC123")
+    assert repo.update("34ABC123", owner="Ali", nonsense=1) is True
+    assert repo.get("34ABC123")["owner"] == "Ali"
+
+
+def test_blocking_a_plate_closes_the_gate_to_it(db: Any) -> None:
+    from lpr.db import PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("34ABC123")
+    assert repo.is_registered("34ABC123") is True
+
+    repo.update("34ABC123", blocked=True)
+    assert repo.is_registered("34ABC123") is False
+    assert repo.is_blocked("34ABC123") is True

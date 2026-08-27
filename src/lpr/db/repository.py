@@ -133,6 +133,38 @@ class PlateRepository:
             logger.info("Plate registered: %s", key)
         return added
 
+    def update(self, plate: str, **fields: Any) -> bool:
+        """Patch only the columns named in ``fields``. Returns False if unknown.
+
+        Distinct from :meth:`upsert`, which writes every column and therefore
+        blanks anything the caller did not supply. A dashboard toggling the
+        blocked flag must not wipe the owner and expiry it never sent, so a
+        partial update needs partial SQL.
+        """
+        key = normalise_plate(plate)
+        if not key:
+            return False
+
+        allowed = ("owner", "apartment", "note", "expires_at", "blocked")
+        updates = {name: fields[name] for name in allowed if name in fields}
+        if not updates:
+            return False
+        if "blocked" in updates:
+            updates["blocked"] = int(bool(updates["blocked"]))
+
+        # Column names come from `allowed`, never from the caller, so this
+        # interpolation cannot carry anything a request supplied.
+        assignments = ", ".join(f"{name} = ?" for name in updates)
+        with transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE plates SET {assignments} WHERE plate = ?",  # noqa: S608
+                (*updates.values(), key),
+            )
+            changed = cur.rowcount > 0
+        if changed:
+            logger.info("Plate updated: %s (%s)", key, ", ".join(updates))
+        return changed
+
     def remove(self, plate: str) -> bool:
         """Deregister a plate. Returns False if it was not registered."""
         key = normalise_plate(plate)
@@ -179,9 +211,7 @@ class PlateRepository:
             return "invalid"
 
         with transaction() as conn:
-            existing = conn.execute(
-                "SELECT 1 FROM plates WHERE plate = ?", (key,)
-            ).fetchone()
+            existing = conn.execute("SELECT 1 FROM plates WHERE plate = ?", (key,)).fetchone()
             if existing is not None and not overwrite:
                 return "skipped"
 

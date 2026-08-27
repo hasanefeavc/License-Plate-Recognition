@@ -478,7 +478,12 @@ def test_plate_crud_round_trip(
 
     listed = api_client.get("/api/plates", headers=auth(operator_token))
     assert listed.status_code == 200
-    assert listed.json() == {"plates": ["34ABC123"], "count": 1}
+    body = listed.json()
+    # Field-wise rather than exact-equality: `records` was added alongside
+    # `plates`, and an exact match would make every additive field a breakage.
+    assert body["plates"] == ["34ABC123"]
+    assert body["count"] == 1
+    assert [row["plate"] for row in body["records"]] == ["34ABC123"]
 
     duplicate = api_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=auth(admin_token)
@@ -1192,6 +1197,23 @@ class ImportablePlateRepository(FakePlateRepository):
         self._plates[plate] = note
         return "updated" if existing else "added"
 
+    def get(self, plate: str) -> dict[str, Any] | None:
+        return self.details.get(plate)
+
+    def update(self, plate: str, **fields: Any) -> bool:
+        """Partial write, mirroring PlateRepository.update: only what is sent."""
+        row = self.details.get(plate)
+        if row is None:
+            return False
+        allowed = ("owner", "apartment", "note", "expires_at", "blocked")
+        changes = {name: fields[name] for name in allowed if name in fields}
+        if not changes:
+            return False
+        if "blocked" in changes:
+            changes["blocked"] = int(bool(changes["blocked"]))
+        row.update(changes)
+        return True
+
     def all_detailed(self) -> list[dict[str, Any]]:
         return [self.details[key] for key in sorted(self.details)]
 
@@ -1319,3 +1341,164 @@ def test_event_export_rejects_an_absurd_limit(
         api_client.get("/api/events/export?limit=999999", headers=auth(operator_token)).status_code
         == 422
     )
+
+
+# ---------------------------------------------------------------------------
+# Plate management: resident records, status and the block toggle
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def detail_client(api_app: Any, csv_repo: ImportablePlateRepository) -> TestClient:
+    """A client whose plate repository carries the schema-v4 columns."""
+    api_app.dependency_overrides[deps.get_plate_repository] = lambda: csv_repo
+    return TestClient(api_app)
+
+
+def test_adding_a_plate_stores_the_resident_detail(
+    detail_client: TestClient, admin_token: str, csv_repo: ImportablePlateRepository
+) -> None:
+    response = detail_client.post(
+        "/api/plates",
+        headers=auth(admin_token),
+        json={
+            "plate": " 34 abc 123 ",
+            "owner": "Ahmet Yılmaz",
+            "apartment": "B Blok D:12",
+            "note": "Müdür aracı",
+        },
+    )
+    assert response.status_code == 201
+    stored = csv_repo.details["34ABC123"]
+    assert stored["owner"] == "Ahmet Yılmaz"
+    assert stored["apartment"] == "B Blok D:12"
+
+
+def test_a_bare_date_is_widened_to_the_end_of_that_day(
+    detail_client: TestClient, admin_token: str, csv_repo: ImportablePlateRepository
+) -> None:
+    """A date picker sends 2027-01-01; stored as midnight it expires a day early.
+
+    The resident's sticker says they are valid until the 1st, so being refused
+    on the 1st is the bug this guards.
+    """
+    detail_client.post(
+        "/api/plates",
+        headers=auth(admin_token),
+        json={"plate": "34ABC123", "expires_at": "2027-01-01"},
+    )
+    assert csv_repo.details["34ABC123"]["expires_at"] == "2027-01-01T23:59:59+00:00"
+
+
+def test_an_explicit_timestamp_is_left_alone(
+    detail_client: TestClient, admin_token: str, csv_repo: ImportablePlateRepository
+) -> None:
+    detail_client.post(
+        "/api/plates",
+        headers=auth(admin_token),
+        json={"plate": "34ABC123", "expires_at": "2027-01-01T08:00:00+00:00"},
+    )
+    assert csv_repo.details["34ABC123"]["expires_at"] == "2027-01-01T08:00:00+00:00"
+
+
+def test_the_list_carries_both_shapes(
+    detail_client: TestClient, admin_token: str, operator_token: str
+) -> None:
+    """`plates` for the desktop client, `records` for the management screen."""
+    detail_client.post(
+        "/api/plates", headers=auth(admin_token), json={"plate": "34ABC123", "owner": "Ali"}
+    )
+    body = detail_client.get("/api/plates", headers=auth(operator_token)).json()
+
+    assert body["plates"] == ["34ABC123"]
+    assert body["records"][0]["owner"] == "Ali"
+    assert body["records"][0]["status"] == "active"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({}, "active"),
+        ({"blocked": True}, "blocked"),
+        ({"expires_at": "2020-01-01"}, "expired"),
+        ({"expires_at": "2099-01-01"}, "guest"),
+        ({"blocked": True, "expires_at": "2020-01-01"}, "blocked"),
+    ],
+)
+def test_status_is_derived_for_the_badge(
+    detail_client: TestClient, admin_token: str, payload: dict[str, Any], expected: str
+) -> None:
+    """Derived server-side: a browser with a wrong clock must not show a badge
+    that contradicts what the gate will do. Blocked outranks expired."""
+    detail_client.post(
+        "/api/plates", headers=auth(admin_token), json={"plate": "34ABC123", **payload}
+    )
+    records = detail_client.get("/api/plates", headers=auth(admin_token)).json()["records"]
+    assert records[0]["status"] == expected
+
+
+def test_the_block_toggle_preserves_the_other_fields(
+    detail_client: TestClient, admin_token: str, csv_repo: ImportablePlateRepository
+) -> None:
+    """The whole reason PATCH is partial: a toggle must not blank the resident."""
+    detail_client.post(
+        "/api/plates",
+        headers=auth(admin_token),
+        json={"plate": "34ABC123", "owner": "Ali", "apartment": "B-12", "note": "Kiracı"},
+    )
+    response = detail_client.patch(
+        "/api/plates/34ABC123", headers=auth(admin_token), json={"blocked": True}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["blocked"] is True
+    assert body["status"] == "blocked"
+    assert body["owner"] == "Ali"
+    assert body["apartment"] == "B-12"
+    assert body["note"] == "Kiracı"
+
+
+def test_unblocking_restores_the_active_status(
+    detail_client: TestClient, admin_token: str
+) -> None:
+    detail_client.post(
+        "/api/plates", headers=auth(admin_token), json={"plate": "34ABC123", "blocked": True}
+    )
+    body = detail_client.patch(
+        "/api/plates/34ABC123", headers=auth(admin_token), json={"blocked": False}
+    ).json()
+    assert body["status"] == "active"
+
+
+def test_patching_requires_admin(detail_client: TestClient, operator_token: str) -> None:
+    response = detail_client.patch(
+        "/api/plates/34ABC123", headers=auth(operator_token), json={"blocked": True}
+    )
+    assert response.status_code == 403
+
+
+def test_patching_an_unknown_plate_is_a_404(
+    detail_client: TestClient, admin_token: str
+) -> None:
+    response = detail_client.patch(
+        "/api/plates/99ZZZ99", headers=auth(admin_token), json={"blocked": True}
+    )
+    assert response.status_code == 404
+
+
+def test_an_empty_patch_is_rejected(detail_client: TestClient, admin_token: str) -> None:
+    """A no-op write should say so rather than report success."""
+    detail_client.post("/api/plates", headers=auth(admin_token), json={"plate": "34ABC123"})
+    response = detail_client.patch(
+        "/api/plates/34ABC123", headers=auth(admin_token), json={}
+    )
+    assert response.status_code == 400
+
+
+def test_a_patch_rejects_unknown_fields(detail_client: TestClient, admin_token: str) -> None:
+    """`extra="forbid"` keeps a typo'd key from silently doing nothing."""
+    response = detail_client.patch(
+        "/api/plates/34ABC123", headers=auth(admin_token), json={"blokked": True}
+    )
+    assert response.status_code == 422

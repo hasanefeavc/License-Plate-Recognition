@@ -301,3 +301,25 @@ def test_build_notifier_warns_but_does_not_raise_on_a_half_configuration(
     tmp_settings.smtp.host = ""
     notifier = build_notifier(tmp_settings)
     assert notifier.enabled is False
+
+
+def test_a_user_without_a_password_is_not_usable() -> None:
+    """The exact shape a deployment lands in after the credential moves to .env.
+
+    `config.yaml` ships `user` filled and `password` empty. Starting the worker
+    on that would fail authentication once per refused vehicle; refusing up
+    front makes it one warning at startup instead.
+    """
+    assert EmailNotifier(config(user="gate@example.com", password="")).enabled is False
+
+
+def test_a_relay_that_wants_no_authentication_is_still_usable() -> None:
+    """An internal MTA on port 25 has no user and needs no password."""
+    assert EmailNotifier(config(user="", password="")).enabled is True
+
+
+def test_the_shipped_config_does_not_carry_a_password(tmp_settings: Any) -> None:
+    """config.yaml is committed; the credential belongs in .env."""
+    from lpr.config import Settings
+
+    assert Settings().smtp.password == ""

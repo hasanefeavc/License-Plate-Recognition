@@ -322,8 +322,17 @@ class SmtpConfig(BaseModel):
         Checked before the worker thread is even started, so a half-filled
         configuration is one warning at startup rather than a failed connection
         per event for the life of the process.
+
+        A configured ``user`` with no ``password`` counts as half-filled. That
+        is the shape a deployment lands in after the credential is moved out of
+        ``config.yaml`` and ``LPR_SMTP__PASSWORD`` has not been set in ``.env``
+        yet -- every send would fail authentication, one per refused vehicle.
+        An empty ``user`` is a different thing: an internal relay that wants no
+        authentication at all, and that is left alone.
         """
-        return bool(self.enabled and self.host.strip() and self.sender and self.recipients)
+        if not (self.enabled and self.host.strip() and self.sender and self.recipients):
+            return False
+        return not self.user.strip() or bool(self.password)
 
 
 class DatabaseConfig(BaseModel):
