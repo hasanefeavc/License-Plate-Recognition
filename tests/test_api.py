@@ -1665,14 +1665,22 @@ def admin_auth() -> dict[str, str]:
     return auth(create_token("mudur", "admin"))
 
 
+def operator_auth() -> dict[str, str]:
+    """A token for the operator the users fixture actually defines.
+
+    The generic ``operator_token`` names an account those fixtures do not
+    create, and the revocation check rejects a token whose account is gone --
+    correctly, but that is a 401 and not the 403 these tests are about.
+    """
+    return auth(create_token("bekci", "operator"))
+
+
 # -- listing ----------------------------------------------------------------
 
 
-def test_listing_users_requires_admin(
-    users_client: TestClient, operator_token: str
-) -> None:
+def test_listing_users_requires_admin(users_client: TestClient) -> None:
     assert users_client.get("/api/users").status_code == 401
-    assert users_client.get("/api/users", headers=auth(operator_token)).status_code == 403
+    assert users_client.get("/api/users", headers=operator_auth()).status_code == 403
 
 
 def test_listing_users_never_returns_password_material(
@@ -1694,14 +1702,11 @@ def test_listing_users_reports_the_session_length(users_client: TestClient) -> N
 # -- creation ---------------------------------------------------------------
 
 
-def test_creating_a_user_requires_admin(
-    users_client: TestClient, operator_token: str
-) -> None:
+def test_creating_a_user_requires_admin(users_client: TestClient) -> None:
     payload = {"username": "yeni", "password": "parola1234"}
     assert users_client.post("/api/users", json=payload).status_code == 401
     assert (
-        users_client.post("/api/users", json=payload, headers=auth(operator_token)).status_code
-        == 403
+        users_client.post("/api/users", json=payload, headers=operator_auth()).status_code == 403
     )
 
 
@@ -1756,13 +1761,9 @@ def test_an_unknown_role_is_rejected(users_client: TestClient) -> None:
 # -- deletion ---------------------------------------------------------------
 
 
-def test_deleting_a_user_requires_admin(
-    users_client: TestClient, operator_token: str
-) -> None:
+def test_deleting_a_user_requires_admin(users_client: TestClient) -> None:
     assert users_client.delete("/api/users/bekci").status_code == 401
-    assert (
-        users_client.delete("/api/users/bekci", headers=auth(operator_token)).status_code == 403
-    )
+    assert users_client.delete("/api/users/bekci", headers=operator_auth()).status_code == 403
 
 
 def test_an_admin_deletes_an_operator(
@@ -1884,10 +1885,6 @@ def license_client(
     api_app.dependency_overrides[deps.get_user_repository] = lambda: users_repo
     api_app.state.user_repository = users_repo
     return TestClient(api_app)
-
-
-def operator_auth() -> dict[str, str]:
-    return auth(create_token("bekci", "operator"))
 
 
 def test_an_unlicensed_operator_is_blocked_with_402(
@@ -2117,3 +2114,28 @@ def test_the_user_listing_reports_live_licence_state(
     row = listing()["bekci"]
     assert row["license_status"] == "active"
     assert row["license_expires_at"] and row["license_activated_at"]
+
+
+def test_the_auth_path_uses_the_overridden_repository(api_app: Any) -> None:
+    """The revocation check must resolve its repository as a dependency.
+
+    ``app.dependency_overrides`` is keyed on the callable's identity, so
+    calling ``deps.get_user_repository(request)`` directly would silently
+    bypass the override -- and the auth path would talk to the process's real
+    database on every request, in tests and in any app that swaps the
+    repository for its own reasons.
+    """
+    seen: list[str] = []
+
+    class Watching(FakeUserRepository):
+        def get(self, username: str) -> dict[str, Any] | None:
+            seen.append(username)
+            return {"username": username, "role": "admin"}
+
+    api_app.dependency_overrides[deps.get_user_repository] = lambda: Watching()
+    response = TestClient(api_app).get(
+        "/api/auth/me", headers=auth(create_token("mudur", "admin"))
+    )
+
+    assert response.status_code == 200
+    assert seen == ["mudur"], "the override was bypassed"
