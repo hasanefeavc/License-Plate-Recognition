@@ -844,6 +844,65 @@ def test_the_generated_key_is_shown_to_the_admin() -> None:
     assert "window.prompt" in body and "issued.key" in body
 
 
+def test_generation_confirms_the_span_for_the_named_user() -> None:
+    """The span must be tied to the row that was clicked.
+
+    The dropdown above the table is one control shared by every row. Reading
+    it at click time -- which is what generateLicense used to do -- meant the
+    button issued whatever it happened to say, "1 yıl" by default, with
+    nothing on screen connecting that number to the operator being issued to.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function confirmLicenseDays") :]
+    body = body[: body.index("\n  }\n")]
+
+    # The operator is named in the prompt, and their own span is the default.
+    assert "username" in body and "defaultLicenseDaysFor" in body
+    assert "window.prompt" in body
+
+
+def test_a_reissue_defaults_to_the_span_the_operator_already_had() -> None:
+    """Replacing a lost 30-day key must not quietly promote them to a year."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function defaultLicenseDaysFor") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "license_duration_days" in body
+    # Only an account with no licence history falls back to the shared default.
+    assert "selectedLicenseDays()" in body
+
+
+def test_generation_posts_the_confirmed_span_and_can_be_cancelled() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function generateLicense") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "confirmLicenseDays" in body
+    # Cancelling the prompt must not issue a key.
+    assert "if (days === null) return;" in body
+    # The confirmed number is what goes on the wire -- not a re-read of the
+    # dropdown, which is the bug this whole path exists to prevent.
+    assert "JSON.stringify({ days })" in body
+    assert "selectedLicenseDays()" not in body
+
+
+def test_the_generate_button_carries_the_rows_own_span() -> None:
+    """The delegated click handler has only the button to read from."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderUsers") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "licenseDurationDays" in body
+
+
+def test_the_validity_dropdown_is_described_as_a_default() -> None:
+    """The hint must not promise the dropdown is used verbatim any more."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    block = html[html.index('id="license-days"') :]
+    block = block[: block.index("</div>")]
+    assert "önerir" in block, "the hint should say the value is a suggestion"
+
+
 def test_the_validity_choices_include_the_documented_spans() -> None:
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     block = html[html.index('id="license-days"') :]

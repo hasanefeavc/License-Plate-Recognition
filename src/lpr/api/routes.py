@@ -95,7 +95,14 @@ router = APIRouter()
 _optional_bearer = HTTPBearer(auto_error=False, scheme_name="BearerToken")
 
 #: Upper bound on MJPEG frames pushed to a single client.
-STREAM_MAX_FPS = 10.0
+#:
+#: The stream reads the capture worker's latest buffer, which is refreshed at
+#: the camera's own rate and never waits on detection or OCR, so this is a
+#: bandwidth-and-JPEG-encoding budget rather than a property of the pipeline.
+#: Set to the capture rate: the previous 10 made a 30 FPS webcam look stuttery
+#: for no saving that mattered, since a frame nobody is watching is never
+#: encoded at all.
+STREAM_MAX_FPS = 30.0
 STREAM_BOUNDARY = "lprframe"
 #: How long a stream may go without a frame before it gives up (seconds).
 _STREAM_IDLE_TIMEOUT_S = 30.0

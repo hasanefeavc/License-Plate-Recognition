@@ -69,6 +69,10 @@ MIN_SHARPNESS = 25.0
 #: Crop margin around a detector box, see ``preprocess.crop_with_padding``.
 CROP_PAD_RATIO = 0.06
 
+#: Weights file assumed when ``detection.model_path`` is blank. Relative to
+#: ``app.models_dir``, like every other relative model path.
+DEFAULT_WEIGHTS_NAME = "plate_yolov8n.pt"
+
 #: Tracker config handed to ultralytics when ``detection.tracker`` is unset.
 #: Ships inside the ultralytics wheel, so it resolves offline in the container.
 DEFAULT_TRACKER = "bytetrack.yaml"
@@ -80,6 +84,33 @@ DEFAULT_STREAM_ID = "default"
 #: Consecutive tracked-inference failures tolerated before the detector gives
 #: up on tracking and degrades to stateless prediction for the rest of the run.
 MAX_TRACK_FAILURES = 3
+
+
+def _downscale(frame: np.ndarray, target_width: int) -> tuple[np.ndarray, float]:
+    """``(image, scale)`` -- ``frame`` no wider than ``target_width``.
+
+    ``scale`` is the factor the returned image was multiplied by, so a box
+    found on it maps back to full-frame coordinates by dividing through. A
+    frame already at or below the target, or a target of 0, is returned
+    untouched with ``scale == 1.0`` and costs nothing.
+
+    ``INTER_AREA`` rather than the default bilinear: it averages the pixels
+    it discards, which preserves the plate's edges -- the one feature both
+    detectors key on -- instead of aliasing them away.
+    """
+    if target_width <= 0 or not isinstance(frame, np.ndarray) or frame.size == 0:
+        return frame, 1.0
+    width = int(frame.shape[1])
+    if width <= target_width:
+        return frame, 1.0
+    scale = target_width / float(width)
+    height = max(1, int(round(frame.shape[0] * scale)))
+    try:
+        resized = cv2.resize(frame, (target_width, height), interpolation=cv2.INTER_AREA)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("downscale failed; detecting at full resolution", exc_info=True)
+        return frame, 1.0
+    return resized, scale
 
 
 def plausible_box(
@@ -117,6 +148,22 @@ def plausible_box(
         if frame_area > 0 and (width * height) / frame_area < min_area_ratio:
             return False
     return True
+
+
+class UnusablePlateWeights(RuntimeError):
+    """The weights loaded fine but cannot detect plates.
+
+    Raised for a multi-class model with no plate-like class -- in practice the
+    stock COCO ``yolov8n.pt``, which is what you get when a fine-tune download
+    silently fell back to the baseline, or when a baseline file was renamed to
+    ``plate_yolov8n.pt`` to satisfy the config. Its 80 classes are person, car,
+    chair and so on; none of them is a licence plate.
+
+    Distinguished from a plain ``RuntimeError`` so :func:`lpr.detect.build_detector`
+    can fall back to the contour detector, which -- weak as it is -- at least
+    looks for plate-shaped things, instead of handing the recogniser a crop of
+    every car and pot plant in frame.
+    """
 
 
 class YoloPlateDetector:
@@ -174,7 +221,7 @@ class YoloPlateDetector:
         self._tracker_states: dict[str, Any] = {}
         self._track_failures = 0
 
-        if not self.weights_path.exists():
+        if not self.weights_path.is_file():
             raise RuntimeError(
                 f"Detection weights not found at {self.weights_path}. Fetch the "
                 "baseline model with `python scripts/fetch_models.py`, then point "
@@ -314,7 +361,15 @@ class YoloPlateDetector:
 
     @staticmethod
     def _resolve_weights(model_path: str, settings: "Settings") -> Path:
-        """Absolute path to the weights, relative paths resolved under models_dir."""
+        """Absolute path to the weights, relative paths resolved under models_dir.
+
+        A blank ``model_path`` means "the default weights file". Without this
+        branch ``Path("")`` is ``Path(".")``, which resolves to the models
+        *directory* -- and a directory passes the ``.exists()`` check below, so
+        the failure surfaced much later as an opaque error out of ultralytics
+        instead of the "weights not found" message that triggers the fallback.
+        """
+        model_path = (model_path or "").strip() or DEFAULT_WEIGHTS_NAME
         raw = Path(model_path).expanduser()
         if raw.is_absolute():
             return raw
@@ -360,15 +415,23 @@ class YoloPlateDetector:
                 return plate_ids
             if len(list(names)) == 1:
                 return None
-            logger.warning(
-                "detector weights expose %d classes and none is named like a "
-                "plate; every class will be treated as a plate candidate",
-                len(list(names)),
-            )
-            return None
+        except UnusablePlateWeights:
+            raise
         except Exception:
             logger.debug("could not inspect model class names", exc_info=True)
             return None
+
+        # Multi-class weights with nothing plate-like in them. Treating every
+        # class as a plate candidate (which is what this used to do) is the
+        # worst of the options: the recogniser is handed a crop of every
+        # person, car and chair COCO knows about, which is both useless and
+        # the single largest source of wasted OCR time on a CPU box.
+        raise UnusablePlateWeights(
+            f"the detection weights expose {len(list(names))} classes and none is "
+            "named like a licence plate -- this looks like the stock COCO model, "
+            "not a plate fine-tune. Point detection.model_path at real plate "
+            "weights; until then the pipeline falls back to contour detection."
+        )
 
     # -- Detector protocol ---------------------------------------------
 
@@ -635,13 +698,20 @@ class ContourPlateDetector:
         self._settings = settings
         self.max_candidates = int(max_candidates)
         self.min_sharpness = float(min_sharpness)
+        #: Longest edge the edge-detection pass runs at. The chain below is
+        #: dominated by ``bilateralFilter``, whose cost is proportional to the
+        #: pixel count: at 1280x720 it is ~40 ms a frame on a laptop CPU, at
+        #: 640 it is ~10 ms. Plate-sized quadrilaterals survive the downscale
+        #: comfortably, and crops are still cut from the full-resolution frame.
+        self.downscale_width = max(0, int(getattr(settings.detection, "downscale_width", 0)))
 
     def detect(self, frame: np.ndarray) -> list[PlateDetection]:
         """Find plate-shaped quadrilaterals, best (largest) first."""
         if not isinstance(frame, np.ndarray) or frame.size == 0:
             return []
         try:
-            gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            work, scale = _downscale(frame, self.downscale_width)
+            gray = work if work.ndim == 2 else cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
             filtered = cv2.bilateralFilter(gray, 11, 17, 17)
             edges = cv2.Canny(filtered, 30, 200)
             contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -659,7 +729,10 @@ class ContourPlateDetector:
                 approx = cv2.approxPolyDP(contour, 0.018 * perimeter, True)
                 if len(approx) != 4:
                     continue
-                x, y, w, h = cv2.boundingRect(approx)
+                box_x, box_y, box_w, box_h = cv2.boundingRect(approx)
+                # Back to full-frame coordinates before anything downstream
+                # (plausibility, cropping) sees the box.
+                x, y, w, h = (float(v) / scale for v in (box_x, box_y, box_w, box_h))
                 bbox = (int(x), int(y), int(x + w), int(y + h))
                 if not plausible_box(bbox, frame.shape):
                     continue
@@ -672,7 +745,7 @@ class ContourPlateDetector:
                 # candidate covers, squashed into a deliberately modest range,
                 # so downstream confidence gates cannot mistake a contour guess
                 # for a confident detection.
-                area_ratio = (w * h) / frame_area if frame_area else 0.0
+                area_ratio = float(w * h) / frame_area if frame_area else 0.0
                 confidence = float(min(0.60, 0.25 + area_ratio * 8.0))
                 detections.append(
                     PlateDetection(bbox=bbox, confidence=confidence, crop=crop)

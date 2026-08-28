@@ -638,23 +638,162 @@ def test_contour_detector_satisfies_the_protocol_and_never_raises() -> None:
 
 
 def test_yolo_detector_end_to_end() -> None:
-    """Only runs where real weights and ultralytics are both available."""
+    """Only runs where real *plate* weights and ultralytics are both available."""
     config = pytest.importorskip("lpr.config")
     pytest.importorskip("ultralytics")
     from pathlib import Path
 
     from lpr.contracts import Detector
-    from lpr.detect.yolo import YoloPlateDetector
+    from lpr.detect.yolo import UnusablePlateWeights, YoloPlateDetector
 
     settings = config.Settings()
     weights = YoloPlateDetector._resolve_weights(settings.detection.model_path, settings)
     if not Path(weights).exists():
         pytest.skip(f"no detection weights at {weights}")
 
-    detector = YoloPlateDetector(settings)
+    try:
+        detector = YoloPlateDetector(settings)
+    except UnusablePlateWeights as exc:
+        # A file existing at models/ is not the same as a plate model existing
+        # there: a checkout whose fetch fell back to the COCO baseline lands
+        # here. Covered by the fallback tests below.
+        pytest.skip(f"weights present but not a plate model: {exc}")
+
     assert isinstance(detector, Detector)
     detector.warmup()
     assert detector.detect(make_frame(480, 640)) == []
+
+
+# ---------------------------------------------------------------------------
+# Weights that load but cannot find plates
+# ---------------------------------------------------------------------------
+
+
+class _NamedModel:
+    """Stands in for a loaded ultralytics model with a given class map."""
+
+    def __init__(self, names) -> None:
+        self.names = names
+
+
+def test_a_single_class_model_needs_no_class_filter() -> None:
+    """A dedicated fine-tune: one class, and it is the plate."""
+    from lpr.detect.yolo import YoloPlateDetector
+
+    assert YoloPlateDetector._resolve_plate_classes(_NamedModel({0: "plate"})) == {0}
+    # Unnamed, but there is only one thing it can be.
+    assert YoloPlateDetector._resolve_plate_classes(_NamedModel({0: "0"})) is None
+
+
+def test_a_multi_class_model_is_filtered_to_its_plate_classes() -> None:
+    from lpr.detect.yolo import YoloPlateDetector
+
+    names = {0: "car", 1: "license_plate", 2: "person"}
+    assert YoloPlateDetector._resolve_plate_classes(_NamedModel(names)) == {1}
+
+
+def test_coco_weights_are_rejected_rather_than_treated_as_plates() -> None:
+    """80 classes, none of them a plate: the stock COCO model.
+
+    Accepting it (the old behaviour) meant every car, person and chair in
+    frame became a plate candidate and was sent to OCR -- the single largest
+    source of wasted CPU on a box with no GPU.
+    """
+    from lpr.detect.yolo import UnusablePlateWeights, YoloPlateDetector
+
+    coco = _NamedModel({index: f"class{index}" for index in range(80)})
+    with pytest.raises(UnusablePlateWeights, match="80 classes"):
+        YoloPlateDetector._resolve_plate_classes(coco)
+
+
+def test_build_detector_falls_back_to_contours_on_unusable_weights(monkeypatch) -> None:
+    from lpr.detect import ContourPlateDetector, build_detector
+    from lpr.detect.yolo import UnusablePlateWeights
+
+    def refuse(settings=None):
+        raise UnusablePlateWeights("80 classes and none is a plate")
+
+    monkeypatch.setattr("lpr.detect.YoloPlateDetector", refuse)
+    assert isinstance(build_detector(None), ContourPlateDetector)
+
+
+def test_build_detector_still_propagates_real_misconfiguration(monkeypatch) -> None:
+    """Only 'missing' and 'not a plate model' fall back; nothing else does."""
+    from lpr.detect import build_detector
+
+    def explode(settings=None):
+        raise RuntimeError("CUDA device requested but unavailable")
+
+    monkeypatch.setattr("lpr.detect.YoloPlateDetector", explode)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        build_detector(None)
+
+
+def test_a_blank_model_path_resolves_to_the_default_weights_file() -> None:
+    """Not to the models *directory*, which used to pass the exists() check."""
+    config = pytest.importorskip("lpr.config")
+    from lpr.detect.yolo import DEFAULT_WEIGHTS_NAME, YoloPlateDetector
+
+    settings = config.Settings()
+    resolved = YoloPlateDetector._resolve_weights("", settings)
+    assert resolved.name == DEFAULT_WEIGHTS_NAME
+    assert resolved.parent == settings.paths.models_dir
+
+
+# ---------------------------------------------------------------------------
+# Detection downscaling
+# ---------------------------------------------------------------------------
+
+
+def test_downscale_is_a_no_op_below_the_target() -> None:
+    from lpr.detect.yolo import _downscale
+
+    frame = make_frame(240, 320)
+    out, scale = _downscale(frame, 640)
+    assert out is frame and scale == 1.0
+
+    out, scale = _downscale(frame, 0)  # disabled
+    assert out is frame and scale == 1.0
+
+
+def test_downscale_preserves_aspect_ratio_and_reports_its_scale() -> None:
+    from lpr.detect.yolo import _downscale
+
+    out, scale = _downscale(make_frame(720, 1280), 640)
+    assert out.shape[1] == 640
+    assert out.shape[0] == 360  # 720 * 0.5
+    assert scale == pytest.approx(0.5)
+
+
+def test_contour_boxes_come_back_in_full_frame_coordinates() -> None:
+    """The whole point of downscaling: the caller must not notice it happened.
+
+    The same plate is detected at capture resolution and at 320 px wide; the
+    boxes must agree to within the rounding the downscale introduces.
+    """
+    config = pytest.importorskip("lpr.config")
+    from lpr.detect.yolo import ContourPlateDetector
+
+    frame = make_frame(480, 640)
+    frame[200:250, 220:420] = 255
+    frame[208:242, 232:408] = make_plate_crop(34, 176)
+
+    full = ContourPlateDetector(config.Settings(detection={"downscale_width": 0}))
+    small = ContourPlateDetector(config.Settings(detection={"downscale_width": 320}))
+
+    full_boxes = full.detect(frame)
+    small_boxes = small.detect(frame)
+    if not full_boxes or not small_boxes:
+        pytest.skip("the contour detector found nothing to compare")
+
+    for detection in small_boxes:
+        assert plausible_box(detection.bbox, frame.shape)
+        # Full-frame coordinates, not the 320-wide working image's.
+        assert detection.bbox[2] <= frame.shape[1]
+        assert detection.bbox[3] <= frame.shape[0]
+
+    best_full, best_small = full_boxes[0].bbox, small_boxes[0].bbox
+    assert all(abs(a - b) <= 8 for a, b in zip(best_full, best_small, strict=True))
 
 
 # ---------------------------------------------------------------------------

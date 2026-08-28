@@ -169,6 +169,8 @@ class PipelineOrchestrator:
 
         self._min_confidence = float(settings.ocr.min_confidence)
         self._frame_stride = max(1, int(settings.detection.frame_stride))
+        #: Cap on OCR passes per frame. 0 = unlimited. See DetectionConfig.
+        self._max_ocr_candidates = max(0, int(getattr(settings.detection, "max_ocr_candidates", 0)))
         self._cooldown_s = max(0.0, float(settings.voting.cooldown_s))
 
     # ------------------------------------------------------------------
@@ -335,13 +337,30 @@ class PipelineOrchestrator:
         return bytes(buffer)
 
     def latest_frame(self, camera: str) -> Frame | None:
-        """The newest raw frame for ``camera`` (no copy, do not mutate it)."""
-        with self._frame_lock:
-            frame = self._latest_frames.get(camera)
-        if frame is not None:
-            return frame
+        """The newest raw frame for ``camera`` (no copy, do not mutate it).
+
+        Read from the **capture** worker first, which updates on every frame
+        it pulls off the device, at the full capture rate.
+        ``self._latest_frames`` is written by the processing thread and only
+        ever holds frames that got past the motion gate, so preferring it --
+        as this method used to -- silently pinned the live preview to the
+        inference path: on a still scene the gate passes one frame every
+        ``motion.heartbeat_s`` (3 s by default), and the viewer watched a
+        0.3 FPS slideshow that only came alive when something moved. Worse,
+        anything that stalled the processing thread froze the preview with it,
+        which is what made a slow OCR pass look like a dead camera.
+
+        The fallback is kept for the pipeline driven without capture threads:
+        tests and any caller invoking :meth:`process_frame` directly have no
+        worker to read from.
+        """
         worker = self._cameras.get(camera)
-        return worker.latest() if worker is not None else None
+        if worker is not None:
+            frame = worker.latest()
+            if frame is not None:
+                return frame
+        with self._frame_lock:
+            return self._latest_frames.get(camera)
 
     # ------------------------------------------------------------------
     # Event fan-out
@@ -437,8 +456,62 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
 
     def _camera_configs(self) -> list[tuple[str, CameraConfig]]:
+        """The camera roles that will actually get a capture thread.
+
+        Two roles are filtered out here rather than left to fail at open time:
+
+        * **unfitted** -- ``source`` is blank. The single-camera setup is the
+          common one, and a blank source is how it is expressed. Spawning a
+          worker for it produces nothing but a "could not open source ''"
+          warning every ``reconnect_delay_s`` forever.
+        * **colliding** -- two roles naming the same physical device. V4L2
+          gives exclusive access to one opener; the loser gets
+          ``VIDIOC_QBUF: Bad file descriptor`` and reconnects forever, and
+          which of the two loses depends on thread scheduling, so the symptom
+          moves between cameras run to run. ``entry: "/dev/video0"`` with
+          ``exit: "0"`` is the same webcam spelled two ways -- see
+          :attr:`~lpr.config.CameraConfig.device_key`.
+
+        The first role naming a device keeps it, so the order below (entry,
+        then exit) decides the winner deterministically.
+        """
         cameras = self._settings.cameras
-        return [("entry", cameras.entry), ("exit", cameras.exit)]
+        selected: list[tuple[str, CameraConfig]] = []
+        claimed: dict[str, str] = {}
+
+        for role, config in (("entry", cameras.entry), ("exit", cameras.exit)):
+            if not config.enabled:
+                logger.info(
+                    "Camera %s has no source configured; skipping it", role
+                )
+                continue
+
+            key = config.device_key
+            owner = claimed.get(key) if key is not None else None
+            if owner is not None:
+                logger.warning(
+                    "Camera %s (source %r) is the same device as camera %s "
+                    "(source %r); skipping %s. Two capture threads cannot share "
+                    "one V4L2 device -- give each role its own camera, or leave "
+                    "one source blank.",
+                    role,
+                    config.source,
+                    owner,
+                    getattr(cameras, owner).source,
+                    role,
+                )
+                continue
+
+            if key is not None:
+                claimed[key] = role
+            selected.append((role, config))
+
+        if not selected:
+            logger.warning(
+                "No usable camera sources configured; the pipeline will run "
+                "without capture"
+            )
+        return selected
 
     def _make_camera_worker(self, role: str, config: CameraConfig) -> CameraWorker:
         """Build one capture worker.
@@ -514,6 +587,23 @@ class PipelineOrchestrator:
         detections = self._detect(camera, self._prepare_frame(frame))
         if not detections:
             return events
+
+        # OCR is the expensive stage -- hundreds of milliseconds per crop on
+        # CPU -- and its cost is linear in the number of boxes the detector
+        # returned. A frame holding a real plate needs one or two passes; a
+        # frame yielding a dozen candidates means the detector is firing on
+        # things that are not plates, and reading all of them is what turns a
+        # slow frame into a pipeline that never catches up. Take the
+        # best-scoring few and drop the tail.
+        if self._max_ocr_candidates and len(detections) > self._max_ocr_candidates:
+            detections = sorted(
+                detections, key=lambda d: float(getattr(d, "confidence", 0.0)), reverse=True
+            )[: self._max_ocr_candidates]
+            logger.debug(
+                "Camera %s: capped OCR at the %d best candidates",
+                camera,
+                self._max_ocr_candidates,
+            )
 
         for detection in detections:
             track_id = getattr(detection, "track_id", None)

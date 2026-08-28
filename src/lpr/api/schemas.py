@@ -963,8 +963,15 @@ class UserLicenseIn(BaseModel):
         extra="forbid", json_schema_extra={"examples": [{"days": 90}]}
     )
 
-    #: Validity in days. The dashboard offers 30 / 90 / 365 and a free field.
-    days: int = Field(default=365, ge=1, le=3650, examples=[90])
+    #: Validity in days. **Required**, deliberately: this used to default to
+    #: 365, so a caller that omitted the field -- or sent a typo'd one, since
+    #: unknown keys are forbidden but a missing one was not -- was silently
+    #: handed a one-year licence instead of an error. The span a licence grants
+    #: is not something to guess at on the operator's behalf.
+    #:
+    #: The dashboard offers 30 / 90 / 365 and a free field, and confirms the
+    #: number per user before it posts.
+    days: int = Field(ge=1, le=3650, examples=[90])
 
 
 class LicenseKeyIn(BaseModel):

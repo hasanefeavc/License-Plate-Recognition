@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,11 @@ class AppConfig(BaseModel):
 class CameraConfig(BaseModel):
     """One camera feed. ``source`` is kept as a string so it can hold either
     a numeric device index ("0") or an RTSP/HTTP URL.
+
+    A **blank** ``source`` means "this camera is not fitted on this site".
+    That is the normal single-camera setup, not an error: the orchestrator
+    skips the role entirely rather than spawning a capture thread that
+    reconnects to nothing forever.
     """
 
     source: str = "0"
@@ -66,13 +72,48 @@ class CameraConfig(BaseModel):
     queue_size: int = 2
 
     @property
-    def resolved_source(self) -> int | str:
+    def enabled(self) -> bool:
+        """False when ``source`` is blank, i.e. the role is not fitted."""
+        return bool((self.source or "").strip())
+
+    @property
+    def resolved_source(self) -> int | str | None:
         """``source`` as an int device index when it is all-digits, else the
-        raw string (URL or device path) unchanged.
+        raw string (URL or device path) unchanged. ``None`` when blank.
+
+        ``None`` is what tells :class:`~lpr.pipeline.camera.CameraWorker` and
+        the orchestrator that there is nothing to open here.
         """
-        if self.source.isdigit():
-            return int(self.source)
-        return self.source
+        source = (self.source or "").strip()
+        if not source:
+            return None
+        if source.isdigit():
+            return int(source)
+        return source
+
+    @property
+    def device_key(self) -> str | None:
+        """A stable identity for the *physical* device this camera opens.
+
+        ``"0"`` and ``"/dev/video0"`` are the same webcam addressed two ways.
+        V4L2 hands the second opener ``VIDIOC_QBUF: Bad file descriptor``
+        rather than a second stream, so the orchestrator has to recognise the
+        collision before it opens anything -- by the time OpenCV reports it,
+        one of the two cameras is already in a reconnect loop. Both spellings
+        normalise to ``"v4l2:0"`` here. Network sources normalise to their URL,
+        which is genuinely shareable but still worth reporting when duplicated.
+
+        ``None`` for a disabled camera, which collides with nothing.
+        """
+        source = (self.source or "").strip()
+        if not source:
+            return None
+        if source.isdigit():
+            return f"v4l2:{int(source)}"
+        match = re.fullmatch(r"/dev/video(\d+)", source)
+        if match:
+            return f"v4l2:{int(match.group(1))}"
+        return source.lower()
 
 
 class MotionConfig(BaseModel):
@@ -125,6 +166,27 @@ class DetectionConfig(BaseModel):
     #: CPU -- benchmark your own hardware with ``scripts/export_onnx.py``,
     #: which reports both, and set this to false if the .pt wins.
     prefer_onnx: bool = True
+    #: Frame width, in pixels, that the **contour** detector runs its edge pass
+    #: at. 0 detects at capture resolution.
+    #:
+    #: Only the contour detector reads this. YOLO has its own equivalent in
+    #: ``imgsz`` above and letterboxes internally, so pre-shrinking its input
+    #: would just add a resize -- and would cost crop quality, since crops are
+    #: cut from whatever frame the detector was handed.
+    #:
+    #: The contour chain is dominated by ``bilateralFilter``, whose cost scales
+    #: with the pixel count: ~40 ms a frame at 1280x720 against ~10 ms at 640 on
+    #: a laptop CPU. Boxes are scaled back to full-frame coordinates and crops
+    #: are still taken from the original frame, so the recogniser reads the
+    #: plate at full resolution and OCR accuracy is unaffected.
+    downscale_width: int = 640
+    #: Most crops from one frame that are allowed to reach OCR, best-scoring
+    #: first. OCR is by far the most expensive stage (hundreds of ms per crop
+    #: on CPU), and a frame with a genuine plate in it needs one or two passes
+    #: -- a frame producing ten candidates is a detector that is firing on
+    #: things that are not plates, and OCR'ing all of them is what turns a
+    #: slow frame into a stalled pipeline. 0 = no cap.
+    max_ocr_candidates: int = 3
 
 
 class PreprocessConfig(BaseModel):

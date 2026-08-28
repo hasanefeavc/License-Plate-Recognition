@@ -276,6 +276,9 @@ class CameraWorker(threading.Thread):
         self._min_interval = 1.0 / config.fps_limit if config.fps_limit > 0 else 0.0
         self._reconnect_delay = max(0.1, float(config.reconnect_delay_s))
 
+        if self._source is None:
+            self._status.last_error = "no source configured"
+
     # -- consumer API ------------------------------------------------------
 
     def read(self, timeout: float = 1.0) -> Frame | None:
@@ -310,6 +313,16 @@ class CameraWorker(threading.Thread):
             )
 
     @property
+    def enabled(self) -> bool:
+        """False when this camera has no source, i.e. it is not fitted.
+
+        A disabled worker is safe to construct and to start -- :meth:`run`
+        returns immediately -- but the orchestrator does neither, so the
+        thread never exists in the first place.
+        """
+        return self._source is not None
+
+    @property
     def stopping(self) -> bool:
         return self._stop_event.is_set()
 
@@ -325,6 +338,15 @@ class CameraWorker(threading.Thread):
     # -- capture loop ------------------------------------------------------
 
     def run(self) -> None:  # noqa: C901 - a capture loop is inherently branchy
+        if self._source is None:
+            # Belt and braces: the orchestrator already skips unfitted roles,
+            # so reaching here means somebody started the worker directly.
+            # Return rather than spin -- an empty source is a configuration
+            # statement ("no camera here"), and retrying it forever produces a
+            # warning every reconnect_delay_s for the life of the process.
+            logger.info("Camera %s has no source configured; not capturing", self.role)
+            return
+
         logger.info("Camera %s starting on source %r", self.role, self._source)
         while not self._stop_event.is_set():
             capture = self._capture
@@ -365,6 +387,8 @@ class CameraWorker(threading.Thread):
     # -- internals ---------------------------------------------------------
 
     def _open(self) -> Any | None:
+        if self._source is None:  # pragma: no cover - run() returns first
+            return None
         try:
             import cv2
         except ImportError as exc:  # pragma: no cover - opencv missing

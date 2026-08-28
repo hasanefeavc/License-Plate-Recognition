@@ -2046,6 +2046,64 @@ def test_generating_a_key_does_not_activate_the_account(
     assert row.get("license_expires_at") is None
 
 
+def test_the_generated_key_carries_the_requested_span(
+    license_client: TestClient
+) -> None:
+    """30 days asked for is 30 days signed into the token.
+
+    The regression this guards: the dashboard used to post whatever a single
+    panel-wide dropdown said -- 365 unless somebody had changed it -- for
+    whichever row was clicked, so a 30-day operator was handed a year.
+    """
+    from lpr.user_license import inspect_key
+
+    response = license_client.post(
+        "/api/users/bekci/license", json={"days": 30}, headers=admin_auth()
+    )
+    assert response.status_code == 201
+    key = response.json()["key"]
+
+    info = inspect_key(key)
+    assert info.username == "bekci"
+    assert info.duration_days == 30, "the token must encode the span that was asked for"
+
+
+@pytest.mark.parametrize("days", [1, 30, 90, 365, 3650])
+def test_every_accepted_span_survives_the_round_trip(
+    license_client: TestClient, days: int
+) -> None:
+    from lpr.user_license import inspect_key
+
+    response = license_client.post(
+        "/api/users/bekci/license", json={"days": days}, headers=admin_auth()
+    )
+    assert response.status_code == 201
+    assert inspect_key(response.json()["key"]).duration_days == days
+
+
+def test_omitting_the_span_is_refused_rather_than_defaulted_to_a_year(
+    license_client: TestClient
+) -> None:
+    """A missing `days` used to mean 365 silently.
+
+    Unknown keys were already forbidden, but a *missing* one was not, so a
+    caller with a typo'd field name got a one-year licence and no complaint.
+    The span a licence grants is not something to guess at.
+    """
+    response = license_client.post(
+        "/api/users/bekci/license", json={}, headers=admin_auth()
+    )
+    assert response.status_code == 422
+
+
+def test_an_out_of_range_span_is_refused(license_client: TestClient) -> None:
+    for days in (0, -1, 3651):
+        response = license_client.post(
+            "/api/users/bekci/license", json={"days": days}, headers=admin_auth()
+        )
+        assert response.status_code == 422, f"{days} should not be issuable"
+
+
 def test_a_generated_key_still_leaves_the_operator_blocked(
     license_client: TestClient
 ) -> None:
@@ -2093,6 +2151,53 @@ def test_revoking_keeps_the_key_but_changes_the_status(
     assert response.status_code == 200
     assert response.json()["status"] == "revoked"
     assert users_repo.rows["bekci"]["license_key"] == key
+
+
+def test_a_30_day_key_yields_a_30_day_licence_end_to_end(
+    license_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """The whole reported path: generate 30 -> activate -> read back 30.
+
+    Checks the three places the number has to agree: the signed token, the
+    stored account row, and what /api/users hands the dashboard to render.
+    """
+    from lpr.user_license import inspect_key
+
+    generated = license_client.post(
+        "/api/users/bekci/license", json={"days": 30}, headers=admin_auth()
+    )
+    assert generated.status_code == 201
+    key = generated.json()["key"]
+
+    # 1. the token payload
+    assert inspect_key(key).duration_days == 30
+
+    # A key is issued to a person and is activated by that person: the route
+    # binds it to the calling account, so bekci enters their own key.
+    activated = license_client.post(
+        "/api/license/activate", json={"key": key}, headers=operator_auth()
+    )
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["duration_days"] == 30
+
+    # 2. the stored row
+    row = users_repo.rows["bekci"]
+    assert int(row["license_duration_days"]) == 30
+
+    # 3. what the dashboard renders
+    listed = {
+        r["username"]: r
+        for r in license_client.get("/api/users", headers=admin_auth()).json()
+    }
+    assert listed["bekci"]["license_duration_days"] == 30
+    assert listed["bekci"]["license_status"] == "active"
+
+    # And the date the table prints is 30 days out, not 365.
+    from datetime import datetime, timezone
+
+    expires = datetime.fromisoformat(listed["bekci"]["license_expires_at"])
+    remaining = (expires - datetime.now(timezone.utc)).total_seconds() / 86400.0
+    assert 29 <= remaining <= 30, f"{remaining:.1f} days -- expected a 30-day span"
 
 
 def test_the_user_listing_reports_live_licence_state(

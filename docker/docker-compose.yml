@@ -7,39 +7,18 @@ services:
     container_name: lpr-api
     restart: unless-stopped
     user: "0:0"
-    ports:
-      - "8000:8000"
+    network_mode: "host"
     devices:
       - "/dev/video0:/dev/video0"
       - "/dev/video1:/dev/video1"
-      # Röle cihazını USB'ye taktığında aşağıdaki satırın başındaki '#' işaretini kaldır:
-      # - "/dev/ttyUSB0:/dev/ttyUSB0"
     volumes:
       - ../data:/app/data
       - ../models:/app/models
       - ../config.yaml:/app/config.yaml:ro
-      # The repo itself, so `git pull` has a checkout to work in:
       - ..:/repo
-      # The Docker socket, so the container can rebuild its own stack:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       LPR_SYSTEM_UPDATE__REPO_DIR: /repo
     env_file:
       - path: ../.env
         required: false
-
-    # --- Serial relay passthrough (Linux hosts only) --------------------
-    # Uncomment to expose a physical serial gate relay to the container.
-    # devices:
-    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
-
-    # --- GPU acceleration (optional) -------------------------------------
-    # Requires the NVIDIA Container Toolkit on the host and a CUDA-enabled
-    # image (see the CPU/GPU note at the top of docker/Dockerfile).
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]

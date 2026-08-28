@@ -1884,6 +1884,11 @@
         generate.textContent = "Lisans Üret";
         generate.dataset.username = username;
         generate.dataset.licenseAction = "generate";
+        // The row's own licence span, carried on the button so the delegated
+        // click handler can pre-fill with it instead of the shared dropdown.
+        if (row.license_duration_days) {
+          generate.dataset.licenseDurationDays = String(row.license_duration_days);
+        }
         actions.append(generate);
 
         if (row.license_key) {
@@ -1948,7 +1953,7 @@
     return wrap;
   }
 
-  /** The validity the admin picked, in days. */
+  /** The panel-wide default validity, in days. */
   function selectedLicenseDays() {
     const choice = el["license-days"] ? el["license-days"].value : "365";
     if (choice !== "custom") return Number(choice) || 365;
@@ -1956,8 +1961,50 @@
     return Number.isFinite(custom) && custom > 0 ? Math.min(3650, custom) : 365;
   }
 
-  async function generateLicense(username) {
-    const days = selectedLicenseDays();
+  /**
+   * The validity to offer for one operator, in days.
+   *
+   * A re-issue defaults to the span that operator already had, so replacing a
+   * lost 30-day key does not quietly promote them to a year. Only a first
+   * issue falls back to the panel's dropdown, which is the admin stating a
+   * default for accounts that have no history to inherit.
+   */
+  function defaultLicenseDaysFor(row) {
+    const previous = Number(row && row.license_duration_days);
+    if (Number.isFinite(previous) && previous > 0) return Math.min(3650, previous);
+    return selectedLicenseDays();
+  }
+
+  /**
+   * Confirm the validity for this specific operator.
+   *
+   * Returns the agreed number of days, or null if the admin cancelled.
+   *
+   * The dropdown above the table is one control shared by every row, so
+   * clicking "Lisans Üret" used to issue whatever it happened to say --
+   * "1 yıl" unless somebody had changed it -- with nothing on screen tying
+   * that number to the row being clicked. Naming the operator and their span
+   * in the prompt is what makes the two agree.
+   */
+  function confirmLicenseDays(username, row) {
+    const suggested = defaultLicenseDaysFor(row);
+    const answer = window.prompt(
+      `${username} için lisans süresi (gün):`,
+      String(suggested)
+    );
+    if (answer === null) return null;  // cancelled
+    const days = Number(String(answer).trim());
+    if (!Number.isFinite(days) || days < 1) {
+      modalStatus(el["users-status"], "Geçersiz gün sayısı.", "bad");
+      return null;
+    }
+    return Math.min(3650, Math.floor(days));
+  }
+
+  async function generateLicense(username, row) {
+    const days = confirmLicenseDays(username, row);
+    if (days === null) return;
+
     modalStatus(el["users-status"], `${username} için lisans üretiliyor...`, "muted");
     try {
       const issued = await api(`/api/users/${encodeURIComponent(username)}/license`, {
@@ -2259,8 +2306,11 @@
         const button = event.target.closest("button[data-username]");
         if (!button || button.disabled) return;
         const who = button.dataset.username;
-        if (button.dataset.licenseAction === "generate") generateLicense(who);
-        else if (button.dataset.licenseAction === "revoke") revokeLicense(who);
+        if (button.dataset.licenseAction === "generate") {
+          generateLicense(who, {
+            license_duration_days: Number(button.dataset.licenseDurationDays) || 0,
+          });
+        } else if (button.dataset.licenseAction === "revoke") revokeLicense(who);
         else removeUser(who);
       });
     }
