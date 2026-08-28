@@ -939,3 +939,70 @@ def test_a_cooldown_repeat_does_not_re_alert(db, monkeypatch, frame) -> None:
         pipeline.process_frame("entry", frame)
 
     assert len(notifier.sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# The capture loop never runs on the caller's thread
+# ---------------------------------------------------------------------------
+
+
+def test_a_camera_that_cannot_open_does_not_block_the_caller(tmp_settings) -> None:
+    """An absent /dev/video0 must cost the *worker* time, never the caller.
+
+    `cv2.VideoCapture` on a missing device can take a noticeable moment, and a
+    reconnect loop that ran anywhere but its own thread would put that latency
+    straight into whatever called it -- an HTTP handler, or the event loop.
+    """
+    config = tmp_settings.cameras.entry
+    config.source = "/dev/definitely-not-a-camera"
+    config.reconnect_delay_s = 0.05
+
+    worker = CameraWorker("entry", config)
+    started = time.monotonic()
+    worker.start()
+    start_cost = time.monotonic() - started
+
+    try:
+        # start() hands off to the thread; it must not wait for a probe.
+        assert start_cost < 0.5, f"start() blocked for {start_cost:.2f}s"
+
+        # And the consumer side stays responsive while the worker retries.
+        began = time.monotonic()
+        assert worker.read(timeout=0.05) is None
+        assert time.monotonic() - began < 0.5
+    finally:
+        worker.stop(timeout=2)
+
+
+def test_the_capture_loop_runs_on_the_worker_thread(tmp_settings) -> None:
+    """Pins where `_open` is called from, which is the property that matters."""
+    config = tmp_settings.cameras.entry
+    config.source = "/dev/definitely-not-a-camera"
+    config.reconnect_delay_s = 0.05
+
+    worker = CameraWorker("entry", config)
+    threads: list[str] = []
+    original = worker._open
+
+    def watched():
+        threads.append(threading.current_thread().name)
+        return original()
+
+    worker._open = watched
+    caller = threading.current_thread().name
+
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while not threads and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert threads, "the worker never attempted to open the camera"
+        assert caller not in threads, "the open ran on the caller's thread"
+        assert all(name.startswith("camera-") for name in threads)
+    finally:
+        worker.stop(timeout=2)
+
+
+def test_the_worker_is_a_daemon_so_it_cannot_hold_shutdown_open(tmp_settings) -> None:
+    worker = CameraWorker("entry", tmp_settings.cameras.entry)
+    assert worker.daemon is True

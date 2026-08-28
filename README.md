@@ -724,6 +724,20 @@ it had been due to end.
 Keys are bound to the account they were issued to. Without that, any operator
 could activate a colleague's key and inherit its validity.
 
+### Where the licence checks run
+
+Both the revocation check and the licence check read SQLite, and both sit on
+every authenticated request. They run through `asyncio.to_thread`, not inline:
+a synchronous read on the event loop is a millisecond when the database is
+idle, but under write contention it waits on the busy-timeout and stalls *every*
+concurrent request rather than only its own.
+
+They also resolve the repository as a **real FastAPI dependency**
+(`Depends(get_user_repository)`) rather than calling the provider directly.
+`app.dependency_overrides` is keyed on the callable's identity, so a direct call
+— or a thin local wrapper — silently bypasses any override and reaches the
+process's real database.
+
 ### Enforcement
 
 `require_license` gates every operational endpoint and answers **402 Payment
@@ -959,6 +973,24 @@ In the dashboard both live where the data does — **İçe Aktar (CSV)** and
 ---
 
 ## Remote updates (OTA)
+
+The **Sistem Güncellemesi** card in Ayarlar (`#settings-ota-section`) is always
+rendered, for both roles. What varies is whether its two buttons —
+**Güncellemeleri Kontrol Et** and **Sistemi Güncelle** — are live:
+
+| Server state | Card | Buttons |
+|---|---|---|
+| `system_update.enabled: true` | shown | enabled |
+| `system_update.enabled: false` | shown | disabled, naming the setting |
+| `/api/system/version` fails | shown | disabled, with the error |
+| Endpoint absent (older build) | shown | disabled, saying so |
+
+It used to start hidden and be revealed only on a successful version call with
+`update_enabled`. That lost the card in two ways: a server with updates off
+showed nothing at all, and *any* error before the reveal left it hidden with
+the reason swallowed. Fetching the update status and history is best-effort —
+neither can take the card down.
+
 
 An admin can pull the latest code and rebuild the stack from the dashboard —
 **Ayarlar → Sistem Güncellemesi** — instead of SSHing into every site.
@@ -1220,19 +1252,19 @@ make fmt
 
 ### Test suite
 
-**849 passing tests** across 23 modules (851 collected: 849 pass, 1 skipped, 1 known
+**862 passing tests** across 23 modules (864 collected: 862 pass, 1 skipped, 1 known
 failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 131 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_api.py` | 132 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_web_ui.py` | 85 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
-| `test_web_ui.py` | 76 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
-| `test_pipeline.py` | 47 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
+| `test_pipeline.py` | 50 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
 | `test_db.py` | 42 | Repositories, migrations, retention, system-event trail, partial plate updates |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
 | `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
@@ -1253,7 +1285,7 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 851 collected tests. Every
+`test_preprocess_pipeline.py` together account for 220 of the 864 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

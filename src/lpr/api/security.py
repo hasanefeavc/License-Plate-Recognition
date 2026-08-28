@@ -20,15 +20,17 @@ module only ever asks the repository "is this password correct?" and turns a
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 import jwt
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from lpr.api.deps import get_user_repository
 from lpr.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -231,27 +233,22 @@ def resolve_live_user(user: AuthUser, user_repo: Any = None) -> AuthUser:
     return user if role == user.role else AuthUser(username=user.username, role=role)
 
 
-def _request_user_repo(request: Request | None) -> Any:
-    """The app's user repository, or ``None``.
-
-    Routed through :mod:`lpr.api.deps` rather than constructing a repository
-    here so the app's cached instance (and any test override) is the one used
-    -- building our own would quietly reach past both, at the cost of a test
-    suite that talks to the developer's real database.
-    """
-    if request is None:
-        return None
-    try:
-        from lpr.api import deps
-
-        return deps.get_user_repository(request)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("Kullanıcı deposu çözümlenemedi", exc_info=True)
-        return None
+#: The user repository, resolved the way FastAPI resolves everything else.
+#:
+#: Declared as a real dependency rather than fetched with
+#: ``deps.get_user_repository(request)``. Calling a provider directly bypasses
+#: ``app.dependency_overrides`` entirely -- the auth path would then reach past
+#: any override and talk to the process's real database, which is both wrong in
+#: a test and surprising in an app that swaps the repository for any reason.
+#: Names ``deps.get_user_repository`` itself, not a wrapper around it.
+#: ``app.dependency_overrides`` is keyed on the callable's *identity*, so a
+#: local indirection -- however thin -- would never be substituted, and the
+#: auth path would quietly keep talking to the real database.
+UserRepo = Annotated[Any, Depends(get_user_repository)]
 
 
 async def current_user(
-    request: Request = None,  # type: ignore[assignment]
+    user_repo: UserRepo,
     credentials: Annotated[
         HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)
     ] = None,
@@ -263,7 +260,12 @@ async def current_user(
         raise _unauthorized("Kimlik doğrulama gerekli")
     try:
         user = user_from_token(credentials.credentials)
-        return resolve_live_user(user, _request_user_repo(request))
+        # The revocation check reads SQLite, and this dependency runs on every
+        # authenticated request. Left inline it would be a synchronous read on
+        # the event loop -- normally a millisecond, but under write contention
+        # it waits on the busy-timeout and stalls *every* concurrent request,
+        # not just its own. Off the loop it can only ever delay itself.
+        return await asyncio.to_thread(resolve_live_user, user, user_repo)
     except AuthError as exc:
         raise _unauthorized(str(exc)) from exc
 
@@ -282,7 +284,7 @@ async def require_admin(
 
 async def require_license(
     user: Annotated[AuthUser, Depends(current_user)],
-    request: Request = None,  # type: ignore[assignment]
+    user_repo: UserRepo,
 ) -> AuthUser:
     """Like :func:`current_user`, but an operator must hold a live licence.
 
@@ -304,11 +306,11 @@ async def require_license(
     if not requires_license(user.role):
         return user
 
-    repo = _request_user_repo(request)
-    if repo is None:
+    if user_repo is None:  # pragma: no cover - provider always returns one
         return user
     try:
-        row = repo.get(user.username)
+        # Off the event loop, for the same reason as the revocation check above.
+        row = await asyncio.to_thread(user_repo.get, user.username)
     except Exception:
         logger.warning(
             "Lisans okunamadı, istek kabul ediliyor: %s", user.username, exc_info=True

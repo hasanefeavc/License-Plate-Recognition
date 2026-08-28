@@ -277,26 +277,71 @@ def test_the_history_export_asks_the_server_not_the_rendered_page() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_update_panel_starts_hidden() -> None:
-    """It is revealed only for an admin on a server with the feature enabled.
+def test_the_ota_card_is_always_rendered() -> None:
+    """It must not vanish for a role or for a server that has updates off.
 
-    Shipping it visible would offer every operator a button that can only ever
-    come back 403, and every non-updatable deployment one that only 503s.
+    A card that disappears tells an operator nothing about why; a disabled
+    button with a reason tells them everything.
     """
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    section = html[html.index('id="update-section"') :][:200]
-    assert "hidden" in section
+    start = html.index('id="settings-ota-section"')
+    assert "hidden" not in html[start : html.index(">", start)]
 
 
-def test_the_update_panel_is_gated_on_server_enablement_only() -> None:
-    """Operators run OTA updates on this deployment, so the panel is not
-    role-gated. It still respects the server's own switch: offering a button
-    that can only ever 503 helps nobody."""
+def test_the_ota_card_survives_a_failing_version_call() -> None:
+    """Any error must leave the card up with the reason in it.
+
+    The old code hid the section first and revealed it only on success, so a
+    blip left it hidden and the message swallowed.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function refreshUpdatePanel") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "section.hidden = false" in body
+    assert "section.hidden = true" not in body
+    assert "setUpdateAvailable(false" in body, "a failure must explain itself"
+
+
+def test_the_ota_card_explains_a_server_with_updates_disabled() -> None:
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("async function refreshUpdatePanel") :]
     body = body[: body.index("\n  }\n")]
     assert "update_enabled" in body
+    assert "system_update.enabled" in body, "name the setting the operator must ask about"
+
+
+def test_the_ota_subcalls_cannot_take_the_card_down() -> None:
+    """Status and history are extras; neither may abort the panel."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function refreshUpdatePanel") :]
+    body = body[: body.index("\n  }\n")]
+    assert "refreshUpdateState().catch" in body
+    assert "refreshUpdateHistory().catch" in body
+
+
+def test_both_ota_buttons_are_present_and_named() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="update-check"' in html and "Güncellemeleri Kontrol Et" in html
+    assert 'id="update-run"' in html and "Sistemi Güncelle" in html
+
+
+def test_checking_for_updates_does_not_install_anything() -> None:
+    """"Kontrol Et" must not be a second "Güncelle" with a softer label."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function checkForUpdates") :]
+    body = body[: body.index("\n  }\n")]
+    assert '"/api/system/version"' in body
+    assert '"POST"' not in body and "/api/system/update" not in body
+
+
+def test_the_ota_card_is_not_role_gated() -> None:
+    """Operators run OTA updates on this deployment."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function refreshUpdatePanel") :]
+    body = body[: body.index("\n  }\n")]
     assert 'state.role !== "admin"' not in body
+    assert 'state.role === "admin"' not in body
 
 
 def test_the_update_button_asks_for_confirmation_before_posting() -> None:
@@ -854,3 +899,68 @@ def test_the_admin_modal_says_the_countdown_starts_at_activation() -> None:
     body = script[script.index("async function generateLicense") :]
     body = body[: body.index("\n  }\n")]
     assert "operatör anahtarı girdiğinde başlar" in body
+
+
+# ---------------------------------------------------------------------------
+# Front-end initialisation
+# ---------------------------------------------------------------------------
+
+
+def test_every_wired_element_exists_in_the_page() -> None:
+    """A listener bound to a missing id throws and aborts the rest of `init()`.
+
+    The failure is silent and total: one renamed id in the markup and every
+    listener registered after it never binds, which looks like "half the
+    dashboard stopped working" with nothing in the console to explain it.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # `el["x"].addEventListener(...)` -- an unguarded bind on a registry entry.
+    unguarded = set(re.findall(r'el\["([a-z0-9-]+)"\]\.addEventListener', script))
+    missing = sorted(name for name in unguarded if f'id="{name}"' not in html)
+    assert not missing, f"init() binds listeners to ids absent from the page: {missing}"
+
+
+def test_optional_listeners_are_guarded() -> None:
+    """Anything bound behind `if (el[...])` may legitimately be absent."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    guarded = re.findall(
+        r'if \(el\["([a-z0-9-]+)"\]\) el\["\1"\]\.addEventListener', script
+    )
+    assert guarded, "the guarded-bind idiom should be in use for optional controls"
+
+
+def test_no_listener_binds_to_a_camera_element_at_boot() -> None:
+    """Initialisation must not depend on a camera being present.
+
+    The stream elements are <img> tags whose src is set later; nothing about
+    wiring them should require /dev/video0 to be producing frames.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function init()") :]
+    body = body[: body.index("\n  }\n")]
+    assert "VideoCapture" not in body
+    # Streams are attached per-session, not at boot.
+    assert "attachStream" not in body
+
+
+def test_the_element_registry_covers_every_id_it_dereferences() -> None:
+    """`el["x"]` for an id never registered is `undefined`, not an error --
+    until something dereferences it. Catch the mismatch here instead."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    registry = re.search(r"\]\.forEach\(\(id\) => \{ el\[id\] = \$\(id\); \}\);", script)
+    assert registry
+    block = script[: registry.start()]
+    block = block[block.rindex("[") :]
+    registered = set(re.findall(r'"([a-z0-9-]+)"', block))
+
+    used = set(re.findall(r'el\["([a-z0-9-]+)"\]', script))
+    # Ids built at runtime (`cam-${role}`) are not literals and not in scope here.
+    unregistered = sorted(name for name in used if name not in registered)
+    assert not unregistered, f"dereferenced but never registered: {unregistered}"
+
+    absent = sorted(name for name in registered if f'id="{name}"' not in html)
+    assert not absent, f"registered but absent from the page: {absent}"

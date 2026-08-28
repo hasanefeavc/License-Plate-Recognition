@@ -184,8 +184,8 @@
     "capacity-section", "capacity-divider",
     "occupancy", "capacity", "full-banner",
     // System update (inside the settings modal)
-    "update-section", "update-version", "update-branch", "update-dirty-row",
-    "update-run", "update-run-label", "update-spinner", "update-status",
+    "settings-ota-section", "update-version", "update-branch", "update-dirty-row",
+    "update-run", "update-check", "update-run-label", "update-spinner", "update-status",
     "update-log", "update-history", "update-history-wrap",
   ].forEach((id) => { el[id] = $(id); });
 
@@ -966,32 +966,83 @@
   function setUpdateBusy(busy, label) {
     if (el["update-run"]) el["update-run"].disabled = busy;
     if (el["update-spinner"]) el["update-spinner"].hidden = !busy;
-    setText(el["update-run-label"], label || "Güncellemeyi Denetle & Uygula");
+    setText(el["update-run-label"], label || "Sistemi Güncelle");
   }
 
   /** Show the current version, and reveal the panel only for an admin on a
    *  server that actually has the feature enabled. */
+  /** Fill the OTA card. Never hides it, and never throws.
+   *
+   *  The card used to start hidden and be revealed only on a successful
+   *  `/api/system/version` with `update_enabled`. Two ways that went wrong: a
+   *  server with updates switched off lost the whole card rather than an
+   *  explanation, and *any* error before the reveal left it hidden with the
+   *  reason swallowed. It is now always rendered — what varies is whether the
+   *  button is live and what the status line says. */
   async function refreshUpdatePanel() {
-    const section = el["update-section"];
+    const section = el["settings-ota-section"];
     if (!section) return;
-    section.hidden = true;
+    section.hidden = false;
     updateLog([]);
+    setUpdateBusy(false);
 
+    let info = null;
+    try {
+      info = await api("/api/system/version");
+    } catch (err) {
+      // A server too old to know the endpoint, or one that refused: say so in
+      // the card instead of removing it.
+      setUpdateAvailable(false, err.status === 404
+        ? "Bu sunum güncelleme uçlarını desteklemiyor."
+        : err.message);
+      return;
+    }
+
+    applyVersion(info);
+    if (!info.update_enabled) {
+      setUpdateAvailable(false, "Sunucuda güncelleme kapalı (system_update.enabled).");
+      return;
+    }
+
+    setUpdateAvailable(true, "");
+    // A previous update -- or last night's scheduled one -- may have finished
+    // while nobody was looking. Both are best-effort: neither may take the
+    // card down with it.
+    await refreshUpdateState().catch(() => {});
+    await refreshUpdateHistory().catch(() => {});
+  }
+
+  /** Enable or disable the two OTA buttons, with a reason when disabled. */
+  function setUpdateAvailable(available, reason) {
+    ["update-run", "update-check"].forEach((id) => {
+      const button = el[id];
+      if (!button) return;
+      button.disabled = !available;
+      button.title = available ? "" : reason;
+    });
+    if (!available) updateStatusText(reason, "warn");
+  }
+
+  /** Check for a newer version without installing anything. */
+  async function checkForUpdates() {
+    const before = state.commit;
+    if (el["update-check"]) el["update-check"].disabled = true;
+    updateStatusText("Kontrol ediliyor...", "accent");
     try {
       const info = await api("/api/system/version");
-      section.hidden = !info.update_enabled;
-
       applyVersion(info);
-      if (!info.update_enabled) return;
-
-      setUpdateBusy(false);
-      // A previous update -- or last night's scheduled one -- may have
-      // finished while nobody was looking.
-      await refreshUpdateState();
-      await refreshUpdateHistory();
+      const now = info.commit || info.short_commit || "";
+      updateStatusText(
+        before && now && now !== before
+          ? `Yeni sürüm yüklendi: ${state.version}`
+          : `Çalışan sürüm: ${state.version}`,
+        "ok"
+      );
+      await refreshUpdateHistory().catch(() => {});
     } catch (err) {
-      // A server too old to know these endpoints simply has no update panel.
-      if (err.status !== 404) updateStatusText(err.message, "bad");
+      updateStatusText(err.message, "bad");
+    } finally {
+      if (el["update-check"]) el["update-check"].disabled = false;
     }
   }
 
@@ -2168,6 +2219,7 @@
     if (el["btn-users"]) el["btn-users"].addEventListener("click", openUsers);
     el["btn-settings"].addEventListener("click", openSettings);
     if (el["update-run"]) el["update-run"].addEventListener("click", runUpdate);
+    if (el["update-check"]) el["update-check"].addEventListener("click", checkForUpdates);
     el["btn-logout"].addEventListener("click", () => logout(""));
 
     wireModal("modal-plates");
