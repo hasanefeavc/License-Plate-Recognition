@@ -41,6 +41,7 @@ __all__ = [
     "PlateImportOut",
     "StatsOut",
     "SystemEventOut",
+    "SystemUpdateIn",
     "SystemUpdateOut",
     "TokenOut",
     "LicenseKeyIn",
@@ -91,10 +92,19 @@ def _end_of_day(value: str | None) -> str | None:
 def plate_status(row: dict[str, Any], now: str | None = None) -> str:
     """Classify one plate row for display: active / blocked / expired / guest.
 
+    The order of these checks is the same policy
+    :meth:`lpr.db.repository.PlateRepository.authorization` applies at the
+    barrier, and it has to stay that way: a badge that says "expired" for a car
+    the gate refuses as "blocked" sends an operator to fix the wrong thing.
+
     ``blocked`` outranks expiry: a barred plate whose permit also lapsed is
     still barred, and that is the more important thing to show. A plate with a
     future end date is a *guest* (a temporary permit) rather than merely
     active, because those are the rows a manager reviews.
+
+    The owning account's licence is deliberately absent from this: it governs
+    that person's access to the dashboard, not their car's access to the gate,
+    so it must not colour a badge about the car.
     """
     if row.get("blocked"):
         return "blocked"
@@ -142,8 +152,12 @@ class PlateIn(BaseModel):
     #: the end of that day, so a permit dated today is valid all of today.
     expires_at: str | None = Field(default=None, max_length=40, examples=["2027-01-01"])
     blocked: bool = Field(default=False, examples=[False])
+    #: The account this car belongs to. ``None`` -- the default -- means no
+    #: subscriber, i.e. a plate no licence governs, which is what every plate
+    #: registered before this field existed remains.
+    username: str | None = Field(default=None, max_length=40, examples=["ahmet"])
 
-    @field_validator("owner", "apartment", "expires_at", mode="before")
+    @field_validator("owner", "apartment", "expires_at", "username", mode="before")
     @classmethod
     def _strip_optional(cls, value: Any) -> Any:
         if isinstance(value, str):
@@ -204,8 +218,9 @@ class PlateUpdateIn(BaseModel):
     apartment: str | None = Field(default=None, max_length=60)
     expires_at: str | None = Field(default=None, max_length=40)
     blocked: bool | None = Field(default=None, examples=[True])
+    username: str | None = Field(default=None, max_length=40)
 
-    @field_validator("owner", "apartment", "expires_at", "note", mode="before")
+    @field_validator("owner", "apartment", "expires_at", "note", "username", mode="before")
     @classmethod
     def _strip_optional(cls, value: Any) -> Any:
         if isinstance(value, str):
@@ -249,6 +264,7 @@ class PlateDetailOut(BaseModel):
     expires_at: str | None = None
     blocked: bool = False
     added_at: str | None = None
+    username: str | None = None
     #: Derived here rather than in the browser, deliberately. Expiry decides
     #: whether the gate opens, and that comparison is made against the
     #: *server's* clock -- a dashboard on a machine with a wrong clock must not
@@ -410,6 +426,7 @@ class StatsOut(BaseModel):
                     "grants": 61,
                     "denials": 26,
                     "ocr_skipped": 412,
+                    "fast_path_hits": 87,
                     "cameras": [],
                 }
             ]
@@ -424,6 +441,9 @@ class StatsOut(BaseModel):
     denials: int = Field(default=0, ge=0, examples=[26])
     #: OCR passes skipped because the plate's track had already been decided.
     ocr_skipped: int = Field(default=0, ge=0, examples=[412])
+    #: Gate decisions taken on the first confident read of a registered
+    #: plate. Against ``grants``, the fast path's hit rate.
+    fast_path_hits: int = Field(default=0, ge=0, examples=[87])
     cameras: list[CameraStatusOut] = Field(default_factory=list)
 
 
@@ -447,6 +467,7 @@ class MetricsOut(BaseModel):
                     "grants": 61,
                     "denials": 26,
                     "ocr_skipped": 412,
+                    "fast_path_hits": 87,
                     "motion_skipped": 1284510,
                     "frames_read": 1296100,
                     "frames_dropped": 42,
@@ -469,6 +490,9 @@ class MetricsOut(BaseModel):
     grants: int = Field(default=0, ge=0, examples=[61])
     denials: int = Field(default=0, ge=0, examples=[26])
     ocr_skipped: int = Field(default=0, ge=0, examples=[412])
+    #: Gate decisions taken on the first confident read of a registered
+    #: plate. Against ``grants``, the fast path's hit rate.
+    fast_path_hits: int = Field(default=0, ge=0, examples=[87])
     motion_skipped: int = Field(default=0, ge=0, examples=[1284510])
     frames_read: int = Field(default=0, ge=0, examples=[1296100])
     frames_dropped: int = Field(default=0, ge=0, examples=[42])
@@ -694,6 +718,13 @@ class LoginIn(BaseModel):
 
     username: str = Field(min_length=1, max_length=64, examples=["admin"])
     password: str = Field(min_length=1, max_length=256, examples=["s3cret!"])
+    #: Optional licence key, activated as part of signing in.
+    #:
+    #: An account whose licence has lapsed is refused at login, and activation
+    #: normally needs a session -- so without this an operator holding a valid
+    #: replacement key would have no way to use it. Sending it here activates
+    #: first and admits the same request. Ordinary logins leave it unset.
+    license_key: str | None = Field(default=None, max_length=2048)
 
     @field_validator("username", mode="before")
     @classmethod
@@ -819,6 +850,30 @@ class VersionOut(BaseModel):
     update_enabled: bool = Field(default=False, examples=[True])
 
 
+class SystemUpdateIn(BaseModel):
+    """Body of ``POST /api/system/update``. Entirely optional.
+
+    The body carries exactly one flag and nothing else. That is a deliberate
+    limit rather than an oversight: the remote, branch, repository directory
+    and compose file are configuration, so there is nowhere in this model for
+    a caller to name *what* gets pulled or built. Unknown keys are ignored,
+    which keeps an older client that posts no body -- or a curious one that
+    posts a ``remote`` -- working and harmless respectively.
+    """
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{"force": True}]})
+
+    #: Rebuild and restart even when the pull brings nothing new.
+    #:
+    #: The default path treats "already on the newest commit" as a reason
+    #: *not* to rebuild, because a rebuild takes the cameras and the barrier
+    #: down for a few minutes. ``force`` says the operator wants that outage
+    #: anyway -- the usual reasons being a container running a stale image, an
+    #: edited ``.env`` that only a recreate will pick up, or a checkout that
+    #: cannot fast-forward and therefore never reaches the build at all.
+    force: bool = Field(default=False, examples=[True])
+
+
 class SystemUpdateOut(BaseModel):
     """Response of ``POST /api/system/update`` and ``GET /api/system/update``.
 
@@ -854,6 +909,11 @@ class SystemUpdateOut(BaseModel):
     finished_at: float | None = Field(default=None)
     commit_before: str | None = Field(default=None)
     commit_after: str | None = Field(default=None)
+    #: This run was a forced rebuild, so the commit very probably did not move.
+    #: The UI needs it to avoid reporting "güncellendi" for a run that
+    #: deliberately upgraded nothing, and to stop waiting for a commit change
+    #: that is never coming.
+    forced: bool = Field(default=False, examples=[True])
     #: Tail of the git/compose output, for the operator to read on failure.
     log: list[str] = Field(default_factory=list)
 

@@ -25,7 +25,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -222,13 +222,101 @@ class PreprocessConfig(BaseModel):
     #: Retry a failed read on a perspective-corrected copy of the crop. Costs
     #: an extra OCR pass, but only on crops that produced no valid plate.
     rectify_perspective: bool = True
+    #: Last-resort views for a crop nothing else could read: an Otsu
+    #: binarisation for the uniformly dark night crops that defeat the adaptive
+    #: threshold, plus polarity-inverted copies for plates lit by an IR
+    #: illuminator. Same bargain as ``rectify_perspective`` -- an extra OCR
+    #: pass, paid only on crops that have already failed.
+    hard_case_variants: bool = True
+    #: Keep escalating to the harder views while the best read so far scores
+    #: below this.
+    #:
+    #: Without it a *grammatical but unconvincing* read ends the search -- and
+    #: since the pipeline then rejects anything under ``ocr.min_confidence``,
+    #: the crop is thrown away having never been shown the views most likely to
+    #: rescue it. The default matches the ``ocr.min_confidence`` default, so
+    #: out of the box the recogniser keeps trying exactly as long as its best
+    #: read would still be refused downstream. 0 restores the old behaviour of
+    #: stopping at the first grammatical read whatever its confidence.
+    escalate_below_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    #: Offer the recogniser a fourth view of each crop: the binarisation with
+    #: the ink bridges between tightly-set characters prised apart
+    #: (:func:`lpr.detect.preprocess.separate_characters`).
+    #:
+    #: This is the fix for the bold, tightly-spaced plates whose adjacent
+    #: glyphs merge into one blob at binarisation and read as a dropped or
+    #: invented character. It is an *additional* view rather than a
+    #: replacement, because the same repair applied to a delicate font thins
+    #: its strokes into gaps -- so both go to the ensemble and agreement
+    #: between views decides, which is how every other variant here works.
+    #:
+    #: Nearly free on plates that do not need it: a crop whose ink coverage
+    #: says there is no bridge, or whose view the repair would not change,
+    #: produces no extra view and therefore no extra OCR pass.
+    tight_font_variant: bool = True
+    #: ``(width, height)`` of the structuring element used for that repair.
+    #: Vertical and odd for the reasons in
+    #: :data:`lpr.detect.preprocess.TIGHT_FONT_KERNEL`; raise the height to 5
+    #: to clear thicker bridges, at the cost of eating the horizontal bar of
+    #: an E or F on a short crop.
+    tight_font_kernel: tuple[int, int] = (1, 3)
 
 
 class OcrConfig(BaseModel):
     backend: str = "easyocr"
-    gpu: bool = False
+    #: ``true``, ``false``, or ``"auto"`` (the default): probe for a usable
+    #: CUDA device and use it when there is one.
+    #:
+    #: "auto" rather than a hard ``true`` because the same ``config.yaml`` is
+    #: deployed to the GPU gate box, to CPU-only spares, and to CI. An explicit
+    #: ``true`` on a machine with no GPU is downgraded to CPU with a warning
+    #: rather than honoured, because EasyOCR raises out of its constructor in
+    #: that case and would take the whole pipeline build down with it. See
+    #: :func:`lpr.accel.resolve_gpu_flag`.
+    gpu: bool | Literal["auto"] = "auto"
     min_confidence: float = 0.5
     allowlist: str = "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
+    #: EasyOCR's horizontal box-merging threshold. Two detected boxes on the
+    #: same line are merged when the gap between them is smaller than
+    #: ``width_ths * box_height`` (easyocr/utils.py, ``group_text_box``).
+    #:
+    #: **The direction is the opposite of what it sounds like: higher merges
+    #: more.** Raising it to 0.6-0.7 makes EasyOCR *more* willing to glue
+    #: adjacent boxes together, not less. To have the plate split into more,
+    #: smaller boxes, lower it -- 0.3 is a reasonable first try.
+    #:
+    #: Left at EasyOCR's own 0.5 by default because this knob is worth much
+    #: less here than it looks. It groups *boxes*, and the characters that
+    #: merge on a bold APP plate merge inside a single box at binarisation,
+    #: which no grouping threshold can undo -- that is what
+    #: ``preprocess.tight_font_variant`` is for. It also cannot lose a read:
+    #: the recogniser already votes on each fragment separately *and* on their
+    #: concatenation, so a plate split across two boxes is scored both ways.
+    width_ths: float = Field(default=0.5, ge=0.0, le=5.0)
+    #: Where EasyOCR keeps its detection/recognition weights. Blank means
+    #: ``<app.models_dir>/easyocr``.
+    #:
+    #: EasyOCR defaults to ``~/.EasyOCR``, which inside a container is a layer
+    #: of the container filesystem -- so every ``docker compose up --build``
+    #: threw the weights away and re-downloaded ~100 MB on the next start,
+    #: and a flaky link at that moment hung or failed startup. models/ is a
+    #: bind-mounted host volume, so pointing the cache there makes the download
+    #: a once-per-machine cost instead of a once-per-container one.
+    model_dir: str = ""
+    #: Allow EasyOCR to fetch missing weights over the network at startup.
+    #: Set false on a locked-down gate box: the service then fails fast with a
+    #: message naming ``scripts/fetch_models.py`` instead of hanging on a
+    #: connection that will never complete.
+    allow_download: bool = True
+    #: Socket timeout, in seconds, applied while the reader is being built.
+    #:
+    #: EasyOCR downloads its weights with ``urllib`` and no timeout, so a
+    #: half-open connection (captive portal, dropped VPN, a NAT that blackholes
+    #: instead of resetting) leaves the container hanging in ``__init__``
+    #: forever -- past the compose healthcheck, with no log line explaining
+    #: why. Bounding the socket turns that into a prompt, diagnosable failure.
+    #: 0 restores the unbounded default.
+    download_timeout_s: float = Field(default=60.0, ge=0.0)
     #: Extra engines pooled into the per-frame ensemble vote alongside
     #: ``backend``. Empty by default: the ensemble already votes across the
     #: several enhanced views of each crop, which recovers most view-dependent
@@ -238,6 +326,46 @@ class OcrConfig(BaseModel):
     #: Engines are queried in order and the ensemble stops as soon as it holds
     #: a grammatical read, so the second one is a cost paid on hard crops only.
     ensemble_backends: list[str] = Field(default_factory=list)
+
+
+class FastPathConfig(BaseModel):
+    """Open the gate on the first confident read of a **registered** plate.
+
+    The slow path is deliberately thorough: every crop is read through a ladder
+    of enhanced views (gamma, unsharp, rectification, then the hard-case
+    binarisations), and the winning string has to be confirmed by
+    ``voting.min_votes`` separate frames before the barrier moves. That is the
+    right default for a stranger at the gate, where a misread is a security
+    event.
+
+    It is over-cautious for the common case. A resident's car, in daylight,
+    reads cleanly on the first view -- and then pays for the whole ladder and
+    waits several more frames for a verdict that never changes. This section
+    short-circuits exactly that case: when the running vote is already above
+    ``min_confidence`` *and* names a plate that
+    :meth:`~lpr.db.repository.PlateRepository.authorization` clears right now,
+    the remaining views are not computed and the gate opens on that frame.
+
+    **What is being traded.** The escalation saving is free -- the later views
+    exist to rescue an unreadable crop, and this one was read. The multi-frame
+    confirmation is not free: a single confident misread that happens to spell
+    a registered plate opens the barrier, where today it would need
+    ``voting.min_votes`` frames to agree on the same wrong string. That is why
+    the threshold defaults high and why the check is against the whitelist
+    rather than against grammar: the misread has to land on a plate that is
+    actually registered at this site.
+
+    Set ``enabled: false`` to keep every read on the slow path; the escalation
+    saving goes with it, because the two are the same early exit.
+    """
+
+    #: Whether the early exit is armed at all.
+    enabled: bool = True
+    #: How confident the running vote must be before the gate may open on it.
+    #: Floored at ``ocr.min_confidence`` in the orchestrator: a fast path that
+    #: accepted reads the ordinary path would discard would be a downgrade in
+    #: accuracy wearing the word "optimisation".
+    min_confidence: float = Field(default=0.9, ge=0.0, le=1.0)
 
 
 class VotingConfig(BaseModel):
@@ -452,6 +580,16 @@ class SystemUpdateConfig(BaseModel):
     git_remote: str = "origin"
     git_branch: str = "main"
     compose_file: str = "docker/docker-compose.yml"
+    #: Overlay compose files merged over ``compose_file``, in order, each
+    #: passed as another ``-f``. Exactly what an operator would type by hand.
+    #:
+    #: This exists because an OTA rebuild is the one place a host-specific
+    #: overlay gets silently dropped. The service is brought back up by this
+    #: module, not by the operator, so anything they normally add on the
+    #: command line -- most importantly ``docker-compose.cdi.yml``, which is
+    #: what passes the GPU through on a Podman or CDI host -- has to be named
+    #: here or every update quietly returns the site to CPU.
+    compose_overrides: list[str] = Field(default_factory=list)
     #: Fetching is quick; building an ML image is not.
     git_timeout_s: float = Field(default=120.0, gt=0, le=3600)
     build_timeout_s: float = Field(default=900.0, gt=0, le=21600)
@@ -582,6 +720,7 @@ class Settings(BaseSettings):
     preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
     voting: VotingConfig = Field(default_factory=VotingConfig)
+    fast_path: FastPathConfig = Field(default_factory=FastPathConfig)
     relay: RelayConfig = Field(default_factory=RelayConfig)
     smtp: SmtpConfig = Field(default_factory=SmtpConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -669,6 +808,20 @@ class ResolvedPaths:
     @property
     def models_dir(self) -> Path:
         p = Path(self._settings.app.models_dir).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def ocr_models_dir(self) -> Path:
+        """Where the OCR backend caches its weights; ``<models_dir>/easyocr``.
+
+        Derived from ``models_dir`` rather than from ``$HOME`` so the weights
+        land on the same bind-mounted volume as the detector's, and survive
+        container recreation. Overridable with ``ocr.model_dir`` for a shared
+        read-only model store.
+        """
+        configured = str(getattr(self._settings.ocr, "model_dir", "") or "").strip()
+        p = Path(configured).expanduser().resolve() if configured else self.models_dir / "easyocr"
         p.mkdir(parents=True, exist_ok=True)
         return p
 

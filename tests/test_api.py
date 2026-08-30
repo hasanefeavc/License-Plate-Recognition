@@ -1,9 +1,17 @@
 """Tests for the HTTP API.
 
 The pipeline and the repositories are replaced by local fakes: nothing here
-imports ``lpr.pipeline`` or ``lpr.db``, so the suite runs without torch,
-ultralytics, easyocr or a database file. The fake orchestrator implements
-exactly the public surface :mod:`lpr.api.routes` is allowed to use.
+imports ``lpr.pipeline``, so the suite runs without torch, ultralytics or
+easyocr. The fake orchestrator implements exactly the public surface
+:mod:`lpr.api.routes` is allowed to use.
+
+The one deliberate exception is the date-filtering section, which drives the
+real :class:`~lpr.db.LogRepository` over a temporary SQLite file. A fake that
+records its arguments cannot show whether a day filter actually selects that
+day, and that comparison is exactly where the bug it guards against lived.
+``lpr.db`` needs nothing but stdlib ``sqlite3``, so this costs the suite no ML
+dependency; the imports are kept function-local so collection still succeeds
+without a database.
 
 ``TestClient`` is deliberately *not* used as a context manager -- entering it
 would run the real lifespan (init_db + build_pipeline), which is precisely what
@@ -13,6 +21,7 @@ these tests replace.
 from __future__ import annotations
 
 import types
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -24,7 +33,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from lpr.api import deps  # noqa: E402
 from lpr.api.main import create_app  # noqa: E402
-from lpr.api.security import create_token  # noqa: E402
+from lpr.api.security import LICENSE_LAPSED_DETAIL, create_token  # noqa: E402
 from lpr.contracts import LprEvent, utc_now_iso  # noqa: E402
 from lpr.license import LicenseError, LicenseStatus  # noqa: E402
 
@@ -64,6 +73,8 @@ class FakeLogRepository:
         self.events = list(events or [])
         self.last_query: dict[str, Any] | None = None
         self.written: list[Any] = []
+        #: Offset the last ``dates()`` call was made with.
+        self.dates_offset: int | None = None
 
     def write(self, event: Any) -> int:
         self.written.append(event)
@@ -91,7 +102,8 @@ class FakeLogRepository:
     def recent(self, limit: int) -> list[Any]:
         return self.events[:limit]
 
-    def dates(self) -> list[str]:
+    def dates(self, tz_offset_minutes: int = 0) -> list[str]:
+        self.dates_offset = tz_offset_minutes
         return ["2026-05-02", "2026-05-01"]
 
     def purge_older_than(self, days: int) -> int:
@@ -587,6 +599,350 @@ def test_log_dates(api_client: TestClient, operator_token: str) -> None:
     assert response.json() == ["2026-05-02", "2026-05-01"]
 
 
+# ---------------------------------------------------------------------------
+# Date filtering, over a real database
+#
+# The fake log repository records the filters it was handed but does not apply
+# them, so it can prove the *plumbing* and nothing about whether a day filter
+# actually selects that day. These run the real LogRepository against real
+# SQLite, because the reported bug -- every preset except "Tümü" returning an
+# empty list -- lived entirely in the comparison the fake does not perform.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def real_log_app(api_app: Any, db: Any) -> Any:
+    """``api_app`` with the genuine LogRepository behind ``/api/logs``."""
+    from lpr.db import LogRepository
+
+    repo = LogRepository()
+    api_app.dependency_overrides[deps.get_log_repository] = lambda: repo
+    return api_app
+
+
+def _log_at(moment: datetime, plate: str, camera: str = "entry") -> None:
+    """Write one log row at a chosen instant, through the real repository.
+
+    ``moment`` is converted to UTC first, whatever timezone it arrives in,
+    because that is the only thing the production write path ever stores
+    (:func:`lpr.contracts.utc_now_iso`) and the lexical ``ts`` comparison in
+    the repository depends on every row being in that one shape. Writing a
+    ``+03:00`` offset straight through would put a 23:59 local row *after* the
+    day's upper bound as text while being before it in time -- a failure that
+    belongs to the test, not to the filter it is aiming at.
+    """
+    from lpr.db import LogRepository
+
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    LogRepository().write(
+        LprEvent(
+            ts=moment.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+            camera=camera,
+            plate=plate,
+            action="granted",
+            confidence=0.9,
+        )
+    )
+
+
+def _plates(response: Any) -> set[str]:
+    return {row["plate"] for row in response.json()}
+
+
+def test_filtering_by_today_returns_todays_logs(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """The reported bug: picking a day returned nothing at all.
+
+    ``until="2026-08-28"`` is *shorter* than the stored
+    ``"2026-08-28T14:32:11+00:00"``, so a lexical ``ts <= ?`` put every row on
+    that day after the bound and the filter matched zero rows -- while "Tümü",
+    which sends no dates, kept working. That asymmetry is the whole signature
+    of the defect.
+    """
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    _log_at(now.replace(hour=14, minute=32, second=11), "34TODAY1")
+    _log_at(now - timedelta(days=1), "34YEST01")
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={"since": today, "until": today},
+        headers=auth(operator_token),
+    )
+
+    assert response.status_code == 200
+    assert _plates(response) == {"34TODAY1"}, "today's log must come back"
+    assert yesterday != today
+
+
+def test_filtering_by_yesterday_returns_only_yesterday(
+    real_log_app: Any, operator_token: str
+) -> None:
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(days=1)
+
+    _log_at(now, "34TODAY1")
+    _log_at(yesterday, "34YEST01")
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={
+            "since": yesterday.strftime("%Y-%m-%d"),
+            "until": yesterday.strftime("%Y-%m-%d"),
+        },
+        headers=auth(operator_token),
+    )
+
+    assert _plates(response) == {"34YEST01"}
+
+
+def test_a_day_filter_includes_the_very_last_second_of_the_day(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """Both ends of the expanded window are inclusive.
+
+    23:59:59 is the row an off-by-one in the upper bound drops, and the one
+    nobody notices is missing until a night-shift read goes unaccounted for.
+    """
+    day = datetime(2026, 5, 2, tzinfo=timezone.utc)
+    _log_at(day.replace(hour=0, minute=0, second=0), "34FIRST1")
+    _log_at(day.replace(hour=23, minute=59, second=59), "34LAST01")
+    _log_at(day + timedelta(days=1), "34NEXT01")
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={"since": "2026-05-02", "until": "2026-05-02"},
+        headers=auth(operator_token),
+    )
+
+    assert _plates(response) == {"34FIRST1", "34LAST01"}
+
+
+def test_an_older_single_day_returns_its_afternoon_rows(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """The reported symptom: picking an *older* day from the dropdown was empty.
+
+    Three days back at 15:00 local is the interesting case rather than an
+    arbitrary one. It sits in the middle of the working day, so no day-boundary
+    arithmetic can excuse dropping it, and it is far enough back that a filter
+    which only ever worked for "today" -- because an unbounded query happened
+    to return today's rows anyway -- is caught here and nowhere else.
+
+    Driven through the API with the exact bounds ``web/app.js`` computes, east
+    of Greenwich, so the whole chain is under test: the browser's local-midnight
+    instants, the ``...Z`` spelling they arrive in, and the repository's
+    normalisation of both ends.
+    """
+    east = timezone(timedelta(hours=3))  # Europe/Istanbul, the deployed site
+    day = (datetime.now(east) - timedelta(days=3)).date()
+
+    def at(hour: int, minute: int = 0) -> datetime:
+        """That local day at a given wall-clock time, east of Greenwich."""
+        return datetime(day.year, day.month, day.day, hour, minute, tzinfo=east)
+
+    _log_at(at(15), "34AFT001")  # the record the report named
+    _log_at(at(0), "34FIRST1")  # local midnight, the lower edge
+    _log_at(at(23, 59), "34LAST01")  # last minute, the upper edge
+    _log_at(at(15) - timedelta(days=1), "34PREV01")
+    _log_at(at(15) + timedelta(days=1), "34NEXT01")
+
+    # Exactly what dayRange() sends: local midnight and 23:59:59.999 as UTC
+    # instants with a trailing Z.
+    since = at(0).astimezone(timezone.utc)
+    until = datetime(
+        day.year, day.month, day.day, 23, 59, 59, 999_000, tzinfo=east
+    ).astimezone(timezone.utc)
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={
+            "since": since.isoformat().replace("+00:00", "Z"),
+            "until": until.isoformat().replace("+00:00", "Z"),
+        },
+        headers=auth(operator_token),
+    )
+
+    assert response.status_code == 200
+    assert _plates(response) == {"34AFT001", "34FIRST1", "34LAST01"}
+
+
+def test_an_older_single_day_works_from_the_bare_date_too(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """The same day, filtered by the dropdown's own ``YYYY-MM-DD`` value.
+
+    Anything holding the API directly -- the CSV export, a curl, a script --
+    passes the bare date rather than recomputing instants, so both spellings
+    have to select the same afternoon row.
+    """
+    day = (datetime.now(timezone.utc) - timedelta(days=3)).date()
+    _log_at(datetime(day.year, day.month, day.day, 15, 0, tzinfo=timezone.utc), "34AFT001")
+    _log_at(datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc), "34LAST01")
+    _log_at(datetime.now(timezone.utc), "34TODAY1")
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={"since": str(day), "until": str(day)},
+        headers=auth(operator_token),
+    )
+
+    assert _plates(response) == {"34AFT001", "34LAST01"}
+
+
+def test_the_day_picker_and_the_day_filter_agree_east_of_greenwich(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """Every day the picker offers must return the row that put it there.
+
+    These are two different pieces of arithmetic -- SQLite bucketing in
+    ``dates()``, Python bounds in ``query()`` -- over the same rows, and a
+    disagreement between them is invisible until an operator picks the one day
+    that falls through the gap. Late-evening reads are where they diverge: 23:30
+    in Istanbul is stored as 20:30 UTC the *same* day, but 01:30 is stored as
+    22:30 the day *before*.
+    """
+    from lpr.db import LogRepository
+
+    east = timezone(timedelta(hours=3))
+    base = (datetime.now(east) - timedelta(days=3)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    for hour in range(24):
+        _log_at(base.replace(hour=hour), f"34H{hour:05d}")
+
+    client = TestClient(real_log_app)
+    offered = LogRepository().dates(180)
+    assert offered, "the picker must offer the day these rows landed on"
+
+    seen: set[str] = set()
+    for day_text in offered:
+        year, month, date = (int(part) for part in day_text.split("-"))
+        since = datetime(year, month, date, tzinfo=east).astimezone(timezone.utc)
+        until = datetime(
+            year, month, date, 23, 59, 59, 999_000, tzinfo=east
+        ).astimezone(timezone.utc)
+        response = client.get(
+            "/api/logs",
+            params={
+                "since": since.isoformat().replace("+00:00", "Z"),
+                "until": until.isoformat().replace("+00:00", "Z"),
+                "limit": 1000,
+            },
+            headers=auth(operator_token),
+        )
+        assert response.status_code == 200
+        assert _plates(response), f"the picker offered {day_text} but it filters to nothing"
+        seen |= _plates(response)
+
+    # Every row is reachable through some offered day: none falls in a gap.
+    assert seen == {f"34H{hour:05d}" for hour in range(24)}
+
+
+def test_the_unfiltered_view_still_returns_everything(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """"Tümü" was the one option that worked; it has to keep working."""
+    now = datetime.now(timezone.utc)
+    _log_at(now, "34TODAY1")
+    _log_at(now - timedelta(days=1), "34YEST01")
+
+    client = TestClient(real_log_app)
+    response = client.get("/api/logs", headers=auth(operator_token))
+
+    assert _plates(response) == {"34TODAY1", "34YEST01"}
+
+
+def test_full_iso_bounds_from_a_browser_are_accepted(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """What the dashboard actually sends: local midnight, as a `...Z` instant.
+
+    JavaScript's `toISOString()` yields milliseconds and a `Z`, neither of
+    which appears in the stored format. Comparing those two shapes as text is
+    only accidentally correct, so the server normalises before comparing.
+    """
+    _log_at(datetime(2026, 5, 2, 12, 0, 0, tzinfo=timezone.utc), "34MIDDAY")
+    _log_at(datetime(2026, 5, 3, 12, 0, 0, tzinfo=timezone.utc), "34NEXTDY")
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={
+            "since": "2026-05-02T00:00:00.000Z",
+            "until": "2026-05-02T23:59:59.999Z",
+        },
+        headers=auth(operator_token),
+    )
+
+    assert _plates(response) == {"34MIDDAY"}
+
+
+def test_an_offset_bearing_bound_is_converted_not_compared_as_text(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """A local-midnight bound in UTC+3 selects the local day, not the UTC one.
+
+    01:30 in Istanbul is 22:30 the previous day in UTC. An operator asking for
+    "3 May" in Istanbul must get that read; a UTC-day filter would file it
+    under 2 May and lose it.
+    """
+    _log_at(datetime(2026, 5, 2, 22, 30, 0, tzinfo=timezone.utc), "34LATE01")
+    _log_at(datetime(2026, 5, 2, 20, 0, 0, tzinfo=timezone.utc), "34EARLY1")
+
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs",
+        params={
+            "since": "2026-05-03T00:00:00+03:00",  # == 2026-05-02T21:00:00Z
+            "until": "2026-05-03T23:59:59+03:00",
+        },
+        headers=auth(operator_token),
+    )
+
+    assert _plates(response) == {"34LATE01"}
+
+
+def test_the_day_list_can_be_bucketed_in_the_operators_timezone(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """The other half of the drift: the picker must offer the operator's days.
+
+    Without a matching offset the list and the filter disagree about where the
+    day starts, and a day plainly holding rows comes back empty when chosen.
+    """
+    _log_at(datetime(2026, 5, 2, 22, 30, 0, tzinfo=timezone.utc), "34LATE01")
+
+    client = TestClient(real_log_app)
+    utc_days = client.get("/api/logs/dates", headers=auth(operator_token)).json()
+    istanbul = client.get(
+        "/api/logs/dates", params={"tz_offset": 180}, headers=auth(operator_token)
+    ).json()
+
+    assert utc_days == ["2026-05-02"]
+    assert istanbul == ["2026-05-03"], "22:30 UTC is 01:30 the next day in Istanbul"
+
+
+def test_an_implausible_timezone_offset_is_refused(
+    real_log_app: Any, operator_token: str
+) -> None:
+    """Better a 422 than a silently skewed day list."""
+    client = TestClient(real_log_app)
+    response = client.get(
+        "/api/logs/dates", params={"tz_offset": 5000}, headers=auth(operator_token)
+    )
+    assert response.status_code == 422
+
+
 def test_bad_log_camera_is_422(api_client: TestClient, operator_token: str) -> None:
     response = api_client.get(
         "/api/logs", params={"camera": "garaj"}, headers=auth(operator_token)
@@ -706,6 +1062,155 @@ def test_unknown_camera_is_404(api_client: TestClient, operator_token: str) -> N
 
 def test_stream_without_token_is_401(api_client: TestClient) -> None:
     assert api_client.get("/api/stream/entry").status_code == 401
+
+
+class RoledPipeline(FakePipeline):
+    """A pipeline that reports exactly which cameras have a capture worker.
+
+    ``frame=None`` makes it a camera that is enabled but currently silent,
+    which is the only shape a stream test can safely open: a pipeline that
+    always yields a frame streams forever and hangs the test client.
+    """
+
+    def __init__(self, roles: list[str], frame: bytes | None = None) -> None:
+        super().__init__()
+        self._roles = list(roles)
+        self.frame = frame
+        self.frame_calls = 0
+
+    def camera_roles(self) -> list[str]:
+        return list(self._roles)
+
+    def latest_frame_jpeg(self, camera: str, quality: int = 80) -> bytes | None:
+        self.frame_calls += 1
+        return self.frame
+
+
+@pytest.fixture()
+def brief_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the idle window so a frameless stream ends inside a test."""
+    from lpr.api import routes
+
+    monkeypatch.setattr(routes, "_STREAM_IDLE_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(routes, "_STREAM_IDLE_POLL_S", 0.1)
+
+
+def _pipeline_client(api_app: Any, pipeline: Any) -> TestClient:
+    api_app.state.pipeline = pipeline
+    return TestClient(api_app)
+
+
+def test_a_disabled_camera_is_refused_immediately(
+    api_app: Any, operator_token: str
+) -> None:
+    """The hang this fixes.
+
+    A camera with no worker never produces a frame, so the generator used to
+    hold the connection for the full idle timeout before giving up. A browser
+    allows only a handful of connections per host, so that dead stream was
+    paid for by every other request the page needed -- the slow load.
+    """
+    pipeline = RoledPipeline(["entry"])
+    client = _pipeline_client(api_app, pipeline)
+
+    response = client.get("/api/stream/exit", headers=auth(operator_token))
+
+    assert response.status_code == 404
+    assert "exit" in response.json()["error"]["detail"]
+    assert pipeline.frame_calls == 0, "the refusal must precede the waiting loop"
+
+
+def test_an_enabled_camera_still_streams(
+    api_app: Any, operator_token: str, brief_stream: None
+) -> None:
+    """The check must not cost a working camera its stream."""
+    client = _pipeline_client(api_app, RoledPipeline(["entry", "exit"]))
+
+    response = client.get("/api/stream/entry", headers=auth(operator_token))
+
+    assert response.status_code == 200
+    assert "multipart/x-mixed-replace" in response.headers["content-type"]
+
+
+def test_a_configured_but_disconnected_camera_is_not_refused(
+    api_app: Any, operator_token: str, brief_stream: None
+) -> None:
+    """Disabled and disconnected are different, and only one is permanent.
+
+    A camera that has a worker but is not currently connected may come back
+    inside the stream's own idle window, so it keeps its stream. 404ing it
+    would turn a passing cable fault into a blank tile until the next reload.
+    """
+    pipeline = RoledPipeline(["entry", "exit"])
+    pipeline._connected = False
+    client = _pipeline_client(api_app, pipeline)
+
+    assert client.get("/api/stream/entry", headers=auth(operator_token)).status_code == 200
+
+
+def test_a_silent_camera_is_polled_gently_not_thirty_times_a_second(
+    api_app: Any, operator_token: str, brief_stream: None
+) -> None:
+    """Each poll is a thread-pool hop, and the pool serves every other request.
+
+    Asking a dark camera at the full frame rate was ~30 hops a second
+    returning nothing, which is what made one bad camera slow the whole
+    dashboard. With a 0.3s window and a 0.1s idle poll this is a handful of
+    calls; at the frame rate it would be an order of magnitude more.
+    """
+    pipeline = RoledPipeline(["entry"])
+    client = _pipeline_client(api_app, pipeline)
+
+    client.get("/api/stream/entry", headers=auth(operator_token))
+
+    assert 1 <= pipeline.frame_calls <= 6, f"{pipeline.frame_calls} polls in a 0.3s window"
+
+
+def test_a_pipeline_that_cannot_report_its_cameras_is_given_the_benefit(
+    api_app: Any, operator_token: str, brief_stream: None
+) -> None:
+    """Unknowable must mean "allow", never "404".
+
+    Guessing wrong in this direction breaks a working camera, which is a worse
+    failure than the hang the check exists to prevent.
+    """
+
+    class Opaque(RoledPipeline):
+        def __init__(self) -> None:
+            super().__init__([])
+
+        camera_roles = None  # type: ignore[assignment]
+
+        def stats(self) -> Any:
+            return types.SimpleNamespace(started_at=0.0, plates_read=0, grants=0, denials=0)
+
+    assert client_status(api_app, Opaque(), operator_token) == 200
+
+
+def client_status(api_app: Any, pipeline: Any, token: str, camera: str = "entry") -> int:
+    return _pipeline_client(api_app, pipeline).get(
+        f"/api/stream/{camera}", headers=auth(token)
+    ).status_code
+
+
+def test_the_camera_list_falls_back_to_stats_when_there_is_no_accessor() -> None:
+    """``FakePipeline`` and older pipelines expose the roles only via stats()."""
+    from lpr.api.routes import _streamable_roles
+
+    assert _streamable_roles(FakePipeline()) == {"entry", "exit"}
+    assert _streamable_roles(RoledPipeline(["entry"])) == {"entry"}
+
+
+def test_an_unknown_role_is_still_404_before_the_camera_check(
+    api_app: Any, operator_token: str
+) -> None:
+    """A bad path stays a 404 about the *name*, not about being disabled."""
+    response = _pipeline_client(api_app, RoledPipeline(["entry"])).get(
+        "/api/stream/garaj", headers=auth(operator_token)
+    )
+
+    assert response.status_code == 404
+    assert "Bilinmeyen kamera" in response.json()["error"]["detail"]
 
 
 def test_unknown_camera_source_is_404(api_client: TestClient, admin_token: str) -> None:
@@ -955,6 +1460,8 @@ class FakeUpdater:
         self.enabled = enabled
         self.error = error
         self.starts = 0
+        #: One entry per accepted start, recording the ``force`` it was given.
+        self.forced: list[bool] = []
         self._status = types.SimpleNamespace(
             to_dict=lambda: {
                 "state": "idle",
@@ -965,6 +1472,7 @@ class FakeUpdater:
                 "finished_at": None,
                 "commit_before": None,
                 "commit_after": None,
+                "forced": False,
                 "log": [],
             }
         )
@@ -984,20 +1492,26 @@ class FakeUpdater:
     def status(self) -> Any:
         return self._status
 
-    def start(self) -> Any:
+    def start(self, force: bool = False) -> Any:
         self.starts += 1
         if self.error is not None:
             raise self.error
+        self.forced.append(bool(force))
         self._status = types.SimpleNamespace(
             to_dict=lambda: {
                 "state": "running",
                 "step": "pull",
-                "detail": "Güncelleme başlatıldı.",
+                "detail": (
+                    "Zorla yeniden derleme başlatıldı."
+                    if force
+                    else "Güncelleme başlatıldı."
+                ),
                 "running": True,
                 "started_at": 1.0,
                 "finished_at": None,
                 "commit_before": "aaa",
                 "commit_after": None,
+                "forced": bool(force),
                 "log": [],
             }
         )
@@ -1112,8 +1626,10 @@ def test_the_update_endpoint_accepts_no_caller_supplied_target(
 ) -> None:
     """A body naming another repo must not change what gets pulled.
 
-    ``start()`` takes no arguments, so there is nowhere for a caller-supplied
-    remote to go even if one were sent. This pins that shape.
+    The body model holds ``force`` and nothing else, so a caller-supplied
+    remote is dropped on the way in rather than reaching a command line. This
+    pins that shape -- the request is accepted, and the update it starts is
+    the ordinary configured one.
     """
     response = update_client.post(
         "/api/system/update",
@@ -1122,6 +1638,71 @@ def test_the_update_endpoint_accepts_no_caller_supplied_target(
     )
     assert response.status_code == 202
     assert updater.starts == 1
+    assert updater.forced == [False], "an unknown key must not turn into a force"
+
+
+def test_an_update_without_a_body_is_not_forced(
+    update_client: TestClient, admin_token: str, updater: FakeUpdater
+) -> None:
+    """The plain button posts nothing at all; that must stay the safe path."""
+    response = update_client.post("/api/system/update", headers=auth(admin_token))
+    assert response.status_code == 202
+    assert updater.forced == [False]
+    assert response.json()["forced"] is False
+
+
+def test_an_admin_can_ask_for_a_forced_rebuild(
+    update_client: TestClient, admin_token: str, updater: FakeUpdater
+) -> None:
+    """``force: true`` has to reach the updater, or the button does nothing."""
+    response = update_client.post(
+        "/api/system/update",
+        headers=auth(admin_token),
+        json={"force": True},
+    )
+    assert response.status_code == 202
+    assert updater.forced == [True]
+
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["forced"] is True, "the client needs to know not to await a new commit"
+
+
+def test_a_forced_rebuild_is_refused_while_one_is_running(
+    api_app: Any, admin_token: str
+) -> None:
+    """Forcing must not become a way around the single-flight guard."""
+    busy = FakeUpdater(error=RuntimeError("Zaten devam eden bir güncelleme var."))
+    api_app.state.system_updater = busy
+    api_app.dependency_overrides[deps.get_system_updater] = lambda: busy
+    response = TestClient(api_app).post(
+        "/api/system/update",
+        headers=auth(admin_token),
+        json={"force": True},
+    )
+    assert response.status_code == 409
+
+
+def test_a_forced_rebuild_still_needs_the_feature_enabled(
+    api_app: Any, admin_token: str
+) -> None:
+    """``force`` overrides the no-op check, never the deployment's own switch."""
+    disabled = FakeUpdater(enabled=False, error=RuntimeError("Sistem güncellemesi devre dışı."))
+    api_app.state.system_updater = disabled
+    api_app.dependency_overrides[deps.get_system_updater] = lambda: disabled
+    response = TestClient(api_app).post(
+        "/api/system/update",
+        headers=auth(admin_token),
+        json={"force": True},
+    )
+    assert response.status_code == 503
+
+
+def test_a_forced_rebuild_still_requires_authentication(
+    update_client: TestClient, updater: FakeUpdater
+) -> None:
+    assert update_client.post("/api/system/update", json={"force": True}).status_code == 401
+    assert updater.starts == 0
 
 
 class FakeSystemEventRepo:
@@ -1227,6 +1808,7 @@ class ImportablePlateRepository(FakePlateRepository):
         expires_at: str | None = None,
         blocked: bool = False,
         overwrite: bool = True,
+        username: str | None = None,
     ) -> str:
         existing = plate in self.details
         if existing and not overwrite:
@@ -1236,6 +1818,7 @@ class ImportablePlateRepository(FakePlateRepository):
             "owner": owner,
             "apartment": apartment,
             "note": note,
+            "username": username,
             "expires_at": expires_at,
             "blocked": int(blocked),
             "added_at": "2026-08-27T00:00:00+00:00",
@@ -1887,17 +2470,20 @@ def license_client(
     return TestClient(api_app)
 
 
-def test_an_unlicensed_operator_is_blocked_with_402(
+def test_an_unlicensed_operator_is_blocked_with_403(
     license_client: TestClient
 ) -> None:
-    """402, not 403. The dashboard opens the key dialog on exactly this code.
+    """403, with the detail carrying the reason.
 
-    403 would say "not your role", which is wrong and offers nothing to do.
+    A lapsed licence and an ordinary role refusal are both "you may not", and
+    the dashboard tells them apart by this exact string -- which is why it is
+    asserted here and not just the status.
     """
     response = license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
     )
-    assert response.status_code == 402
+    assert response.status_code == 403
+    assert response.json()["error"]["detail"] == LICENSE_LAPSED_DETAIL
 
 
 def test_an_admin_is_never_blocked(license_client: TestClient) -> None:
@@ -1945,7 +2531,7 @@ def test_a_revoked_licence_blocks_immediately(
     users_repo.set_license("bekci", key, state.expires_at, STATUS_REVOKED)
     assert license_client.post(
         "/api/plates", json={"plate": "06MNP99"}, headers=operator_auth()
-    ).status_code == 402
+    ).status_code == 403
 
 
 def test_reading_your_own_licence_is_never_gated(license_client: TestClient) -> None:
@@ -2000,7 +2586,7 @@ def test_activation_unblocks_the_operator(
 
     assert license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
-    ).status_code == 402
+    ).status_code == 403
 
     license_client.post(
         "/api/license/activate",
@@ -2011,6 +2597,175 @@ def test_activation_unblocks_the_operator(
     assert license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
     ).status_code == 201
+
+
+def _expire(users_repo: ManagedUserRepository, licensing: Any, username: str = "bekci") -> None:
+    """Give ``username`` a licence that ran out yesterday."""
+    from datetime import datetime, timedelta, timezone
+
+    from lpr.user_license import STATUS_ACTIVE
+
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    users_repo.set_license(
+        username, "eski-anahtar", yesterday, STATUS_ACTIVE, duration_days=30
+    )
+
+
+# -- the application door ----------------------------------------------------
+
+
+def test_an_expired_operator_cannot_log_in(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """Refused at the door, so the account never holds a token at all."""
+    _expire(users_repo, licensing)
+
+    response = license_client.post(
+        "/api/auth/login", json={"username": "bekci", "password": "parola1234"}
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["detail"] == LICENSE_LAPSED_DETAIL
+    assert "access_token" not in response.text
+
+
+def test_a_wrong_password_still_reads_as_a_wrong_password(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """The licence is checked *after* the credentials, and must not mask them.
+
+    Answering "your licence lapsed" to a typo would send an operator hunting
+    for a key they do not need.
+    """
+    _expire(users_repo, licensing)
+
+    response = license_client.post(
+        "/api/auth/login", json={"username": "bekci", "password": "yanlis-parola"}
+    )
+    assert response.status_code == 401
+
+
+def test_an_admin_logs_in_without_any_licence(license_client: TestClient) -> None:
+    """Exempt by construction; the account that issues keys cannot need one."""
+    response = license_client.post(
+        "/api/auth/login", json={"username": "mudur", "password": "parola1234"}
+    )
+    assert response.status_code == 200
+
+
+def test_a_key_sent_with_the_credentials_is_the_way_back_in(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """Otherwise the refusal is a trap: locked out of the dashboard, and out
+    of the endpoint that would unlock it."""
+    from lpr.user_license import issue_key
+
+    _expire(users_repo, licensing)
+    response = license_client.post(
+        "/api/auth/login",
+        json={
+            "username": "bekci",
+            "password": "parola1234",
+            "license_key": issue_key("bekci", 30, licensing),
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["access_token"]
+    # The countdown started here, not when the admin cut the key.
+    assert users_repo.get("bekci")["license_activated_at"]
+
+
+def test_a_key_issued_to_somebody_else_does_not_open_the_door(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    from lpr.user_license import issue_key
+
+    _expire(users_repo, licensing)
+    response = license_client.post(
+        "/api/auth/login",
+        json={
+            "username": "bekci",
+            "password": "parola1234",
+            "license_key": issue_key("baskasi", 30, licensing),
+        },
+    )
+    assert response.status_code == 400
+
+
+# -- reading the site --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/plates", "/api/logs", "/api/logs/dates", "/api/stats", "/api/cameras",
+     "/api/parking", "/api/events/export", "/api/system/version"],
+)
+def test_an_expired_operator_cannot_read_the_site_either(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any,
+    path: str,
+) -> None:
+    """A lapsed licence is not a read-only mode; it is the door being shut.
+
+    These were on plain authentication while only the write endpoints were
+    gated, which left an expired account still watching the car park.
+    """
+    _expire(users_repo, licensing)
+    response = license_client.get(path, headers=operator_auth())
+    assert response.status_code == 403
+    assert response.json()["error"]["detail"] == LICENSE_LAPSED_DETAIL
+
+
+def test_an_expired_operator_cannot_watch_the_cameras(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """The stream takes its token in the query string, so it needs its own
+    check -- and a live feed is exactly what must not survive the lapse."""
+    _expire(users_repo, licensing)
+    token = create_token("bekci", "operator")
+
+    response = license_client.get(f"/api/stream/entry?token={token}")
+    assert response.status_code == 403
+    assert response.json()["error"]["detail"] == LICENSE_LAPSED_DETAIL
+
+
+def test_an_expired_operator_cannot_hold_the_event_socket(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """A socket is a standing subscription to the site; the lapse ends it."""
+    _expire(users_repo, licensing)
+    token = create_token("bekci", "operator")
+
+    with license_client.websocket_connect(f"/api/ws/events?token={token}") as ws:
+        message = ws.receive_json()
+        assert message["type"] == "error"
+        assert message["detail"] == LICENSE_LAPSED_DETAIL
+
+
+def test_a_licensed_operator_still_reads_the_site(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """The other side of the gate: enforcement must not lock out the licensed."""
+    from lpr.user_license import activate, issue_key
+
+    key = issue_key("bekci", 30, licensing)
+    state = activate(key, "bekci", licensing)
+    users_repo.set_license(
+        "bekci", key, state.expires_at, state.status,
+        duration_days=state.duration_days, activated_at=state.activated_at,
+    )
+
+    assert license_client.get("/api/plates", headers=operator_auth()).status_code == 200
+
+
+def test_an_expired_operator_can_still_ask_who_they_are(
+    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any
+) -> None:
+    """The endpoints that explain the lapse, and undo it, stay open."""
+    _expire(users_repo, licensing)
+
+    assert license_client.get("/api/auth/me", headers=operator_auth()).status_code == 200
+    body = license_client.get("/api/license/me", headers=operator_auth()).json()
+    assert body["status"] == "expired"
+    assert body["valid"] is False
 
 
 # -- admin-side generation ---------------------------------------------------
@@ -2110,7 +2865,7 @@ def test_a_generated_key_still_leaves_the_operator_blocked(
     license_client.post("/api/users/bekci/license", json={"days": 90}, headers=admin_auth())
     assert license_client.post(
         "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
-    ).status_code == 402
+    ).status_code == 403
 
 
 def test_generating_a_licence_for_an_admin_is_refused(

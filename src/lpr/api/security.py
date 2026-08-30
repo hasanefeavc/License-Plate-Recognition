@@ -48,11 +48,14 @@ __all__ = [
     "ALGORITHM",
     "AuthError",
     "AuthUser",
+    "LICENSE_LAPSED_DETAIL",
     "OPERATOR_ROLE",
     "authenticate_user",
     "create_token",
     "current_user",
     "decode_token",
+    "license_forbidden",
+    "license_refusal",
     "require_admin",
     "require_license",
     "resolve_live_user",
@@ -282,50 +285,87 @@ async def require_admin(
     return user
 
 
-async def require_license(
-    user: Annotated[AuthUser, Depends(current_user)],
-    user_repo: UserRepo,
-) -> AuthUser:
-    """Like :func:`current_user`, but an operator must hold a live licence.
+async def license_refusal(user: AuthUser, user_repo: Any) -> str | None:
+    """``None`` when ``user`` may use the application, or the refusal detail.
+
+    The single place the application-access rule is evaluated. Four callers
+    share it -- the HTTP dependency below, the MJPEG endpoint, the WebSocket
+    handshake and the login route -- and they must agree, because an account
+    refused at login that could still open a socket would not be refused at
+    all.
 
     Administrators pass unconditionally -- see
     :func:`lpr.user_license.requires_license` for why the account that issues
     keys cannot be gated by one.
 
-    Refuses with **402 Payment Required** rather than 403. The distinction is
-    load-bearing for the dashboard: 403 means "not your role, nothing you can
-    do", while 402 means "your access lapsed, here is where you enter a key",
-    and the client opens the licence dialog on exactly this code.
-
-    A failure to *read* the licence lets the request through, for the same
+    A failure to *read* the licence lets the caller through, for the same
     reason the revocation check does: this sits on top of an already-valid
-    session, and a database hiccup must not close a working barrier.
+    credential, and a database hiccup must not lock an operator out of a
+    working installation.
+
+    Note what this does **not** touch: the barrier. A licence governs one
+    person's access to the dashboard and the API, and a resident's car is not
+    party to that contract -- see
+    :meth:`lpr.db.repository.PlateRepository.authorization`.
     """
     from lpr.user_license import license_for, requires_license
 
     if not requires_license(user.role):
-        return user
-
+        return None
     if user_repo is None:  # pragma: no cover - provider always returns one
-        return user
+        return None
     try:
-        # Off the event loop, for the same reason as the revocation check above.
+        # Off the event loop, for the same reason as the revocation check.
         row = await asyncio.to_thread(user_repo.get, user.username)
     except Exception:
         logger.warning(
             "Lisans okunamadı, istek kabul ediliyor: %s", user.username, exc_info=True
         )
-        return user
+        return None
 
     state = license_for(user.role, row)
     if state.valid:
-        return user
-
+        return None
     logger.info("Lisans engeli: %s (%s)", user.username, state.status)
-    raise HTTPException(
-        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-        detail=state.detail or "Lisans süresi doldu",
-    )
+    return LICENSE_LAPSED_DETAIL
+
+
+def license_forbidden(detail: str) -> HTTPException:
+    """The one refusal an unlicensed account ever sees: **403 Forbidden**."""
+    return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+async def require_license(
+    user: Annotated[AuthUser, Depends(current_user)],
+    user_repo: UserRepo,
+) -> AuthUser:
+    """Like :func:`current_user`, but the account must hold a live licence.
+
+    Refuses with **403 Forbidden** and :data:`LICENSE_LAPSED_DETAIL`. The
+    dashboard tells this apart from an ordinary role refusal by that exact
+    detail string, and opens the licence dialog on it -- so the two must stay
+    in step; ``test_web_ui`` asserts the page carries the same text.
+
+    This is the dependency for everything an authenticated caller does with
+    the site: operating it, and reading it. The only endpoints deliberately
+    left on :func:`current_user` are the ones an unlicensed operator needs in
+    order to *stop* being unlicensed -- ``/api/auth/me``, ``/api/license``,
+    ``/api/license/me`` and ``/api/license/activate``. Gating those would
+    leave the dashboard unable to explain why everything else refuses, and
+    would remove the way back in.
+    """
+    detail = await license_refusal(user, user_repo)
+    if detail is None:
+        return user
+    raise license_forbidden(detail)
+
+
+#: What an expired account is told, at login and on every authenticated
+#: request. One constant because four places have to agree on it: this module
+#: raises it, the login route raises it, the WebSocket closes with it, and
+#: ``web/app.js`` matches on it to tell a lapsed licence apart from an ordinary
+#: role refusal (both are 403).
+LICENSE_LAPSED_DETAIL = "Kullanıcı lisans süresi dolmuştur"
 
 
 CurrentUser = Annotated[AuthUser, Depends(current_user)]

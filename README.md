@@ -69,14 +69,20 @@ legacy/main_legacy.py   the original 836-line single-file app, kept for referenc
 ### Docker (headless core — recommended)
 
 ```bash
-cp .env.example docker/.env          # then set LPR_API__SECRET_KEY
-python scripts/fetch_models.py       # downloads baseline weights into models/
+cp .env.example docker/.env               # then set LPR_API__SECRET_KEY
+python scripts/fetch_models.py --easyocr  # baseline detector + OCR weights into models/
 docker compose -f docker/docker-compose.yml up --build
 curl http://localhost:8000/health
 ```
 
 `data/`, `models/` and `config.yaml` are bind-mounted, so the database, weights and
-settings live on the host and survive rebuilds.
+settings live on the host and survive rebuilds. `--easyocr` pre-fills
+`models/easyocr` with the ~100 MB of OCR networks; without it the first container
+start downloads them itself, which is slow and is the step that fails on a flaky
+link.
+
+The compose file requests an NVIDIA GPU — see **[GPU acceleration](#gpu-acceleration)**
+below for the toolkit it needs and how to run without one.
 
 ### Native
 
@@ -219,7 +225,7 @@ snapshots:
 | `POST`/`DELETE /api/users/{username}/license` | admin | issue / revoke an operator licence |
 | `GET /api/license/me` · `POST /api/license/activate` | user | own licence state; enter a key |
 | `GET /api/system/version` | user | deployed version (`git describe`), commit and branch |
-| `GET/POST /api/system/update` | admin | OTA update status; trigger an update (202) |
+| `GET/POST /api/system/update` | admin | OTA update status; trigger an update, optionally `{"force": true}` to rebuild anyway (202) |
 | `GET /api/system/events` | admin | operational audit trail (nightly OTA activity) |
 | `WS /ws/events?token=` | token | live plate events as JSON |
 
@@ -346,6 +352,17 @@ character is trapezoidal. `rectify_perspective` locates the plate's four-corner 
 rectangle, sizing the output from the *near* edge so the foreshortened far edge is
 stretched up to it.
 
+When no contour collapses to a clean quadrilateral — a dirty, cluttered or partly
+occluded border — it falls back to `minAreaRect` → `boxPoints`, which always yields four.
+That is a weaker correction by construction: a rectangle cannot express the trapezoid of a
+true side-on view, so warping one back is a rotation and a scale rather than a perspective
+fix. It earns its place on the case nothing else covers — a plate rotated past
+`MAX_DESKEW_DEGREES` (15°), where `deskew` refuses the angle as implausible and the
+polygon fit cannot find the outline, so the crop previously got no geometric correction at
+all. The guard is a fill ratio: `minAreaRect` returns a rectangle for *any* contour,
+including an L-shaped shadow edge, so the contour must fill ≥ 60% of its own bounding
+rectangle before that rectangle is trusted.
+
 It is deliberately conservative, because a wrong warp does not degrade a crop gracefully —
 it destroys it. A quad is rejected when it is too small (< 25% of the crop), non-convex,
 would rectify to a non-plate aspect ratio, or is merely the crop's own border (a no-op
@@ -354,6 +371,41 @@ the caller keeps what it had. Cost ≈ 0.6 ms when it runs.
 
 Rectification is an **escalation**, not a default stage: it runs only when no cheap variant
 produced a grammatical plate, so ordinary plates never pay for the extra OCR pass.
+
+#### Low light: Otsu and reversed polarity
+
+A third and last stage covers the two night failures the standard views cannot.
+
+**Otsu.** The crop pre-pass binarises with an *adaptive* threshold, which decides per
+neighbourhood — exactly right for a plate lit from one side. On a uniformly dark crop it is
+exactly wrong: every neighbourhood is flat, so each is thresholded against its own sensor
+noise and the result is speckle. `otsu_binarize` takes a single global cut from the whole
+histogram, which is what that crop actually needs. It declines when the 5th–95th percentile
+spread is under 12 grey levels, because the "two modes" it would split are then the noise
+floor and itself.
+
+**Inversion.** Both recognisers are trained on dark glyphs over a light field. An IR
+illuminator against a retroreflective plate inverts that, and a negative is the only thing
+that fixes it. `hard_case_variants` supplies the Otsu image, the negative of the grayscale,
+and the negative of the Otsu image.
+
+These views are *wrong* for an ordinary daylight plate — inverting a perfectly readable crop
+invites a confident misread — so like rectification they are an escalation, reached only
+after the earlier stages have failed.
+
+#### When escalation stops
+
+The recogniser stops climbing the stages as soon as it holds a read that is **grammatical
+and confident enough**, the floor being `preprocess.escalate_below_confidence`.
+
+The confidence half of that test matters more than it looks. Grammar alone used to end the
+search, so a read that parsed at 0.3 stopped it — and the pipeline then discarded that read
+for being under `ocr.min_confidence`. The crop was thrown away having never been shown the
+views most likely to rescue it, which are precisely the angled and low-light crops the later
+stages exist for. The default matches the `ocr.min_confidence` default, so out of the box
+the recogniser keeps trying exactly as long as its best read would still be refused
+downstream. Every extra ballot also feeds the same vote, so a correct-but-unsure read is
+more likely to be *confirmed* by the harder views than overturned by them.
 
 #### Configuration
 
@@ -365,6 +417,8 @@ never what they learned, so none of it requires the detector retrained.
 | `preprocess.normalize_lighting` | `true` | Dynamic gamma + percentile contrast stretch, ahead of CLAHE. Runs before CLAHE deliberately: CLAHE equalises per 8×8 tile and will amplify the noise inside a black tile to full scale if the crop arrives globally underexposed. Self-limiting — a normally-exposed plate passes through untouched. |
 | `preprocess.crop_unsharp_amount` | `0.6` | Unsharp strength in the crop pre-pass. `0` disables it. |
 | `preprocess.rectify_perspective` | `true` | Retry a failed read on a perspective-corrected crop. One extra OCR pass, only on crops that already produced nothing grammatical. |
+| `preprocess.hard_case_variants` | `true` | Last-resort Otsu and polarity-inverted views for dark and IR-lit crops. Same bargain as rectification — an extra OCR pass, paid only on crops that already failed. |
+| `preprocess.escalate_below_confidence` | `0.5` | Keep escalating while the best read scores below this. `0` restores stopping at the first grammatical read whatever its confidence. |
 | `ocr.ensemble_backends` | `[]` | Extra OCR engines pooled into the per-frame vote as equal voters, e.g. `[paddleocr]`. |
 | `preprocess.frame_enhance` | `false` | Whole-frame CLAHE (on the LAB lightness channel, so hue is left alone) plus a mild unsharp mask, applied **before the detector**. ≈ 12 ms per 720p frame. |
 
@@ -385,6 +439,59 @@ paid on the handful of frames per second that are actually going to be looked at
 capture loop keeps draining the camera at full rate regardless. The enhanced frame goes
 to the detector only: `latest_frame()`, the MJPEG preview and the evidence snapshot all
 keep the untouched frame, so what gets recorded stays what the camera saw.
+
+### Fast path: the first confident read of a registered plate
+
+The accuracy machinery below is built for the hard case — a dirty plate at
+night, at an angle, where the answer is worth several OCR passes and several
+frames of agreement. A resident's car in daylight is not that case, and until
+this existed it paid the same bill: the full escalation ladder, then
+`voting.min_votes` frames before the barrier moved.
+
+The fast path short-circuits it. After **every view** — not every stage, since
+the first stage is itself several OCR passes — the running vote is offered to
+the pipeline. If it is above `fast_path.min_confidence` *and* names a plate
+`PlateRepository.authorization` clears at that instant, the remaining views are
+never computed and the gate opens on that frame.
+
+```yaml
+fast_path:
+  enabled: true
+  min_confidence: 0.9
+```
+
+What is skipped, and what that costs:
+
+| | Slow path | Fast path |
+|---|---|---|
+| Enhanced views (gamma, unsharp, rectify, Otsu) | computed as needed | never computed |
+| Frames before the gate moves | `voting.min_votes` (default 3) | 1 |
+| Applies to | every read | reads that clear the whitelist *now* |
+
+The escalation saving is free: those views exist to rescue a crop that did not
+read, and this one did. **The multi-frame saving is not free**, and it is worth
+being explicit about the trade. A single confident misread that happens to
+spell a *registered* plate now opens the barrier, where before it would have
+needed `voting.min_votes` frames to agree on the same wrong string. Two things
+bound that: the threshold defaults to 0.9, and the misread has to land on a
+plate actually registered at this site rather than merely on something
+plate-shaped. A site that would rather keep the confirmation sets
+`fast_path.enabled: false`, which also gives up the escalation saving — they
+are the same early exit.
+
+Everything that is not a live permit keeps the full path: an unknown plate, a
+blocked one, and an expired permit are exactly the cases the enhanced views and
+the multi-frame vote were built for. `fast_path.min_confidence` is floored at
+`ocr.min_confidence`, so it can never admit a read the ordinary path would have
+discarded.
+
+`GET /api/stats` reports `fast_path_hits` alongside `grants`, which is the hit
+rate — if it stays near zero, the threshold is above what your cameras
+actually produce.
+
+Recognisers are not required to support it: the orchestrator probes for the
+`accept` parameter once at construction and stays on the ordinary path for
+anything implementing only the one-argument `Recognizer` protocol.
 
 ### Ensemble OCR voting
 
@@ -571,6 +678,112 @@ it measured ~2× *slower* (53 ms vs 23 ms per frame). The export script prints b
 and warns you if the `.pt` wins; if it does, delete the `.onnx` or set
 `detection.prefer_onnx: false`.
 
+### GPU acceleration
+
+Both halves of the ML stack run on CUDA when a usable GPU is present. One probe in
+`src/lpr/accel.py` decides for both, so the detector and the recogniser cannot end up
+on different devices, and it runs once per process rather than once per component.
+
+The probe is deliberately stronger than `torch.cuda.is_available()`: it allocates a
+tensor on the device before answering yes. That call alone returns true for a driver
+older than the wheel's CUDA runtime, which then raises on the first kernel launch —
+i.e. at the gate, mid-shift, rather than at startup.
+
+Both settings default to auto-detect, so the same `config.yaml` deploys to the GPU box,
+a CPU-only spare and CI:
+
+```yaml
+detection:
+  device: auto      # or "cpu", "cuda:0", "0" to pin a specific card
+ocr:
+  gpu: auto         # or true / false
+```
+
+A device that is asked for but not usable is **downgraded to CPU with a warning**,
+never honoured. That matters more than it sounds: `detection.device: cuda` on a CPU box
+used to raise inside ultralytics, which `build_detector` caught and answered by
+substituting the far weaker contour detector — so a device error surfaced as an
+accuracy collapse.
+
+**Container requirements.** Two things have to line up, and only one of them is the
+compose file:
+
+1. The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+   on the host, which passes the device through:
+   ```bash
+   sudo apt install nvidia-container-toolkit
+   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+   docker compose -f docker/docker-compose.yml run --rm lpr-api nvidia-smi   # verify
+   ```
+2. A **CUDA-enabled torch wheel inside the image**. The Dockerfile defaults to the CPU
+   index so a plain `docker build` stays small (~800 MB against ~2.5 GB); compose
+   overrides it via the `TORCH_INDEX_URL` build arg. Missing this is the classic
+   failure: the GPU is passed through correctly, `nvidia-smi` works in the container,
+   and the service still logs `EasyOCR (gpu=False)` — because the torch that was
+   installed cannot use it. Override the CUDA version for an older driver:
+   ```bash
+   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 \
+     docker compose -f docker/docker-compose.yml build
+   ```
+   The wheel's CUDA version has to be **no newer than the host driver supports**.
+   `nvidia-smi` prints the driver's ceiling in its header (`CUDA Version: 13.2`); a
+   cu130 wheel on a driver that tops out at 12.x reports no device at all, which looks
+   identical in the log to a GPU that was never passed through.
+
+No `nvidia/cuda` base image is needed — the CUDA runtime libraries ship inside the
+torch wheels and the host driver is injected at runtime.
+
+**Which engine is behind the `docker` command?** This decides how the device is
+requested, and the CLI does not tell you — a Docker CLI can be talking to a Podman
+socket. `docker version` reports the client; `docker info | grep "Server Version"`
+reports what is actually running the container (Podman answers with its own version,
+e.g. `5.7.0`).
+
+| Engine | How to request the GPU | What happens if you use the other one |
+|---|---|---|
+| Docker Engine | `deploy.resources.reservations.devices` (in `docker-compose.yml`) | A CDI name fails at container-create unless CDI is enabled |
+| Podman, or Docker ≥ 25 with CDI | `devices: ["nvidia.com/gpu=all"]` (in `docker-compose.cdi.yml`) | **The reservation is accepted and silently ignored** |
+
+That second failure is the nasty one, and it is what
+`no CUDA device visible to torch 2.13.0+cu130; running on CPU` in the logs means when
+the driver and the wheel are both fine: Podman's Docker-compatible API takes the
+`deploy` block, passes no device, returns no error, and the container comes up healthy
+on CPU. The reservation block exists to make a missing GPU loud, and on that engine it
+cannot. Run the overlay instead:
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.cdi.yml up -d
+```
+
+The overlay needs a CDI spec on the host, generated once (`nvidia-ctk cdi list` shows
+the device names it may use):
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+**Verify the device, not the container.** A container that started proves nothing —
+that is the whole trap:
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.cdi.yml \
+  run --rm lpr-api python -c "import torch; print(torch.cuda.is_available())"
+```
+
+On Docker Engine the reservation stays a hard requirement: without the toolkit, `up`
+fails at container-create rather than starting silently on CPU. That is the right
+default for the gate box, but a CPU-only host needs it dropped, most cleanly through an
+uncommitted `docker/docker-compose.override.yml`:
+
+```yaml
+services: {lpr-api: {deploy: {resources: {reservations: {devices: []}}}}}
+```
+
+On CUDA the detector also ignores any `.onnx` export and runs the `.pt` directly, since
+requirements.txt installs the **CPU** `onnxruntime` wheel on purpose — adopting the
+export would quietly move detection off the GPU and end up slower than the `.pt` it
+replaced.
+
 ### Model weights
 
 `scripts/fetch_models.py` fetches the generic `yolov8n.pt` baseline so the stack runs
@@ -588,6 +801,24 @@ early-stop patience 20, horizontal flip disabled) and installs the result where 
 pipeline expects it. It can pull the dataset straight from Roboflow via `ROBOFLOW_*`
 env vars. Colab instructions: **[README_TRAINING.md](README_TRAINING.md)**. Once a
 custom model exists, `fetch_models.py` stops downloading the baseline and says so.
+
+**OCR weights.** EasyOCR needs ~100 MB of its own (a CRAFT detector and an English
+recogniser) and fetches them lazily on first use. They are cached in `models/easyocr`
+— a bind-mounted volume — rather than in EasyOCR's default `~/.EasyOCR`, which inside
+a container is a layer that `docker compose up --build` throws away; that is why every
+rebuild used to re-download them before the service could process a frame.
+
+```bash
+python scripts/fetch_models.py --only-easyocr    # run once per machine
+```
+
+Once the cache is complete the service passes `download_enabled=False`, so a
+provisioned box opens no socket at startup and comes back after a power cut with the
+uplink down. Until then the download is bounded by `ocr.download_timeout_s` (60 s
+default) — EasyOCR calls `urlretrieve` with no timeout of its own, so a half-open
+connection would otherwise hang startup indefinitely, past the compose healthcheck and
+with no log line saying why. Set `ocr.allow_download: false` on an air-gapped site to
+refuse the download outright and fail fast with a message naming the fix instead.
 
 ---
 
@@ -655,6 +886,35 @@ an operator's job — they are the ones standing at the barrier.
 > `/api/system/update` is one dependency change (`LicensedUser` → `AdminUser`)
 > away from being admin-only again.
 
+### Vehicle access versus application access
+
+Two licences live in this system and they must never be conflated.
+
+| | `users.license_expires_at` | `plates.expires_at` |
+|---|---|---|
+| What it is | One account's subscription to the **application** — the dashboard, `/web`, `/api` | One vehicle's **permit** at the barrier |
+| Who it refuses | The person signing in | The car at the gate |
+| How it refuses | 403 + `Kullanıcı lisans süresi dolmuştur` | `DENIED`, relay untouched |
+| Where it is enforced | `lpr.api.security.require_license` | `PlateRepository.authorization` |
+
+A registered plate opens the gate whenever it exists, is not blocked, and its
+own `expires_at` (if it has one) is still in the future. **The barrier never
+reads `plates.username`, and never consults the licence of the account a car is
+recorded against.** An operator or tenant whose dashboard subscription lapsed
+still has residents, and those residents still have cars.
+
+The reasoning is about blast radius, not tidiness. A lapsed dashboard licence
+is a billing matter between a vendor and a customer; a resident sitting at a
+closed barrier at midnight is a physical access failure. Wiring the first into
+the second means an unpaid invoice strands people in the street, so the
+dependency must not exist in that direction. `test_pipeline` asserts it at the
+relay — a plate owned by an expired account still pulses it and still logs
+`registered, gate opened` — and `test_db` asserts it at the repository.
+
+Note that `plates` has no `is_active` column: "active" here means *not blocked*
+and *not past its own expiry*, which is what `lpr.api.schemas.plate_status`
+derives for the management screen.
+
 ### Per-operator licences
 
 Access control is **entirely** the per-user model. The deployment licence
@@ -714,7 +974,7 @@ barrier, at a site never told to set a new secret, is the worse failure.
 
 A new operator starts at `pending_activation` — named for what it is waiting
 on, because a new hire on their first morning is not an error. Clicking any
-non-unlimited badge opens the activation dialog, as does the first 402.
+non-unlimited badge opens the activation dialog, as does the first refusal.
 
 Revocation keeps the key and the dates and changes the *status*. A signed key
 cannot be un-signed, so the status flag is the only thing that can actually
@@ -740,15 +1000,44 @@ process's real database.
 
 ### Enforcement
 
-`require_license` gates every operational endpoint and answers **402 Payment
-Required**, not 403. The distinction is load-bearing for the dashboard: 403
-means "not your role, nothing you can do", 402 means "your access lapsed, here
-is where you enter a key" — and the client opens the licence dialog on exactly
-that code, once per lapse.
+`require_license` gates every authenticated endpoint — operating the site and
+reading it alike — and answers **403 Forbidden** with the detail
+`Kullanıcı lisans süresi dolmuştur`. A role refusal is a 403 too, so the
+*detail* is what separates them: the dashboard matches that exact string and
+opens the licence dialog on it, once per lapse. `web/app.js` keeps the string
+in one constant (`LICENSE_LAPSED`) and a test asserts it still matches the
+server's.
 
-Two endpoints are deliberately never gated: `GET /api/license/me` (an operator
-whose licence lapsed is precisely who needs to read it) and
-`POST /api/license/activate` (it is the way *out* of being unlicensed).
+The same check runs at three other doors, because an account refused in one
+place and admitted in another is not refused at all:
+
+* **`POST /api/auth/login`** — a lapsed account never receives a token.
+* **`GET /api/stream/{camera}`** — it takes its token in the query string, so
+  it cannot use the dependency; a live camera feed is exactly the access a
+  lapsed account must not keep.
+* **`WS /api/ws/events`** — closed with `1008`, after an `error` frame naming
+  the reason, because browsers do not reliably expose the close reason.
+
+Four endpoints are deliberately never gated, because they are how an operator
+learns about the lapse and undoes it: `GET /api/auth/me`, `GET /api/license`
+(the deployment licence, i.e. "why did the system stop"), `GET /api/license/me`
+and `POST /api/license/activate`.
+
+Refusing the login would otherwise be a trap — activation needs a session, and
+the session is what has just been refused. So `POST /api/auth/login` accepts an
+optional `license_key` alongside the credentials: it is activated first (after
+the password is checked, never before) and the same request is admitted. The
+login screen reveals the key box once the server has named the lapse.
+
+The browser dashboard itself is static files and is still served to anyone at
+`/web`, because the login screen has to be reachable before anyone is
+authenticated. Everything it then asks for is gated, so a lapsed account gets
+the licence dialog and an otherwise empty page.
+
+**None of this reaches the barrier.** `users.license_expires_at` is one
+account's subscription to the application. Whether the gate opens is decided by
+the `plates` row alone — see
+[Vehicle access versus application access](#vehicle-access-versus-application-access).
 
 A failure to *read* the licence lets the request through, like the revocation
 check it sits beside: this is a layer on top of an already-valid session, and a
@@ -975,8 +1264,9 @@ In the dashboard both live where the data does — **İçe Aktar (CSV)** and
 ## Remote updates (OTA)
 
 The **Sistem Güncellemesi** card in Ayarlar (`#settings-ota-section`) is always
-rendered, for both roles. What varies is whether its two buttons —
-**Güncellemeleri Kontrol Et** and **Sistemi Güncelle** — are live:
+rendered, for both roles. What varies is whether its three buttons —
+**Güncellemeleri Kontrol Et**, **Sistemi Güncelle** and **Zorla Yeniden Derle /
+Yeniden Başlat** — are live:
 
 | Server state | Card | Buttons |
 |---|---|---|
@@ -1040,15 +1330,46 @@ system_update:
   git_remote: origin
   git_branch: main
   compose_file: docker/docker-compose.yml
+  # Whatever you pass by hand, pass here too — see below.
+  compose_overrides: []
 ```
 
 Then uncomment the OTA block in `docker/docker-compose.yml`, which mounts the
 repo (so `git pull` has a checkout — the image itself has no `.git`) and the
-Docker socket (so the container can rebuild its own stack).
+engine socket (so the container can rebuild its own stack).
 
 Without those mounts the endpoint still answers; the update just fails with a
 specific message rather than a traceback — *"… bir git deposu değil"* or
 *"Docker soketine erişim reddedildi"*.
+
+**Three things have to line up, and two of them fail silently.**
+
+1. **A client in the image.** `docker compose … up -d --build` runs *inside*
+   the container, so the image needs the Docker CLI and the compose plugin —
+   the daemon stays on the host. The Dockerfile installs both (build with
+   `OTA_CLIENT=0` to skip them, ~90 MB, on a site that updates by hand).
+   Without them the update pulls the new code, *then* fails at the build step
+   with `Komut bulunamadı: docker-compose`, leaving new code on disk and the
+   old image running — worse than not updating at all.
+
+2. **The right socket.** `/var/run/docker.sock` is not universal: rootless
+   Podman listens on `/run/user/<uid>/podman/podman.sock`, and mounting the
+   wrong one hands the container an engine that is not running this service.
+   Check `echo $DOCKER_HOST` on the host and set `LPR_DOCKER_SOCK` in `.env`
+   to match.
+
+3. **Every compose file you normally pass.** This module is what brings the
+   service back up, so an overlay named only on your command line is dropped
+   on every rebuild. On a Podman or CDI host that overlay is the GPU
+   passthrough, and the container comes back healthy on CPU:
+
+   ```yaml
+   system_update:
+     compose_overrides: ["docker/docker-compose.cdi.yml"]
+   ```
+
+`GET /api/system/update` replays the last attempt's command log, which is where
+all three of these show up as the exact command that failed.
 
 ### How the deployed version is named
 
@@ -1101,9 +1422,53 @@ Hence the shape of the thing:
 5. The browser polls `GET /api/system/version` through the outage — connection
    errors during a rebuild are expected, not fatal — until a different commit
    answers, then reports the new version. A 10-minute deadline bounds the wait.
+   When the commit does *not* move (a forced rebuild, or nothing to pull), the
+   client falls back to `GET /api/system/update`: a status that is no longer
+   `running` is the ending.
 
 Failures land in `GET /api/system/update` with a `log` tail of the git and
 compose output, which the dashboard shows verbatim under the button.
+
+### Forcing a rebuild with nothing to pull
+
+By default, a pull that brings no new commit ends the run with *"Sistem zaten
+güncel; yeniden derleme yapılmadı."* and never reaches `docker compose`. That is
+the right default — a rebuild costs a few minutes of outage at the barrier, and
+spending it to redeploy the identical commit is a cost with no benefit.
+
+It is also the wrong answer for the cases operators actually hit: a container
+still running a stale image, an edited `.env` or `config.yaml` that only a
+recreate picks up, or a checkout that cannot fast-forward and so never reaches
+the build step at all. None of those had a button.
+
+**Zorla Yeniden Derle / Yeniden Başlat** posts `{"force": true}`, which inverts
+the gates in `SystemUpdater._advance_checkout`:
+
+| Situation | Default | `force: true` |
+|---|---|---|
+| Pull brings a new commit | rebuild | rebuild |
+| Pull brings nothing new | stop, "zaten güncel" | rebuild anyway |
+| Pull fails (diverged, local changes, no network) | fail, no rebuild | log the reason, rebuild what is on disk |
+| Directory is not a git checkout | fail | rebuild anyway (compose needs a compose file, not a repo) |
+| Build itself fails | fail | fail |
+| `system_update.enabled: false` | 503 | 503 |
+| Another update in flight | 409 | 409 |
+
+Two limits are worth stating plainly, because "force" is a word that invites
+assumptions. It does **not** override the deployment's own consent — the enable
+flag and the single-flight guard are untouched — and it does **not** make a
+failed build succeed. It only removes the reasons *not to start* one.
+
+`force` is also the first and only value the HTTP layer forwards to the
+updater. It selects between two fixed code paths and is never interpolated into
+a command, so it changes *whether* the configured build runs, never *what* gets
+built; the remote, branch, repo directory and compose file remain configuration
+only.
+
+A forced run is flagged `forced: true` all the way through — in the 202 reply,
+in the polled status, and in `last_update.json`, so the container that comes up
+afterwards still reports *"Yeniden derleme tamamlandı"* rather than claiming an
+upgrade that never happened.
 
 ### Nightly check (03:00)
 
@@ -1188,12 +1553,13 @@ dialog (`POST /api/license`), or drop it in a `.license` file in the data
 directory. It is stored in `system_meta` *and* mirrored to `.license`, so it
 survives either one being lost.
 
-What happens when it lapses: the API keeps running and `PipelineOrchestrator`
-is paused — no detection, no OCR, no relay, and `POST /api/relay/trigger`
-answers `402`. Cameras stay connected and the live view keeps working, so
-entering a new key resumes processing instantly, without a restart. The
-desktop client freezes its camera panes and opens the key dialog. Nothing
-crashes; the service simply waits.
+What happens when it lapses: **nothing stops.** The state is recorded, logged
+and reported by `GET /api/license`, and that is all — recognition keeps
+running, the relay keeps working and the gate keeps opening for registered
+plates. Access control is entirely the per-user model above; an
+installation-wide expiry that left an administrator standing at their own
+barrier would be an outage, not a commercial control. Re-enabling the hold is
+one edit in `deps.apply_license_state`, which is why it is still a function.
 
 Three defences, in the order an attacker meets them:
 

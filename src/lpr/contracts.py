@@ -10,6 +10,7 @@ behind ``TYPE_CHECKING`` so that importing contracts stays cheap.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -120,6 +121,10 @@ class PipelineStats:
     #: OCR passes skipped because the plate's track had already been decided.
     #: The headline number for "how much did tracking save us".
     ocr_skipped: int = 0
+    #: Gate decisions taken on the first confident read of a registered plate,
+    #: skipping the rest of the OCR ladder and the multi-frame confirmation.
+    #: Against ``grants`` this is the hit rate of ``fast_path``.
+    fast_path_hits: int = 0
     cameras: dict[str, CameraStatus] = field(default_factory=dict)
 
 
@@ -155,6 +160,28 @@ class Recognizer(Protocol):
     """Turns a plate crop into normalised text."""
 
     def recognize(self, crop: Frame) -> PlateRead: ...
+
+    def warmup(self) -> None: ...
+
+
+@runtime_checkable
+class PredicateRecognizer(Protocol):
+    """A :class:`Recognizer` that lets the caller stop it early.
+
+    ``accept`` is offered the running verdict after every view and ends the
+    read the first time it answers True. It exists so the pipeline can stop
+    paying for enhanced views once the answer is already a plate that may come
+    in -- a judgement only the caller can make, since the recogniser knows how
+    confident a read is but not whether the string is registered at this site.
+
+    Optional, like :class:`TrackAwareVoter`: the pipeline probes for it and
+    falls back to the plain one-argument :class:`Recognizer` for anything that
+    does not offer it, so a third-party engine keeps working.
+    """
+
+    def recognize(
+        self, crop: Frame, accept: "Callable[[PlateRead], bool] | None" = None
+    ) -> PlateRead: ...
 
     def warmup(self) -> None: ...
 

@@ -24,7 +24,7 @@ from lpr.db import (
     normalise_plate,
     schema_version,
 )
-from lpr.db.repository import LEGACY_PREFIX, _legacy_digest
+from lpr.db.repository import LEGACY_PREFIX, _legacy_digest, iso_bound
 
 
 def _iso(days_ago: float = 0.0) -> str:
@@ -271,6 +271,106 @@ def test_log_recent_and_dates(db) -> None:
     assert len(dates) == len(set(dates))
     assert dates == sorted(dates, reverse=True)
     assert all(len(day) == 10 for day in dates)
+
+
+# ---------------------------------------------------------------------------
+# Date bounds
+#
+# Timestamps are stored as fixed-width UTC ISO strings and compared lexically,
+# which is only equivalent to comparing instants while both sides are the same
+# shape. Every case below is a shape that is not, and each one silently
+# mis-filtered before `iso_bound` existed.
+# ---------------------------------------------------------------------------
+
+
+def test_a_bare_date_bound_covers_the_whole_day() -> None:
+    """The defect itself, at the unit level.
+
+    ``"2026-05-02"`` is ten characters; a stored ts is twenty-five. Comparing
+    them as text puts every row on that day *after* the upper bound, so the
+    filter matched nothing while the unfiltered list kept working.
+    """
+    assert iso_bound("2026-05-02") == "2026-05-02T00:00:00+00:00"
+    assert iso_bound("2026-05-02", end_of_day=True) == "2026-05-02T23:59:59+00:00"
+
+
+def test_a_browser_instant_is_folded_into_the_stored_shape() -> None:
+    """`toISOString()` brings milliseconds and a `Z`; the stored form has neither."""
+    assert iso_bound("2026-05-02T00:00:00.000Z") == "2026-05-02T00:00:00+00:00"
+
+
+def test_an_offset_bound_is_converted_to_utc() -> None:
+    """Local midnight in Istanbul is 21:00 the previous day in UTC."""
+    assert iso_bound("2026-05-03T00:00:00+03:00") == "2026-05-02T21:00:00+00:00"
+
+
+def test_a_bound_already_in_the_stored_shape_is_left_alone() -> None:
+    assert iso_bound("2026-05-02T14:32:11+00:00") == "2026-05-02T14:32:11+00:00"
+
+
+def test_a_naive_bound_is_read_as_utc() -> None:
+    """Everything this project writes is UTC, so an offsetless bound is too."""
+    assert iso_bound("2026-05-02T14:32:11") == "2026-05-02T14:32:11+00:00"
+
+
+def test_an_empty_bound_is_no_bound() -> None:
+    assert iso_bound(None) is None
+    assert iso_bound("") is None
+    assert iso_bound("   ") is None
+
+
+def test_an_unparseable_bound_narrows_the_search_rather_than_raising() -> None:
+    """A malformed filter must not turn into a 500 on somebody's history view."""
+    assert iso_bound("bugün") == "bugün"
+
+
+def test_a_day_filter_selects_exactly_that_day(db) -> None:
+    """End to end through real SQLite, including both inclusive edges."""
+    logs = LogRepository()
+    day = datetime(2026, 5, 2, tzinfo=timezone.utc)
+    for moment, plate in (
+        (day - timedelta(seconds=1), "34BEFORE"),
+        (day, "34FIRST1"),
+        (day.replace(hour=23, minute=59, second=59), "34LAST01"),
+        (day + timedelta(days=1), "34AFTER1"),
+    ):
+        logs.write(
+            LprEvent(
+                ts=moment.isoformat(),
+                camera=CameraRole.ENTRY,
+                plate=plate,
+                action=Action.GRANTED,
+            )
+        )
+
+    found = {e.plate for e in logs.query(since="2026-05-02", until="2026-05-02", limit=100)}
+    assert found == {"34FIRST1", "34LAST01"}
+    assert logs.count_matching(since="2026-05-02", until="2026-05-02") == 2
+
+
+def test_the_count_agrees_with_the_list_it_counts(db) -> None:
+    """Two code paths, one set of bounds; drift between them is a subtler bug."""
+    logs = LogRepository()
+    _seed_logs(logs)
+    for bound in (_iso(6), _iso(6)[:10]):
+        assert logs.count_matching(since=bound) == len(logs.query(since=bound, limit=100))
+
+
+def test_the_day_list_can_be_bucketed_in_another_timezone(db) -> None:
+    """22:30 UTC is 01:30 the next day in Istanbul, and belongs on that day."""
+    logs = LogRepository()
+    logs.write(
+        LprEvent(
+            ts="2026-05-02T22:30:00+00:00",
+            camera=CameraRole.ENTRY,
+            plate="34LATE01",
+            action=Action.GRANTED,
+        )
+    )
+
+    assert logs.dates() == ["2026-05-02"]
+    assert logs.dates(tz_offset_minutes=180) == ["2026-05-03"]
+    assert logs.dates(tz_offset_minutes=-300) == ["2026-05-02"]
 
 
 def test_log_plate_is_normalised_on_write(db) -> None:
@@ -623,3 +723,91 @@ def test_blocking_a_plate_closes_the_gate_to_it(db: Any) -> None:
     repo.update("34ABC123", blocked=True)
     assert repo.is_registered("34ABC123") is False
     assert repo.is_blocked("34ABC123") is True
+
+
+# ---------------------------------------------------------------------------
+# Expiry as an access decision
+# ---------------------------------------------------------------------------
+
+
+def test_expired_permit_does_not_authorize(db: Any) -> None:
+    """A permit that ran out yesterday must not open the gate.
+
+    The failure this guards against is the quiet one: the plate is still on
+    the list, still unblocked, and every screen still shows it -- so an
+    ``is_registered`` that only checked membership would wave it through and
+    the log would read "gate opened" for a resident who stopped paying.
+    """
+    from lpr.db import PLATE_EXPIRED, PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("35ACP245", owner="Ahmet", expires_at=_iso(days_ago=1))
+
+    assert repo.authorization("35ACP245") == PLATE_EXPIRED
+    assert repo.is_registered("35ACP245") is False
+    # Still listed -- expiry is a refusal, not a deletion.
+    assert repo.get("35ACP245") is not None
+
+
+def test_permit_valid_until_tomorrow_still_authorizes(db: Any) -> None:
+    """The other half of the boundary: expiry must not refuse a live permit."""
+    from lpr.db import PLATE_OK, PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("35ACP246", expires_at=_iso(days_ago=-1))
+    assert repo.authorization("35ACP246") == PLATE_OK
+    assert repo.is_registered("35ACP246") is True
+
+
+def test_blocked_outranks_expired(db: Any) -> None:
+    """One plate cannot be described two ways by the gate and the UI.
+
+    ``lpr.api.schemas.plate_status`` reports ``blocked`` for a barred plate
+    whose permit also lapsed; the gate has to agree, or an operator reading
+    "expired" on screen would chase a renewal for a car that is barred.
+    """
+    from lpr.api.schemas import plate_status
+    from lpr.db import PLATE_BLOCKED, PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("35ACP247", expires_at=_iso(days_ago=1), blocked=True)
+
+    assert repo.authorization("35ACP247") == PLATE_BLOCKED
+    assert plate_status(repo.get("35ACP247")) == "blocked"
+
+
+def test_no_expiry_means_permanent(db: Any) -> None:
+    """A resident with no end date is not accidentally expired."""
+    from lpr.db import PLATE_OK, PLATE_UNKNOWN, PlateRepository
+
+    repo = PlateRepository()
+    repo.upsert("35ACP248")
+    assert repo.authorization("35ACP248") == PLATE_OK
+    # An empty string is what a blanked date field writes, and must read the
+    # same as NULL rather than sorting below every timestamp and expiring.
+    repo.update("35ACP248", expires_at="")
+    assert repo.authorization("35ACP248") == PLATE_OK
+    assert repo.authorization("99ZZZ99") == PLATE_UNKNOWN
+
+
+def test_authorization_ignores_the_owning_accounts_licence(db) -> None:
+    """A plate's verdict must not depend on ``users.license_expires_at``.
+
+    That column is one person's subscription to the dashboard and the API.
+    Letting it reach the barrier would mean an unpaid software invoice
+    stranding a resident in the street -- two failures whose blast radii are
+    not comparable, which is why the dependency must not exist in this
+    direction.
+    """
+    from lpr.db import PLATE_OK, PlateRepository, UserRepository
+    from lpr.user_license import STATUS_EXPIRED
+
+    users = UserRepository()
+    users.register("bekci", "parola1234", "operator")
+    users.set_license("bekci", "eski", "2000-01-01T00:00:00+00:00", STATUS_EXPIRED)
+
+    repo = PlateRepository()
+    repo.upsert("35ACP250", owner="Ahmet", username="bekci")
+
+    assert repo.authorization("35ACP250") == PLATE_OK
+    assert repo.is_registered("35ACP250") is True

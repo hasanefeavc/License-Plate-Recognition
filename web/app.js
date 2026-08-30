@@ -52,6 +52,11 @@
   const WS_RETRY_MIN_MS = 1000;
   const WS_RETRY_MAX_MS = 15000;
   const STREAM_RETRY_MS = 3000;
+  //: Ceiling for the stream reconnect backoff. An <img> cannot read a status
+  //: code, so a camera that is gone looks exactly like one that is briefly
+  //: quiet; backing off is what keeps the first case from being a permanent
+  //: request every three seconds.
+  const STREAM_RETRY_MAX_MS = 30000;
   const TOAST_MS = 4000;
   /** The API caps /api/logs at 1000 rows per call; the export asks for all of
    *  them so the CSV is not silently a truncated view of the day. */
@@ -107,6 +112,10 @@
     statsTimer: null,
     parkingTimer: null,
     uptimeTimer: null,
+    /** Camera roles the server actually has a worker for, from /api/stats.
+     *  A role missing from here has no frames now and will have none later --
+     *  its stream endpoint 404s -- so it is never asked for one. */
+    cameraRoles: [],
     toastTimer: null,
     uptimeSeconds: 0,
     /** False until a stats read succeeds. The clock must not invent an
@@ -127,7 +136,7 @@
     /** The caller's own licence, from /api/license/me. Admins are
      *  `unlimited`; an operator carries a status and remaining days. */
     license: null,
-    /** Guards against a burst of 402s opening the dialog once per request. */
+    /** Guards against a burst of refusals opening the dialog once per request. */
     licensePrompted: false,
     /** Human-readable version of the running server (a tag like `v1.0.0`, or
      *  a bare commit hash in an untagged repo). Display only. */
@@ -155,6 +164,7 @@
   [
     "login-screen", "login-form", "login-username", "login-password",
     "login-error", "login-submit", "login-register", "login-hint",
+    "login-license", "login-license-key",
     "dashboard", "banner",
     "cdn-warning",
     "uptime", "user-label", "conn-dot", "conn-label", "feed", "feed-empty",
@@ -186,6 +196,7 @@
     // System update (inside the settings modal)
     "settings-ota-section", "update-version", "update-branch", "update-dirty-row",
     "update-run", "update-check", "update-run-label", "update-spinner", "update-status",
+    "update-force", "update-force-label", "update-force-spinner",
     "update-log", "update-history", "update-history-wrap",
   ].forEach((id) => { el[id] = $(id); });
 
@@ -247,6 +258,17 @@
   // Transport
   // -----------------------------------------------------------------------
 
+  /** What the server says when this account's licence has lapsed. Matched
+   *  verbatim: a lapse and an ordinary role refusal are both 403, and the
+   *  detail is what tells them apart. Must stay in step with
+   *  `lpr.api.security.LICENSE_LAPSED_DETAIL`. */
+  const LICENSE_LAPSED = "Kullanıcı lisans süresi dolmuştur";
+
+  /** True when this error is the licence refusal rather than a role refusal. */
+  function isLicenseLapse(status, detail) {
+    return status === 403 && detail === LICENSE_LAPSED;
+  }
+
   /** fetch() with the bearer header attached and errors unwrapped.
    *  The API's error envelope is `{error: {status, title, detail}}`. */
   async function api(path, options = {}) {
@@ -264,11 +286,11 @@
         typeof detail === "string" && detail ? detail : `HTTP ${response.status}`
       );
       error.status = response.status;
-      // 402 is specifically "this account's licence has lapsed" — distinct
-      // from 403 ("not your role"), which nothing can be done about from here.
-      // Surfacing the dialog beats leaving the operator to guess why every
-      // button suddenly fails.
-      if (response.status === 402 && !state.closing) onLicenseLapsed();
+      // "This account's licence has lapsed" is distinct from "not your role",
+      // which nothing can be done about from here. Both are 403, so the detail
+      // is what separates them. Surfacing the dialog beats leaving the
+      // operator to guess why every button suddenly fails.
+      if (isLicenseLapse(response.status, detail) && !state.closing) onLicenseLapsed();
       throw error;
     }
     return payload;
@@ -350,41 +372,110 @@
   // Camera streams
   // -----------------------------------------------------------------------
 
+  /** Per-role stream bookkeeping. `wired` guards the one-time listener setup,
+   *  `active` is whether this camera should be streaming at all, `failures`
+   *  drives the backoff. */
+  const streams = {};
+
+  function streamState(role) {
+    if (!streams[role]) streams[role] = { retry: null, failures: 0, wired: false, active: false };
+    return streams[role];
+  }
+
   /** Point one <img> at its MJPEG endpoint and keep it pointed there.
    *  The server closes an idle stream on purpose, so `error` is a normal
-   *  event, not a failure: back off briefly and ask again. */
+   *  event, not a failure: back off and ask again. */
   function attachStream(role) {
     const img = el[`cam-${role}`];
     const placeholder = $(`ph-${role}`);
     if (!img) return;
+    const stream = streamState(role);
 
-    let retry = null;
-    const reconnect = () => {
-      clearTimeout(retry);
-      retry = setTimeout(() => {
-        if (state.token && !state.closing) img.src = streamUrl(role);
-      }, STREAM_RETRY_MS);
-    };
+    // Listeners are wired exactly once per <img>, ever. This function runs
+    // again on every login, and the elements outlive the session -- re-adding
+    // them left one live reconnect timer per past session, all firing on the
+    // same element, which is how a quiet reconnect becomes a request storm.
+    if (!stream.wired) {
+      stream.wired = true;
+      img.addEventListener("load", () => {
+        stream.failures = 0;
+        img.hidden = false;
+        if (placeholder) placeholder.hidden = true;
+      });
+      img.addEventListener("error", () => {
+        img.hidden = true;
+        if (placeholder) placeholder.hidden = false;
+        scheduleStreamRetry(role);
+      });
+    }
 
-    img.addEventListener("load", () => {
-      img.hidden = false;
-      if (placeholder) placeholder.hidden = true;
-    });
-    img.addEventListener("error", () => {
-      img.hidden = true;
-      if (placeholder) placeholder.hidden = false;
-      reconnect();
-    });
+    stream.active = true;
+    clearTimeout(stream.retry);
+    stream.retry = null;
     img.src = streamUrl(role);
   }
 
-  function detachStreams() {
-    ["entry", "exit"].forEach((role) => {
+  /** Ask again after a failure, with a widening gap and only while it is worth
+   *  asking. A camera the server has no worker for answers 404 forever. */
+  function scheduleStreamRetry(role) {
+    const stream = streamState(role);
+    clearTimeout(stream.retry);
+    stream.retry = null;
+    if (!state.token || state.closing || !stream.active) return;
+    // Once /api/stats has been read, it is authoritative about which cameras
+    // exist. Before that it is empty, so an unknown role still gets its first
+    // few retries rather than being written off on a cold start.
+    if (state.cameraRoles.length && !state.cameraRoles.includes(role)) return;
+
+    stream.failures += 1;
+    const delay = Math.min(
+      STREAM_RETRY_MS * Math.pow(2, stream.failures - 1),
+      STREAM_RETRY_MAX_MS
+    );
+    stream.retry = setTimeout(() => {
       const img = el[`cam-${role}`];
-      const placeholder = $(`ph-${role}`);
-      // Clearing src stops the browser holding the connection open.
-      if (img) { img.removeAttribute("src"); img.hidden = true; }
-      if (placeholder) placeholder.hidden = false;
+      if (img && state.token && !state.closing && stream.active) img.src = streamUrl(role);
+    }, delay);
+  }
+
+  /** Stop one stream and release the connection the browser holds for it. */
+  function detachStream(role) {
+    const stream = streamState(role);
+    stream.active = false;
+    stream.failures = 0;
+    clearTimeout(stream.retry);
+    stream.retry = null;
+    const img = el[`cam-${role}`];
+    const placeholder = $(`ph-${role}`);
+    // Clearing src stops the browser holding the connection open.
+    if (img && img.getAttribute("src") !== null) { img.removeAttribute("src"); }
+    if (img) img.hidden = true;
+    if (placeholder) placeholder.hidden = false;
+  }
+
+  function detachStreams() {
+    ["entry", "exit"].forEach(detachStream);
+  }
+
+  /** Stream exactly the cameras the server reports, and nothing else.
+   *
+   *  The `exit` role is commonly disabled -- one physical device cannot serve
+   *  two roles -- and it then has no worker, so `/api/stats` omits it and its
+   *  stream endpoint 404s. Asking anyway cost a browser connection per
+   *  attempt, and a browser allows only a handful per host, so the dead tile
+   *  was paid for by every other request the page needed.
+   *
+   *  Runs on every stats poll, so it must be idempotent: a camera already
+   *  streaming is left alone rather than re-pointed, which would restart the
+   *  stream every few seconds. */
+  function syncStreams(roles) {
+    state.cameraRoles = roles;
+    ["entry", "exit"].forEach((role) => {
+      if (roles.includes(role)) {
+        if (!streamState(role).active) attachStream(role);
+      } else {
+        detachStream(role);
+      }
     });
   }
 
@@ -406,6 +497,23 @@
       }
       if (fps) fps.textContent = connected && camera.fps ? `${Number(camera.fps).toFixed(1)} FPS` : "";
     });
+
+    // A role the server did not report has no capture worker at all -- it is
+    // disabled, not merely disconnected. Say so, and do not stream it.
+    ["entry", "exit"].forEach((role) => {
+      if (seen.has(role)) return;
+      const dot = $(`dot-${role}`);
+      const badge = $(`badge-${role}`);
+      const fps = $(`fps-${role}`);
+      if (dot) dot.className = "h-2.5 w-2.5 rounded-full transition-colors bg-line";
+      if (badge) {
+        badge.textContent = "Devre Dışı";
+        badge.className = `text-xs font-bold ${TEXT_CLASSES.muted}`;
+      }
+      if (fps) fps.textContent = "";
+    });
+
+    syncStreams([...seen]);
   }
 
   // -----------------------------------------------------------------------
@@ -489,6 +597,8 @@
     }
     state.socket = socket;
 
+    state.socketRefusal = "";
+
     socket.addEventListener("open", () => {
       state.wsRetryMs = WS_RETRY_MIN_MS;
       setConnected(true);
@@ -508,7 +618,13 @@
       // 1008 is the server's policy-violation code: the token is no good, so
       // reconnecting with the same one would just loop.
       if (event.code === 1008) {
-        logout("Oturumunuzun süresi doldu. Lütfen tekrar giriş yapın.");
+        // The server names the reason in an `error` frame just before it
+        // closes, because browsers do not reliably expose the close reason.
+        // A lapsed licence and an expired session both end the socket, and
+        // only one of them is fixed by typing the password again.
+        const lapsed = state.socketRefusal === LICENSE_LAPSED;
+        logout(lapsed ? LICENSE_LAPSED : "Oturumunuzun süresi doldu. Lütfen tekrar giriş yapın.");
+        if (lapsed) showLicenseField(true);
         return;
       }
       setBanner("Sunucuya bağlanılamıyor - yeniden deneniyor...");
@@ -550,6 +666,9 @@
         applyLicense(message.license || {});
         break;
       case "error":
+        // Kept for the close handler, which has to tell a lapsed licence
+        // apart from an expired session and gets only a code of its own.
+        state.socketRefusal = String(message.detail || "");
         setBanner(String(message.detail || "Bilinmeyen hata"));
         break;
       case "ping":
@@ -963,10 +1082,22 @@
     node.hidden = !text;
   }
 
-  function setUpdateBusy(busy, label) {
-    if (el["update-run"]) el["update-run"].disabled = busy;
-    if (el["update-spinner"]) el["update-spinner"].hidden = !busy;
-    setText(el["update-run-label"], label || "Sistemi Güncelle");
+  const RUN_LABEL = "Sistemi Güncelle";
+  const FORCE_LABEL = "Zorla Yeniden Derle / Yeniden Başlat";
+
+  /** Disable both triggers while either one is running, and put the spinner on
+   *  whichever was actually pressed.
+   *
+   *  Both buttons drive the same single-flight endpoint, so leaving the other
+   *  one live would only earn the operator a 409. */
+  function setUpdateBusy(busy, label, forced = false) {
+    ["update-run", "update-force"].forEach((id) => {
+      if (el[id]) el[id].disabled = busy;
+    });
+    if (el["update-spinner"]) el["update-spinner"].hidden = !busy || forced;
+    if (el["update-force-spinner"]) el["update-force-spinner"].hidden = !busy || !forced;
+    setText(el["update-run-label"], (busy && !forced && label) || RUN_LABEL);
+    setText(el["update-force-label"], (busy && forced && label) || FORCE_LABEL);
   }
 
   /** Show the current version, and reveal the panel only for an admin on a
@@ -1014,7 +1145,7 @@
 
   /** Enable or disable the two OTA buttons, with a reason when disabled. */
   function setUpdateAvailable(available, reason) {
-    ["update-run", "update-check"].forEach((id) => {
+    ["update-run", "update-force", "update-check"].forEach((id) => {
       const button = el[id];
       if (!button) return;
       button.disabled = !available;
@@ -1118,31 +1249,55 @@
     } catch (_) { /* status is a nicety; never block the panel on it */ }
   }
 
-  async function runUpdate() {
+  /** Trigger the update, or -- with `force` -- a rebuild of what is already
+   *  deployed.
+   *
+   *  The two differ only in the flag posted and in what can be believed
+   *  afterwards. A normal update proves itself by the commit changing; a
+   *  forced rebuild usually ends on the *same* commit, so the only evidence it
+   *  worked is the server answering again with a finished status. */
+  async function runUpdate(force = false) {
     const confirmed = window.confirm(
-      "Sistem güncellenecek.\n\n" +
-      "Sunucu en son sürümü indirip kendini yeniden başlatacak. " +
-      "Bu sırada kameralar ve bariyer birkaç dakika devre dışı kalır.\n\n" +
-      "Devam edilsin mi?"
+      force
+        ? "Sistem zorla yeniden derlenecek.\n\n" +
+          "Yeni bir sürüm olmasa bile sunucu kendini yeniden derleyip " +
+          "başlatacak. Bu sırada kameralar ve bariyer birkaç dakika devre " +
+          "dışı kalır.\n\n" +
+          "Devam edilsin mi?"
+        : "Sistem güncellenecek.\n\n" +
+          "Sunucu en son sürümü indirip kendini yeniden başlatacak. " +
+          "Bu sırada kameralar ve bariyer birkaç dakika devre dışı kalır.\n\n" +
+          "Devam edilsin mi?"
     );
     if (!confirmed) return;
 
     const before = state.commit;
-    setUpdateBusy(true, "Güncelleniyor...");
-    updateStatusText("Güncelleme başlatılıyor...", "accent");
+    setUpdateBusy(true, force ? "Yeniden derleniyor..." : "Güncelleniyor...", force);
+    updateStatusText(
+      force ? "Zorla yeniden derleme başlatılıyor..." : "Güncelleme başlatılıyor...",
+      "accent"
+    );
     updateLog([]);
 
     try {
-      const accepted = await api("/api/system/update", { method: "POST" });
-      updateStatusText(accepted.detail || "Güncelleme başlatıldı.", "accent");
+      const accepted = await api("/api/system/update", {
+        method: "POST",
+        // Sent only when forcing, so the ordinary button keeps posting the
+        // empty body every older server already understands.
+        body: force ? JSON.stringify({ force: true }) : undefined,
+      });
+      updateStatusText(
+        accepted.detail || (force ? "Yeniden derleme başlatıldı." : "Güncelleme başlatıldı."),
+        "accent"
+      );
     } catch (err) {
-      setUpdateBusy(false);
+      setUpdateBusy(false, "", force);
       updateStatusText(err.message, "bad");
       return;
     }
 
     updateStatusText("Sunucu yeniden derleniyor, lütfen bekleyin...", "accent");
-    await pollForRestart(before);
+    await pollForRestart(before, force);
   }
 
   /** Poll until the server answers with a different commit, or time out.
@@ -1150,7 +1305,7 @@
    *  Connection errors here are expected, not exceptional: the container is
    *  being replaced, so the socket *should* fail for a while. Only the clock
    *  ends this loop. */
-  async function pollForRestart(before) {
+  async function pollForRestart(before, force = false) {
     const deadline = Date.now() + UPDATE_POLL_TIMEOUT_MS;
 
     while (Date.now() < deadline) {
@@ -1167,29 +1322,35 @@
 
       const now = info.commit || info.short_commit || "";
       if (before && now && now !== before) {
-        setUpdateBusy(false);
+        setUpdateBusy(false, "", force);
         applyVersion(info);
         updateStatusText(`Güncelleme tamamlandı. Yeni sürüm: ${state.version}`, "ok");
         refreshUpdateHistory();
         return;
       }
 
-      // Same commit and the server is answering again: either nothing to pull
-      // or the update failed. The status endpoint knows which.
+      // Same commit and the server is answering again. For an update that
+      // means nothing was pulled or it failed; for a forced rebuild it is the
+      // *expected* ending, since rebuilding deliberately changes no commit.
+      // Either way the status endpoint is the one that knows.
       const status = await api("/api/system/update").catch(() => null);
       if (status && !status.running) {
-        setUpdateBusy(false);
+        setUpdateBusy(false, "", force);
         if (status.state === "failed") {
           updateStatusText(status.detail || "Güncelleme başarısız.", "bad");
           updateLog(status.log);
         } else {
-          updateStatusText(status.detail || "Sistem zaten güncel.", "ok");
+          updateStatusText(
+            status.detail || (force ? "Yeniden derleme tamamlandı." : "Sistem zaten güncel."),
+            "ok"
+          );
+          refreshUpdateHistory();
         }
         return;
       }
     }
 
-    setUpdateBusy(false);
+    setUpdateBusy(false, "", force);
     updateStatusText(
       "Güncelleme durumu doğrulanamadı. Sayfayı yenileyip sürümü kontrol edin.",
       "warn"
@@ -1218,8 +1379,8 @@
    *  Operators are the people standing at the barrier, so add, edit, block and
    *  delete are all theirs; the server agrees, and gates these endpoints on a
    *  live licence rather than on the role. What an unlicensed operator gets is
-   *  a 402 and the licence dialog, not a hidden button — being told why is more
-   *  use than the control quietly vanishing.
+   *  the licence dialog, not a hidden button — being told why is more use than
+   *  the control quietly vanishing.
    *
    *  Kept as a function (rather than deleted) because it is called after every
    *  render, and a future restriction belongs here rather than scattered
@@ -1542,11 +1703,44 @@
     el["history-csv"].disabled = rows.length === 0;
   }
 
+  /** Minutes east of UTC for this browser: +180 in Turkey.
+   *
+   *  `getTimezoneOffset()` reports the opposite sign -- minutes to *add* to
+   *  local time to reach UTC -- so it is negated here. Getting that backwards
+   *  moves the day boundary six hours the wrong way, which looks like working
+   *  code until somebody opens the history just after midnight. */
+  function tzOffsetMinutes() {
+    return -new Date().getTimezoneOffset();
+  }
+
+  /** The instants bounding a `YYYY-MM-DD` in the operator's own timezone.
+   *
+   *  `new Date(y, m - 1, d)` is a *local* construction, which is the whole
+   *  point: local midnight in Istanbul is 21:00 UTC the previous day, and that
+   *  is the instant the server has to compare against. The obvious-looking
+   *  `new Date(day).toISOString().slice(0, 10)` round-trip is the trap -- it
+   *  parses the bare date as UTC and then formats it back in UTC, so east of
+   *  Greenwich the day silently rolls back by one.
+   *
+   *  Sent as full ISO instants rather than the bare day. A bare `YYYY-MM-DD`
+   *  as an upper bound is shorter than any stored timestamp, so string
+   *  comparison put every row on the chosen day *after* the bound and the
+   *  filter matched nothing at all. */
+  function dayRange(day) {
+    const [year, month, date] = String(day).split("-").map(Number);
+    if (!year || !month || !date) return null;
+    return {
+      since: new Date(year, month - 1, date, 0, 0, 0, 0).toISOString(),
+      until: new Date(year, month - 1, date, 23, 59, 59, 999).toISOString(),
+    };
+  }
+
   async function loadHistory() {
     const day = el["history-day"].value;
     const camera = el["history-camera"].value;
     const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
-    if (day) { params.set("since", day); params.set("until", day); }
+    const range = day ? dayRange(day) : null;
+    if (range) { params.set("since", range.since); params.set("until", range.until); }
     if (camera) params.set("camera", camera);
 
     modalStatus(el["history-status"], "Yükleniyor...", "muted");
@@ -1569,7 +1763,10 @@
 
   async function loadHistoryDays() {
     try {
-      const days = await api("/api/logs/dates");
+      // Same timezone the range is computed in. A list bucketed in UTC and a
+      // range computed locally is how a day that plainly has rows comes back
+      // empty -- the two have to agree on where the day starts.
+      const days = await api(`/api/logs/dates?tz_offset=${tzOffsetMinutes()}`);
       const select = el["history-day"];
       const current = select.value;
       select.textContent = "";
@@ -1608,9 +1805,13 @@
   async function downloadCsv() {
     const params = new URLSearchParams();
     const day = el["history-day"] && el["history-day"].value;
-    if (day) {
-      params.set("since", `${day}T00:00:00+00:00`);
-      params.set("until", `${day}T23:59:59+00:00`);
+    // Shares dayRange with the table so the file matches what is on screen.
+    // This used to hardcode +00:00, which exported a UTC day while the table
+    // showed a local one -- the same day, three hours apart.
+    const range = day ? dayRange(day) : null;
+    if (range) {
+      params.set("since", range.since);
+      params.set("until", range.until);
     }
     const camera = el["history-camera"] && el["history-camera"].value;
     if (camera) params.set("camera", camera);
@@ -1707,8 +1908,9 @@
   // Licensing
   //
   // Admins are exempt by construction and carry an "unlimited" badge. An
-  // operator holds a key with an expiry, and the server answers 402 on every
-  // operational endpoint once it lapses — which is what opens the dialog.
+  // operator holds a key with an expiry, and once it lapses the server refuses
+  // the login itself and every endpoint with 403 + LICENSE_LAPSED — which is
+  // what opens the dialog, and what puts the key box on the login screen.
   // -----------------------------------------------------------------------
 
   const LICENSE_BADGES = {
@@ -2148,21 +2350,28 @@
     state.closing = false;
     applyRole();
     loadQuality();
-    attachStream("entry");
-    attachStream("exit");
+    // Streams are *not* attached here. refreshStats() reports which cameras
+    // the server actually has a worker for, and syncStreams() attaches those
+    // and only those -- one round trip later, but never a request to a camera
+    // that can only 404.
     connectSocket();
     refreshStats();
     refreshLicense();      // deployment licence -> the banner
     refreshUserLicense();  // this account's licence -> the navbar badge
     refreshParking();
     loadRecentLogs();
-    clearInterval(state.statsTimer);
+    startTimers();
+  }
+
+  /** (Re)start the polling timers. Idempotent: it stops whatever is running
+   *  first, so it can be called on login and on every tab re-focus without
+   *  leaving a second copy of each interval behind. */
+  function startTimers() {
+    stopTimers();
     state.statsTimer = setInterval(refreshStats, STATS_INTERVAL_MS);
-    clearInterval(state.parkingTimer);
     state.parkingTimer = setInterval(refreshParking, PARKING_INTERVAL_MS);
     // Counted locally between polls so the clock ticks every second instead
     // of jumping once per stats refresh.
-    clearInterval(state.uptimeTimer);
     state.uptimeTimer = setInterval(() => {
       if (!state.uptimeKnown) return;
       state.uptimeSeconds += 1;
@@ -2170,12 +2379,19 @@
     }, 1000);
   }
 
-  function logout(message) {
-    state.closing = true;
-    closeModal();
+  function stopTimers() {
     clearInterval(state.statsTimer);
     clearInterval(state.parkingTimer);
     clearInterval(state.uptimeTimer);
+    state.statsTimer = null;
+    state.parkingTimer = null;
+    state.uptimeTimer = null;
+  }
+
+  function logout(message) {
+    state.closing = true;
+    closeModal();
+    stopTimers();
     clearTimeout(state.wsTimer);
     if (state.socket) {
       try { state.socket.close(1000, "logout"); } catch (_) { /* already gone */ }
@@ -2188,6 +2404,7 @@
     state.token = null;
     state.role = "";
     state.username = "";
+    state.cameraRoles = [];
     setConnected(false);
     setBanner("");
     state.parking = { inside: 0, capacity: 0, full: false };
@@ -2210,24 +2427,45 @@
     }
     setLoginBusy(true);
     setText(el["login-error"], "");
+    const body = { username, password };
+    // Only sent once the field is showing, i.e. the server has already told
+    // this account its licence lapsed. The server activates it before it
+    // decides on the session, so a valid key turns the refusal into a login.
+    const key = licenseKeyField() ? licenseKeyField().value.trim() : "";
+    if (key && !register) body.license_key = key;
     try {
       const result = await api(register ? "/api/auth/register" : "/api/auth/login", {
         method: "POST",
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify(body),
       });
       state.token = result.access_token;
       state.username = result.username || username;
       state.role = result.role || "";
       localStorage.setItem(TOKEN_KEY, state.token);
+      showLicenseField(false);
       startSession();
     } catch (err) {
       setLoginBusy(false);
+      if (isLicenseLapse(err.status, err.message)) showLicenseField(true);
       const message = register && (err.status === 401 || err.status === 403)
         ? "Sistemde zaten kullanıcı var. Yeni hesabı bir yönetici oluşturmalı."
         : (err.message || "Giriş başarısız.");
       setText(el["login-error"], message);
       el["login-password"].value = "";
     }
+  }
+
+  function licenseKeyField() {
+    return el["login-license-key"] || null;
+  }
+
+  /** Reveal (or hide) the licence key box on the login screen. */
+  function showLicenseField(visible) {
+    const wrap = el["login-license"];
+    if (!wrap) return;
+    wrap.hidden = !visible;
+    if (visible && licenseKeyField()) licenseKeyField().focus();
+    if (!visible && licenseKeyField()) licenseKeyField().value = "";
   }
 
   /** A token in localStorage is only a claim; the server decides. */
@@ -2265,7 +2503,10 @@
     el["btn-history"].addEventListener("click", openHistory);
     if (el["btn-users"]) el["btn-users"].addEventListener("click", openUsers);
     el["btn-settings"].addEventListener("click", openSettings);
-    if (el["update-run"]) el["update-run"].addEventListener("click", runUpdate);
+    if (el["update-run"]) el["update-run"].addEventListener("click", () => runUpdate(false));
+    if (el["update-force"]) {
+      el["update-force"].addEventListener("click", () => runUpdate(true));
+    }
     if (el["update-check"]) el["update-check"].addEventListener("click", checkForUpdates);
     el["btn-logout"].addEventListener("click", () => logout(""));
 
@@ -2328,6 +2569,23 @@
     // Leaving the page mid-stream otherwise leaves two MJPEG responses open
     // on the server until its idle timeout notices.
     window.addEventListener("pagehide", () => { state.closing = true; detachStreams(); });
+
+    // A backgrounded tab does not need counters. Polling it wastes the
+    // operator's connection and the server's threads, and browsers throttle
+    // the timers unpredictably anyway -- which is what makes a resumed tab
+    // look like it fires a burst of catch-up requests.
+    document.addEventListener("visibilitychange", () => {
+      if (!state.token || state.closing) return;
+      if (document.hidden) {
+        stopTimers();
+        return;
+      }
+      // One immediate read so the numbers are current, then the usual cadence.
+      // startTimers() clears first, so re-focusing can never stack intervals.
+      refreshStats();
+      refreshParking();
+      startTimers();
+    });
 
     restoreSession();
   }

@@ -49,9 +49,14 @@ __all__ = [
     "deskew",
     "enhance_frame",
     "enhance_plate",
+    "hard_case_variants",
+    "ink_ratio",
+    "invert",
     "letterbox",
+    "otsu_binarize",
     "normalize_lighting",
     "rectify_perspective",
+    "separate_characters",
     "sharpness",
     "stretch_contrast",
     "unsharp_mask",
@@ -132,6 +137,19 @@ MIN_USABLE_RANGE = 8
 #: fraction of the crop is a glyph or a mounting bolt, not the plate outline.
 MIN_QUAD_AREA_RATIO = 0.25
 
+#: How much of its own minimum-area rectangle a contour must fill before that
+#: rectangle is accepted as the plate outline. A plate border traces a nearly
+#: perfect rectangle and fills ~0.9 of it; an L-shaped shadow edge or a spray
+#: of glyph contours fills far less, and warping on one of those would smear
+#: the crop. This is the guard that makes the minAreaRect fallback safe.
+MIN_BOX_FILL_RATIO = 0.6
+
+#: Minimum spread between the 5th and 95th percentile of a crop before Otsu is
+#: worth running. Otsu assumes a bimodal histogram -- dark glyphs, light field.
+#: Given a flat crop instead it still returns a threshold, splitting sensor
+#: noise into confident-looking black and white speckle that reads as glyphs.
+MIN_OTSU_SPREAD = 12
+
 #: Plate-like aspect window for the rectified output. Outside it the quad was
 #: not a plate, and warping to it would smear the glyphs past recognition.
 MIN_RECTIFIED_ASPECT = 1.2
@@ -150,6 +168,36 @@ MAX_RECTIFIED_ASPECT = 8.0
 #: corner in the first place, so the test would never fire.
 NO_OP_CORNER_TOLERANCE_RATIO = 0.03
 MIN_NO_OP_CORNER_TOLERANCE = 4.0
+
+#: Structuring element used to break the ink bridges between tightly-set
+#: characters (see :func:`separate_characters`). One pixel wide, three tall,
+#: and both numbers are load-bearing.
+#:
+#: **Why vertical.** The intuition that merged characters need *horizontal*
+#: thinning is wrong, and measurably so. Two adjacent glyphs do not merge
+#: across the full height of the gap between them -- they touch only over the
+#: few rows where their strokes come closest, leaving the gap column white
+#: above and below. That bridge is therefore short in **y**, not in x, and only
+#: an erosion along y reaches it: white grows down from above and up from
+#: below until the bridge is gone. A horizontal kernel can only eat into the
+#: gap from its left and right ends, which are exactly where the glyph strokes
+#: are, so it thins the characters without ever reopening the join.
+#:
+#: **Why odd.** ``getStructuringElement`` centres the anchor, so an even height
+#: erodes asymmetrically -- one row from one side only -- which both halves the
+#: bridge thickness it can clear and shifts every glyph half a pixel. Three
+#: takes one row from each side, symmetrically, clearing bridges up to two rows
+#: thick; that covers the overwhelming majority, and the opening below puts the
+#: stroke weight back afterwards.
+TIGHT_FONT_KERNEL = (1, 3)
+
+#: Ink coverage outside which :func:`separate_characters` declines to run.
+#: Below the floor there is no bridge to break and eroding would only thin
+#: already-thin strokes into gaps; above the ceiling the crop is mostly ink
+#: (a shadow, a blown-out binarisation) and no amount of erosion recovers
+#: glyphs from it.
+MIN_TIGHT_FONT_INK = 0.10
+MAX_TIGHT_FONT_INK = 0.60
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,13 +243,28 @@ class EnhancedCrop:
 
     gray: np.ndarray
     binary: np.ndarray | None
+    #: The binarised view with the ink bridges between tightly-set characters
+    #: broken (:func:`separate_characters`). ``None`` when the crop did not
+    #: need it or could not be given it -- which is the common case, so this
+    #: costs an extra OCR pass only on the bold, tight-set plates it exists
+    #: for. Defaulted so that constructing an ``EnhancedCrop`` positionally,
+    #: as the tests and the older call sites do, keeps working.
+    separated: np.ndarray | None = None
 
     @property
     def variants(self) -> list[np.ndarray]:
-        """Grayscale first (usually the better read), binarised second."""
+        """Views to read, best-odds first.
+
+        Grayscale (usually the better read), then the binarisation, then the
+        de-bridged binarisation when there is one. Order matters only as a
+        tie-break: every view that reads anything votes, and the ensemble
+        weighs agreement across them rather than taking the first answer.
+        """
         out = [self.gray]
         if self.binary is not None:
             out.append(self.binary)
+        if self.separated is not None:
+            out.append(self.separated)
         return out
 
 
@@ -306,6 +369,8 @@ def enhance_plate(
     target_height: int = TARGET_CROP_HEIGHT,
     unsharp_amount: float = UNSHARP_AMOUNT,
     normalize_light: bool = True,
+    tight_font: bool = True,
+    tight_font_kernel: tuple[int, int] = TIGHT_FONT_KERNEL,
 ) -> EnhancedCrop:
     """Prepare a plate crop for OCR.
 
@@ -327,6 +392,14 @@ def enhance_plate(
     filter softened. Binarise last, off the sharpened image, because a crisper
     edge is exactly what makes the adaptive threshold land on the glyph
     boundary instead of a few pixels inside it.
+
+    ``tight_font`` adds a fourth product: the binarisation with the ink bridges
+    between adjacent characters broken (:func:`separate_characters`). It is
+    derived from the binary rather than replacing it, because the erosion that
+    rescues a bold APP plate would thin a delicate one into gaps -- so both
+    views go to the recogniser and the ensemble decides. Only crops whose ink
+    coverage says there is a bridge to break produce one, so on an ordinary
+    plate this costs a cheap pixel count and no OCR pass at all.
 
     Always returns an :class:`EnhancedCrop`; on failure ``gray`` is the input
     and ``binary`` is ``None``.
@@ -377,10 +450,195 @@ def enhance_plate(
             logger.debug("adaptive threshold variant unavailable", exc_info=True)
             binary = None
 
-        return EnhancedCrop(gray=gray, binary=binary)
+        separated = (
+            separate_characters(binary, tight_font_kernel)
+            if tight_font and binary is not None
+            else None
+        )
+
+        return EnhancedCrop(gray=gray, binary=binary, separated=separated)
     except Exception:
         logger.debug("enhance_plate failed, returning input unchanged", exc_info=True)
         return EnhancedCrop(gray=crop, binary=None)
+
+
+def otsu_binarize(gray: np.ndarray) -> np.ndarray | None:
+    """Global Otsu threshold of ``gray``, or ``None`` when it would be noise.
+
+    Complements the adaptive threshold in :func:`enhance_plate` rather than
+    replacing it, because the two fail on opposite crops. Adaptive
+    thresholding decides per neighbourhood, which is what rescues a plate lit
+    from one side -- but on a *uniformly* dark night crop every neighbourhood
+    is flat, so it thresholds each one against its own noise and returns
+    speckle. Otsu picks one global cut from the whole histogram, which is
+    exactly right when the entire crop is dark but still bimodal.
+
+    Declines on a crop with no real spread, where the "two modes" Otsu splits
+    would be the noise floor and itself.
+    """
+    if not _is_image(gray):
+        return None
+    try:
+        flat = to_gray(gray)
+        low, high = np.percentile(flat, (5.0, 95.0))
+        if float(high) - float(low) < MIN_OTSU_SPREAD:
+            logger.debug("otsu declined: spread %.1f too flat to threshold", float(high - low))
+            return None
+        _, binary = cv2.threshold(flat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return binary
+    except Exception:
+        logger.debug("otsu_binarize failed", exc_info=True)
+        return None
+
+
+def invert(image: np.ndarray) -> np.ndarray:
+    """Photographic negative of ``image``; returns the input on failure.
+
+    Turkish plates are dark glyphs on a light field, and both recognisers are
+    trained accordingly. Two situations flip that polarity: IR illuminators at
+    night, which drive a retroreflective plate to white and its glyphs to
+    black-on-glare, and the plate appearing as a bright patch in an otherwise
+    black frame. Handing the recogniser the negative costs one pass and is
+    often the difference between a read and nothing at all.
+    """
+    if not _is_image(image):
+        return image
+    try:
+        return cv2.bitwise_not(image)
+    except Exception:
+        logger.debug("invert failed, returning input unchanged", exc_info=True)
+        return image
+
+
+def ink_ratio(binary: np.ndarray) -> float:
+    """Fraction of ``binary`` occupied by ink, whichever polarity it is in.
+
+    Glyphs are the *minority* class on any plate crop worth reading -- strokes
+    cover well under half the plate -- so the smaller of the two populations is
+    the ink. Deciding it that way rather than assuming black-on-white means
+    this works unchanged on the inverted, IR-lit crops
+    :func:`hard_case_variants` produces.
+    """
+    if not _is_image(binary) or binary.size == 0:
+        return 0.0
+    try:
+        dark = float(np.count_nonzero(binary < 128)) / float(binary.size)
+    except Exception:  # pragma: no cover - defensive
+        return 0.0
+    return min(dark, 1.0 - dark)
+
+
+def separate_characters(
+    binary: np.ndarray,
+    kernel_size: tuple[int, int] = TIGHT_FONT_KERNEL,
+) -> np.ndarray | None:
+    """Break the ink bridges between tightly-set characters.
+
+    The APP-style plates -- thick strokes, very little space between glyphs --
+    lose their character boundaries at binarisation. Adaptive thresholding
+    decides per neighbourhood, and in the narrow gap between two heavy strokes
+    the whole neighbourhood is ink, so the gap thresholds *as* ink and the two
+    characters come out as one blob. The recogniser then reads that blob as a
+    single wide glyph, which is why these plates fail as a dropped or invented
+    character rather than as a confusable one: "34ABC123" arriving as
+    "34AEC123" or "34ABC23".
+
+    The repair is a morphological **opening of the ink** with the vertical
+    kernel above -- not a bare erosion. Both break the bridge, but an erosion
+    leaves every stroke permanently thinner, and thinned strokes are how a
+    "B" becomes an "8" and a "0" becomes a "O". The opening's dilation step puts
+    that weight back: once the bridge has been eroded away there is no ink left
+    in the gap column for the dilation to grow from, so the separation survives
+    while the glyphs return to their original thickness. That asymmetry is the
+    entire reason opening is the right primitive here.
+
+    Polarity is detected rather than assumed (see :func:`ink_ratio`), because
+    the same function has to serve the inverted, IR-lit views. OpenCV's
+    ``MORPH_OPEN`` erodes the *bright* class, so opening the ink means
+    ``MORPH_CLOSE`` when the ink is dark -- which is the ordinary daylight
+    plate -- and ``MORPH_OPEN`` when it is bright.
+
+    Returns ``None`` -- meaning "no useful variant here", not an error -- when
+    the crop is unusable, when the opening changes nothing, or when the ink
+    coverage says there is no bridge to break. ``None`` rather than the input
+    unchanged so the caller does not spend an OCR pass re-reading a view it has
+    already seen.
+    """
+    if not _is_image(binary):
+        return None
+    try:
+        flat = to_gray(binary)
+        coverage = ink_ratio(flat)
+        if not (MIN_TIGHT_FONT_INK <= coverage <= MAX_TIGHT_FONT_INK):
+            return None
+
+        width = max(1, int(kernel_size[0]))
+        height = max(1, int(kernel_size[1]))
+        if width == 1 and height == 1:
+            return None  # a 1x1 kernel is the identity
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (width, height))
+
+        # Which operation opens the *ink* depends on which class the ink is.
+        # MORPH_OPEN removes thin bright features, so it opens the ink only on
+        # an inverted crop; on an ordinary dark-glyph plate the equivalent is
+        # MORPH_CLOSE, which removes thin dark ones.
+        dark_fraction = float(np.count_nonzero(flat < 128)) / float(flat.size)
+        ink_is_dark = dark_fraction <= 0.5
+        operation = cv2.MORPH_CLOSE if ink_is_dark else cv2.MORPH_OPEN
+        separated = cv2.morphologyEx(flat, operation, kernel)
+
+        # An opening that changed nothing means there was no bridge; handing
+        # the recogniser a byte-identical view would buy a duplicate ballot.
+        if np.array_equal(separated, flat):
+            return None
+        return separated
+    except Exception:
+        logger.debug("separate_characters failed", exc_info=True)
+        return None
+
+
+def hard_case_variants(gray: np.ndarray) -> list[np.ndarray]:
+    """Last-resort views of an already-enhanced crop, for when nothing read.
+
+    Up to four, in descending order of how often they pay off: the Otsu
+    binarisation (the low-light case the adaptive threshold cannot serve), the
+    negative of the grayscale (the reversed-polarity case), the negative of
+    the Otsu image (both at once), and the Otsu image with tight-set characters
+    prised apart (:func:`separate_characters`).
+
+    The last one is here as well as in :func:`enhance_plate` because Otsu takes
+    one global cut, which on a bold plate is *more* prone to bridging than the
+    adaptive threshold, not less: a single threshold cannot be tight enough for
+    the gap between two heavy strokes and loose enough for the plate's darker
+    corner at the same time.
+
+    Deliberately *not* part of :func:`enhance_plate`. These views are wrong for
+    an ordinary daylight plate -- inverting a perfectly readable crop invites a
+    confident misread -- and every extra view is another OCR pass on every car
+    at the gate. They earn their cost only on a crop the standard views have
+    already failed, so the caller escalates to them rather than always paying.
+
+    Never raises; an unusable input yields an empty list.
+    """
+    if not _is_image(gray):
+        return []
+    try:
+        flat = to_gray(gray)
+        variants: list[np.ndarray] = []
+
+        otsu = otsu_binarize(flat)
+        if otsu is not None:
+            variants.append(otsu)
+        variants.append(invert(flat))
+        if otsu is not None:
+            variants.append(invert(otsu))
+            separated = separate_characters(otsu)
+            if separated is not None:
+                variants.append(separated)
+        return [v for v in variants if isinstance(v, np.ndarray) and v.size > 0]
+    except Exception:
+        logger.debug("hard_case_variants failed", exc_info=True)
+        return []
 
 
 def deskew(crop: np.ndarray, max_degrees: float = MAX_DESKEW_DEGREES) -> np.ndarray:
@@ -558,9 +816,13 @@ def _plate_quad(gray: np.ndarray) -> np.ndarray | None:
         return None
 
     # Largest first, and stop as soon as they are too small to be the plate.
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
-        if cv2.contourArea(contour) < area * MIN_QUAD_AREA_RATIO:
-            break
+    candidates = [
+        contour
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+        if cv2.contourArea(contour) >= area * MIN_QUAD_AREA_RATIO
+    ]
+
+    for contour in candidates:
         perimeter = cv2.arcLength(contour, True)
         if perimeter <= 0:
             continue
@@ -570,7 +832,46 @@ def _plate_quad(gray: np.ndarray) -> np.ndarray | None:
             approx = cv2.approxPolyDP(contour, epsilon_ratio * perimeter, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 return approx.reshape(4, 2).astype(np.float32)
+
+    # Nothing collapsed to a clean quadrilateral. Fall back to the minimum-area
+    # *rotated rectangle*, which always yields four points.
+    #
+    # This is a weaker correction by construction -- a rectangle cannot express
+    # the trapezoid of a true side-on view, so warping one back is a rotation
+    # and a scale, not a perspective fix. It is still worth having, because it
+    # covers the case nothing else does: a plate rotated past
+    # MAX_DESKEW_DEGREES, where a broken or cluttered border stops approxPolyDP
+    # finding the outline and deskew refuses the angle as implausible. Without
+    # this the crop gets no geometric correction at all.
+    for contour in candidates:
+        quad = _min_area_quad(contour)
+        if quad is not None:
+            return quad
     return None
+
+
+def _min_area_quad(contour: np.ndarray) -> np.ndarray | None:
+    """Corners of ``contour``'s minimum-area rotated rectangle, if it fits well.
+
+    The fill ratio is the whole safety argument. ``cv2.minAreaRect`` returns a
+    rectangle for *any* contour, including an L-shaped shadow edge or a smear
+    of glyph blobs, and warping the crop onto one of those destroys it. A real
+    plate border fills close to all of its own bounding rectangle, so requiring
+    :data:`MIN_BOX_FILL_RATIO` rejects the shapes that are not plate outlines
+    while keeping the ones that are.
+    """
+    try:
+        rect = cv2.minAreaRect(contour)
+        (_, _), (rect_w, rect_h), _ = rect
+        rect_area = float(rect_w) * float(rect_h)
+        if rect_area <= 0:
+            return None
+        if cv2.contourArea(contour) / rect_area < MIN_BOX_FILL_RATIO:
+            return None
+        return cv2.boxPoints(rect).astype(np.float32)
+    except Exception:
+        logger.debug("minAreaRect fallback failed", exc_info=True)
+        return None
 
 
 def _is_crop_border(ordered: np.ndarray, shape: tuple[int, int]) -> bool:

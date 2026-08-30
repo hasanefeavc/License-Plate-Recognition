@@ -3,6 +3,21 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        # Which PyTorch wheels go into the image. The default in the Dockerfile
+        # is the CPU index; this override pulls the CUDA 12.4 build so
+        # torch.cuda.is_available() is true inside the container.
+        #
+        # The base image stays python:slim -- no nvidia/cuda image is needed.
+        # The CUDA runtime libraries ship *inside* these wheels (as the
+        # nvidia-*-cu12 dependencies), and the host driver is injected by the
+        # NVIDIA container toolkit, so the two halves meet without a CUDA base
+        # layer. Cost is image size: ~2.5 GB against ~800 MB for CPU.
+        #
+        # Override per host if the driver is too old for cu124:
+        #   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 \
+        #     docker compose -f docker/docker-compose.yml build
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}
     image: lpr-api:latest
     container_name: lpr-api
     restart: unless-stopped
@@ -13,12 +28,84 @@ services:
       - "/dev/video1:/dev/video1"
     volumes:
       - ../data:/app/data
+      # Holds the YOLO weights *and*, under easyocr/, the EasyOCR detection and
+      # recognition networks (see LPR_OCR__MODEL_DIR below). Both are large and
+      # neither is in the image, so this bind mount is what makes a cold start
+      # offline-capable.
       - ../models:/app/models
+      # EasyOCR's built-in default location, mounted as well as configured.
+      # Belt and braces: any code path that ignores model_storage_directory --
+      # a helper script, a future easyocr release, a manual `python -c` inside
+      # the container -- still writes to the host instead of to a container
+      # layer that the next `up --build` deletes.
+      - ../data/easyocr_cache:/root/.EasyOCR
+      # torch.hub / ultralytics asset cache, for the same reason.
+      - ../data/torch_cache:/root/.cache/torch
       - ../config.yaml:/app/config.yaml:ro
       - ..:/repo
-      - /var/run/docker.sock:/var/run/docker.sock
+      # The engine socket the OTA rebuild talks to. Parameterised because the
+      # path is not universal: rootless Podman listens on
+      # /run/user/<uid>/podman/podman.sock, and mounting /var/run/docker.sock
+      # there hands the container a *different* engine from the one running
+      # this service -- so the update would rebuild an image nothing is using,
+      # or fail on permissions. Check with `echo $DOCKER_HOST` on the host and
+      # set LPR_DOCKER_SOCK in .env to match.
+      - ${LPR_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
     environment:
       LPR_SYSTEM_UPDATE__REPO_DIR: /repo
+      # Put the OCR weights on the models/ volume rather than in $HOME, so they
+      # survive `docker compose up --build`. Without this every rebuild
+      # re-downloaded ~100 MB before the first frame could be processed, and a
+      # dropped link at that moment hung startup.
+      LPR_OCR__MODEL_DIR: /app/models/easyocr
+      TORCH_HOME: /app/models/torch
+      # Consumed by the NVIDIA container runtime. The deploy.resources block
+      # below is what actually requests the device under `docker compose up`;
+      # these two keep `docker run --runtime=nvidia` and older toolkit versions
+      # working with the same image.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     env_file:
       - path: ../.env
         required: false
+    # --- GPU passthrough ---------------------------------------------------
+    #
+    # Requires the NVIDIA Container Toolkit on the host:
+    #   sudo apt install nvidia-container-toolkit
+    #   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+    # Verify the *device* actually reaches the container -- not just that the
+    # container started:
+    #   docker compose -f docker/docker-compose.yml run --rm lpr-api \
+    #     python -c "import torch; print(torch.cuda.is_available())"
+    #
+    # This reservation is the Docker Engine spelling, and on Docker Engine it
+    # is a hard requirement: with no nvidia runtime registered, `up` fails at
+    # container-create with 'could not select device driver "nvidia" with
+    # capabilities: [[gpu]]' rather than starting on CPU. That is the right
+    # default for the gate box, because a silent drop to CPU is a 10x slowdown
+    # nobody notices until the queue backs up.
+    #
+    # **It is not universal.** Podman's Docker-compatible API accepts this
+    # block and then ignores it -- no device, no error, container up, and
+    # `lpr.accel` logs "no CUDA device visible to torch ...; running on CPU".
+    # That is precisely the silent CPU fallback this block exists to prevent.
+    # Podman (and Docker Engine >= 25 with CDI enabled) wants the device named
+    # through CDI instead; see docker/docker-compose.cdi.yml, which is an
+    # overlay rather than the default because a host with no CDI spec would
+    # then fail to create the container:
+    #   docker compose -f docker/docker-compose.yml \
+    #                  -f docker/docker-compose.cdi.yml up -d
+    #
+    # A CPU-only host drops the block, most cleanly with an override file that
+    # is never committed:
+    #   # docker/docker-compose.override.yml
+    #   services: {lpr-api: {deploy: {resources: {reservations: {devices: []}}}}}
+    # The application itself degrades gracefully either way: lpr.accel resolves
+    # both detection.device and ocr.gpu to CPU when no GPU is usable.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

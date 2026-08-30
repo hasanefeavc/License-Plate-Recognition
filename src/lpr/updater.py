@@ -17,7 +17,10 @@ This feature is remote code execution by design -- that is what an OTA updater
   directory and compose file all come from configuration. A caller cannot ask
   this endpoint to pull from *their* repository, so a stolen admin token cannot
   be escalated into "run my code" -- only into "run whatever the operator's own
-  configured remote already contains".
+  configured remote already contains". The single flag the HTTP layer does
+  forward, ``force``, selects between two fixed code paths and is never
+  interpolated into anything; it changes *whether* the configured build runs,
+  never *what* it builds.
 * **No shell, ever.** Every command is a fixed ``list[str]`` passed to
   :func:`subprocess.run` without ``shell=True``, so there is no string for an
   argument to break out of.
@@ -158,6 +161,11 @@ class UpdateStatus:
     finished_at: float | None = None
     commit_before: str | None = None
     commit_after: str | None = None
+    #: True when this run was a forced rebuild -- one the operator asked for
+    #: explicitly, which rebuilds even with nothing new to pull. Reported so
+    #: the UI can say "yeniden derlendi" rather than claiming an upgrade that
+    #: did not happen, and so the restored post-restart status keeps saying it.
+    forced: bool = False
     log: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -174,6 +182,7 @@ class UpdateStatus:
             "finished_at": self.finished_at,
             "commit_before": self.commit_before,
             "commit_after": self.commit_after,
+            "forced": self.forced,
             "log": list(self.log),
         }
 
@@ -250,6 +259,11 @@ class SystemUpdater:
         self.build_timeout = float(getattr(cfg, "build_timeout_s", 900.0))
         self._repo_dir = Path(str(getattr(cfg, "repo_dir", "."))).expanduser()
         self._compose_file = str(getattr(cfg, "compose_file", "docker/docker-compose.yml"))
+        self._compose_overrides = [
+            str(item).strip()
+            for item in (getattr(cfg, "compose_overrides", None) or ())
+            if str(item).strip()
+        ]
 
         self._lock = threading.Lock()
         self._status = UpdateStatus()
@@ -409,11 +423,12 @@ class SystemUpdater:
             # process starting at all is the evidence the rebuild worked.
             interrupted = state in ("running", "restarting")
             resolved = cast(UpdateState, "succeeded" if interrupted else state)
+            forced = bool(payload.get("forced"))
             self._status = UpdateStatus(
                 state=resolved,
                 step=payload.get("step"),
                 detail=(
-                    "Güncelleme tamamlandı, servis yeniden başlatıldı."
+                    self._restart_detail(forced)
                     if interrupted
                     else str(payload.get("detail") or "")
                 ),
@@ -421,10 +436,25 @@ class SystemUpdater:
                 finished_at=payload.get("finished_at") or time.time(),
                 commit_before=payload.get("commit_before"),
                 commit_after=payload.get("commit_after"),
+                forced=forced,
                 log=tuple(str(line) for line in payload.get("log") or ())[-40:],
             )
         except Exception:
             logger.debug("Önceki güncelleme durumu okunamadı", exc_info=True)
+
+    @staticmethod
+    def _restart_detail(forced: bool) -> str:
+        """What to say about a run that was cut short by its own rebuild.
+
+        A forced rebuild must not claim an upgrade: the commit is very often
+        unchanged, and "Güncelleme tamamlandı" on a machine that pulled nothing
+        is the kind of message that ends in a phone call.
+        """
+        return (
+            "Yeniden derleme tamamlandı, servis yeniden başlatıldı."
+            if forced
+            else "Güncelleme tamamlandı, servis yeniden başlatıldı."
+        )
 
     # -- the update ------------------------------------------------------
 
@@ -480,8 +510,20 @@ class SystemUpdater:
             detail=(f"{behind} yeni commit mevcut." if behind else "Sistem güncel."),
         )
 
-    def start(self) -> UpdateStatus:
+    def start(self, force: bool = False) -> UpdateStatus:
         """Accept an update and return immediately.
+
+        ``force`` turns this into a *rebuild* rather than an upgrade: the
+        checkout is still pulled, but a pull that brings nothing new no longer
+        ends the run, and a pull that outright fails no longer aborts it. That
+        is deliberately the only knob the HTTP layer exposes -- it selects
+        between two fixed behaviours and never reaches a command line, so it
+        cannot widen what an authenticated caller is able to execute.
+
+        Operators need it because "restart the stack" and "pick up the newest
+        commit" are different requests, and only the second one was reachable
+        from the UI: a container wedged on a stale image, a changed .env or a
+        half-applied config had no button at all.
 
         Raises ``RuntimeError`` when the feature is disabled or an update is
         already in flight; the HTTP layer maps those onto 503 and 409.
@@ -492,25 +534,33 @@ class SystemUpdater:
                 "config.yaml içinde system_update.enabled: true yapın."
             )
 
+        forced = bool(force)
         with self._lock:
             if self._status.running:
                 raise RuntimeError("Zaten devam eden bir güncelleme var.")
             self._status = UpdateStatus(
                 state="running",
                 step=STEP_REVISION,
-                detail="Güncelleme başlatıldı.",
+                detail=(
+                    "Zorla yeniden derleme başlatıldı."
+                    if forced
+                    else "Güncelleme başlatıldı."
+                ),
                 started_at=time.time(),
+                forced=forced,
             )
             thread = threading.Thread(
                 target=self._run_update,
                 name="lpr-system-update",
+                kwargs={"force": forced},
                 daemon=True,
             )
             self._thread = thread
 
         thread.start()
         logger.warning(
-            "Sistem güncellemesi başlatıldı (remote=%s branch=%s repo=%s)",
+            "Sistem %s başlatıldı (remote=%s branch=%s repo=%s)",
+            "yeniden derlemesi (zorla)" if forced else "güncellemesi",
             self.remote,
             self.branch,
             self.repo_dir,
@@ -522,23 +572,78 @@ class SystemUpdater:
         self._set(state="failed", step=step, detail=detail, finished_at=time.time())
         self._persist()
 
-    def _run_update(self) -> None:
+    def _run_update(self, force: bool = False) -> None:
         """The update itself. Runs on its own thread; never raises out of it."""
         try:
-            self._update_steps()
+            self._update_steps(force=force)
         except Exception as exc:  # pragma: no cover - belt and braces
             logger.exception("Sistem güncellemesi beklenmedik şekilde başarısız oldu")
             self._fail(self._status.step or STEP_PULL, f"Beklenmeyen hata: {exc}")
 
-    def _update_steps(self) -> None:
+    def _update_steps(self, force: bool = False) -> None:
+        if not self._advance_checkout(force):
+            return
+
+        # Persisted *before* the rebuild: compose is about to kill this
+        # container, so this is the last chance to leave a breadcrumb.
+        self._set(
+            step=STEP_BUILD,
+            state="restarting",
+            detail="Yeniden derleniyor ve başlatılıyor...",
+        )
+        self._persist()
+
+        build = self._run(self._compose_command(), self.repo_dir, self.build_timeout)
+        self._append_log(f"$ {' '.join(build.command)}")
+        if build.output:
+            self._append_log(build.output)
+        if not build.ok:
+            self._fail(STEP_BUILD, self._explain_build_failure(build))
+            return
+
+        status = self.status
+        self._set(
+            state="succeeded",
+            step=STEP_BUILD,
+            detail=("Yeniden derleme tamamlandı." if force else "Güncelleme tamamlandı."),
+            finished_at=time.time(),
+        )
+        self._persist()
+        logger.info(
+            "Sistem %s tamamlandı: %s -> %s",
+            "yeniden derlemesi" if force else "güncellemesi",
+            status.commit_before,
+            status.commit_after,
+        )
+
+    def _advance_checkout(self, force: bool) -> bool:
+        """Bring the checkout up to date, and say whether a rebuild follows.
+
+        Returns ``False`` when the run is already over -- it failed, or the
+        checkout was current and there was nothing worth an outage for. Either
+        way the terminal status has been set and persisted before returning.
+
+        ``force`` reverses the burden of proof at every one of these gates.
+        Normally the git half decides whether the rebuild is justified, and
+        anything unexpected stops the run; under a forced rebuild the operator
+        has already decided, and git only gets to *annotate* the run. That is
+        the whole point of the button: a container wedged on a stale image, a
+        changed ``.env`` or a checkout that will not fast-forward are exactly
+        the states in which somebody needs a rebuild most, and exactly the
+        states the normal path refuses.
+        """
         repo = self.repo_dir
         if not (repo / ".git").exists():
-            self._fail(
-                STEP_REVISION,
-                f"{repo} bir git deposu değil; güncelleme yalnızca git ile kurulmuş "
-                "sistemlerde çalışır.",
-            )
-            return
+            if not force:
+                self._fail(
+                    STEP_REVISION,
+                    f"{repo} bir git deposu değil; güncelleme yalnızca git ile kurulmuş "
+                    "sistemlerde çalışır.",
+                )
+                return False
+            # Rebuilding needs a compose file, not a checkout.
+            self._append_log(f"{repo} bir git deposu değil; yalnızca yeniden derleniyor.")
+            return True
 
         before = self._git_value(["git", "rev-parse", "HEAD"])
         self._set(step=STEP_PULL, commit_before=before, detail="Değişiklikler alınıyor...")
@@ -554,13 +659,19 @@ class SystemUpdater:
         if pull.output:
             self._append_log(pull.output)
         if not pull.ok:
-            self._fail(STEP_PULL, self._explain_pull_failure(pull))
-            return
+            reason = self._explain_pull_failure(pull)
+            if not force:
+                self._fail(STEP_PULL, reason)
+                return False
+            # Recorded, not fatal: the operator asked for a rebuild of what is
+            # on disk, and what is on disk is still perfectly buildable.
+            logger.warning("Zorla yeniden derleme: git pull başarısız (%s)", reason)
+            self._append_log(f"UYARI: {reason} Mevcut kopya yeniden derleniyor.")
 
         after = self._git_value(["git", "rev-parse", "HEAD"])
         self._set(commit_after=after)
 
-        if before and after and before == after:
+        if not force and before and after and before == after:
             self._set(
                 state="succeeded",
                 step=STEP_PULL,
@@ -569,40 +680,28 @@ class SystemUpdater:
             )
             self._persist()
             logger.info("Sistem güncellemesi: değişiklik yok (%s)", after)
-            return
+            return False
 
-        # Persisted *before* the rebuild: compose is about to kill this
-        # container, so this is the last chance to leave a breadcrumb.
-        self._set(
-            step=STEP_BUILD,
-            state="restarting",
-            detail="Yeniden derleniyor ve başlatılıyor...",
-        )
-        self._persist()
-
-        build = self._run(self._compose_command(), repo, self.build_timeout)
-        self._append_log(f"$ {' '.join(build.command)}")
-        if build.output:
-            self._append_log(build.output)
-        if not build.ok:
-            self._fail(STEP_BUILD, self._explain_build_failure(build))
-            return
-
-        self._set(
-            state="succeeded",
-            step=STEP_BUILD,
-            detail="Güncelleme tamamlandı.",
-            finished_at=time.time(),
-        )
-        self._persist()
-        logger.info("Sistem güncellemesi tamamlandı: %s -> %s", before, after)
+        return True
 
     def _compose_command(self) -> list[str]:
-        """``docker compose -f <file> up -d --build``, with a v1 fallback."""
+        """``docker compose -f <file> [-f <overlay>...] up -d --build``.
+
+        Every ``system_update.compose_overrides`` entry becomes another ``-f``,
+        in order, exactly as an operator would type it. That list is not a
+        convenience: this module is what brings the service back up after an
+        update, so an overlay the operator normally passes by hand is otherwise
+        dropped on every rebuild. On a Podman or CDI host that means the GPU
+        stops being passed through -- and the container comes up healthy on
+        CPU, which is the failure nobody notices.
+        """
+        files: list[str] = ["-f", self._compose_file]
+        for override in self._compose_overrides:
+            files += ["-f", override]
         if shutil.which("docker"):
-            return ["docker", "compose", "-f", self._compose_file, "up", "-d", "--build"]
+            return ["docker", "compose", *files, "up", "-d", "--build"]
         # Older hosts only have the standalone binary.
-        return ["docker-compose", "-f", self._compose_file, "up", "-d", "--build"]
+        return ["docker-compose", *files, "up", "-d", "--build"]
 
     @staticmethod
     def _explain_pull_failure(result: CommandResult) -> str:

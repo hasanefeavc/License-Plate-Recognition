@@ -13,6 +13,7 @@ command, and that the commands are argument lists rather than shell strings.
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -102,9 +103,9 @@ class AdvancingRunner(ScriptedRunner):
         return super().__call__(command, cwd, timeout)
 
 
-def run_to_completion(updater: SystemUpdater) -> Any:
+def run_to_completion(updater: SystemUpdater, force: bool = False) -> Any:
     """Start an update and wait for its thread, so assertions are deterministic."""
-    updater.start()
+    updater.start(force=force)
     thread = updater._thread
     assert thread is not None
     thread.join(timeout=10)
@@ -245,6 +246,221 @@ def test_an_already_current_checkout_skips_the_rebuild(tmp_settings: Any, repo: 
     assert status.state == "succeeded"
     assert "zaten güncel" in status.detail.lower()
     assert not runner.ran("up -d --build")
+
+
+# ---------------------------------------------------------------------------
+# Forced rebuilds
+#
+# The ordinary path treats "nothing new to pull" as a reason not to rebuild,
+# because a rebuild is a few minutes of outage at the barrier. `force` says the
+# operator wants that outage anyway -- for a container stuck on a stale image,
+# an edited .env, or a checkout that cannot fast-forward. These tests pin the
+# inversion: every gate that normally *stops* the run must, under force, let it
+# reach the build instead.
+# ---------------------------------------------------------------------------
+
+
+def test_a_forced_run_rebuilds_even_with_nothing_new_to_pull(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The whole point of the flag: the same commit must still reach compose."""
+    runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
+    status = run_to_completion(build(tmp_settings, repo, runner), force=True)
+
+    assert status.state == "succeeded"
+    assert runner.ran("up -d --build"), "force must bypass the already-current exit"
+    assert "zaten güncel" not in status.detail.lower()
+
+
+def test_the_same_run_without_force_stops_before_the_build(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The control for the test above -- only the flag differs."""
+    runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
+    status = run_to_completion(build(tmp_settings, repo, runner), force=False)
+
+    assert status.state == "succeeded"
+    assert not runner.ran("up -d --build")
+    assert "zaten güncel" in status.detail.lower()
+
+
+def test_a_forced_run_says_it_rebuilt_rather_than_updated(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """Reporting an upgrade that did not happen is how support calls start."""
+    runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
+    status = run_to_completion(build(tmp_settings, repo, runner), force=True)
+
+    assert status.forced is True
+    assert "yeniden derleme" in status.detail.lower()
+    assert "güncelleme tamamlandı" not in status.detail.lower()
+
+
+def test_a_forced_run_is_flagged_from_the_moment_it_is_accepted(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The UI reads `forced` off the POST reply, before any polling begins."""
+    updater = build(tmp_settings, repo, ScriptedRunner({"rev-parse HEAD": ok("same")}))
+    accepted = updater.start(force=True)
+    assert accepted.forced is True
+    assert accepted.to_dict()["forced"] is True
+
+    thread = updater._thread
+    assert thread is not None
+    thread.join(timeout=10)
+
+
+def test_an_ordinary_run_is_not_flagged_as_forced(tmp_settings: Any, repo: Path) -> None:
+    status = run_to_completion(build(tmp_settings, repo, AdvancingRunner()))
+    assert status.forced is False
+
+
+def test_a_forced_run_rebuilds_a_checkout_that_cannot_fast_forward(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """A diverged checkout is a reason somebody needs a rebuild, not a refusal.
+
+    The pull still runs and still fails -- nothing is merged or discarded --
+    but the working tree that is already on disk is perfectly buildable, and
+    that is what the operator asked to rebuild.
+    """
+    runner = ScriptedRunner(
+        {
+            "rev-parse HEAD": ok("aaa"),
+            "git pull": fail(128, "fatal: Not possible to fast-forward, aborting."),
+        }
+    )
+    status = run_to_completion(build(tmp_settings, repo, runner), force=True)
+
+    assert status.state == "succeeded"
+    assert runner.ran("up -d --build")
+    assert any("ayrışmış" in line for line in status.log), "the failure must still be visible"
+
+
+def test_a_failed_pull_still_aborts_an_unforced_run(tmp_settings: Any, repo: Path) -> None:
+    """Force is what relaxes this; the default must not have moved."""
+    runner = ScriptedRunner(
+        {
+            "rev-parse HEAD": ok("aaa"),
+            "git pull": fail(128, "fatal: Not possible to fast-forward, aborting."),
+        }
+    )
+    status = run_to_completion(build(tmp_settings, repo, runner), force=False)
+    assert status.state == "failed"
+    assert not runner.ran("up -d --build")
+
+
+def test_a_forced_run_rebuilds_outside_a_git_checkout(
+    tmp_settings: Any, tmp_path: Path
+) -> None:
+    """Rebuilding needs a compose file, not a repository."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    runner = ScriptedRunner()
+    status = run_to_completion(build(tmp_settings, plain, runner), force=True)
+
+    assert status.state == "succeeded"
+    assert runner.ran("up -d --build")
+    assert not runner.ran("git pull"), "there is no remote to pull from here"
+
+
+def test_a_forced_build_failure_is_still_a_failure(tmp_settings: Any, repo: Path) -> None:
+    """Force skips the reasons not to build -- never the result of building."""
+    runner = ScriptedRunner(
+        {
+            "rev-parse HEAD": ok("samecommit"),
+            "up -d --build": fail(1, "cannot connect to the Docker daemon"),
+        }
+    )
+    status = run_to_completion(build(tmp_settings, repo, runner), force=True)
+    assert status.state == "failed"
+    assert status.step == "build"
+
+
+def test_a_forced_run_cannot_bypass_the_disabled_switch(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """`force` reorders the update's own gates, not the deployment's consent."""
+    updater = build(tmp_settings, repo, ScriptedRunner(), enabled=False)
+    with pytest.raises(RuntimeError, match="devre dışı"):
+        updater.start(force=True)
+
+
+def test_a_forced_run_cannot_bypass_the_single_flight_guard(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """Two rebuilds at once would race a compose against a compose."""
+    gate = threading.Event()
+
+    class BlockingRunner(ScriptedRunner):
+        def __call__(self, command, cwd, timeout):  # type: ignore[no-untyped-def]
+            if "up -d --build" in " ".join(str(p) for p in command):
+                gate.wait(timeout=10)
+            return super().__call__(command, cwd, timeout)
+
+    updater = build(tmp_settings, repo, BlockingRunner({"rev-parse HEAD": ok("same")}))
+    updater.start(force=True)
+    try:
+        with pytest.raises(RuntimeError, match="devam eden"):
+            updater.start(force=True)
+    finally:
+        gate.set()
+        thread = updater._thread
+        assert thread is not None
+        thread.join(timeout=10)
+
+
+def test_a_forced_run_never_reaches_a_command_line(tmp_settings: Any, repo: Path) -> None:
+    """The flag selects a code path; it must not appear as an argument.
+
+    This is the security-relevant half of the feature: `force` is the first
+    value the HTTP layer forwards to the updater at all, so it is worth
+    pinning that it stays a branch rather than becoming a word in an argv.
+    """
+    runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
+    run_to_completion(build(tmp_settings, repo, runner), force=True)
+
+    for argv, _, _ in runner.calls:
+        assert not any("force" in part.lower() for part in argv), argv
+    assert runner.ran("git pull --ff-only origin main"), "the pull is unchanged by force"
+
+
+def test_a_forced_rebuild_survives_the_restart_as_a_rebuild(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The container that comes back must not claim it upgraded anything."""
+    state_file = repo / "last_update.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "state": "restarting",
+                "step": "build",
+                "started_at": 1.0,
+                "commit_before": "aaa",
+                "commit_after": "aaa",
+                "forced": True,
+                "log": ["$ git pull"],
+            }
+        )
+    )
+    updater = build(tmp_settings, repo, ScriptedRunner())
+
+    assert updater.status.state == "succeeded"
+    assert updater.status.forced is True
+    assert "yeniden derleme" in updater.status.detail.lower()
+
+
+def test_an_interrupted_ordinary_update_still_reports_an_update(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The control for the test above: no `forced` key, no change in wording."""
+    (repo / "last_update.json").write_text(
+        json.dumps({"state": "restarting", "step": "build", "commit_after": "bbb"})
+    )
+    updater = build(tmp_settings, repo, ScriptedRunner())
+
+    assert updater.status.forced is False
+    assert "güncelleme tamamlandı" in updater.status.detail.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -539,3 +755,66 @@ def test_an_unparseable_count_is_not_treated_as_an_update(tmp_settings: Any, rep
     state = build(tmp_settings, repo, runner).check_for_updates()
     assert state.checked is False
     assert state.update_available is False
+
+
+def test_compose_overrides_become_extra_dash_f_flags(tmp_settings) -> None:
+    """The overlay an operator passes by hand has to survive an OTA rebuild.
+
+    This module is what brings the service back up, so an overlay named only
+    on the operator's command line is dropped on every update. On a CDI host
+    that is the GPU passthrough, and the container comes back healthy on CPU --
+    the failure that looks like nothing happened.
+    """
+    from lpr.updater import SystemUpdater
+
+    tmp_settings.system_update.compose_file = "docker/docker-compose.yml"
+    tmp_settings.system_update.compose_overrides = ["docker/docker-compose.cdi.yml"]
+    command = SystemUpdater(tmp_settings)._compose_command()
+
+    assert command[-3:] == ["up", "-d", "--build"]
+    assert command.count("-f") == 2
+    base = command.index("docker/docker-compose.yml")
+    overlay = command.index("docker/docker-compose.cdi.yml")
+    assert base < overlay, "compose merges in order; the overlay must come second"
+
+
+def test_no_overrides_leaves_the_command_exactly_as_it_was(tmp_settings) -> None:
+    """The default path is untouched: one file, one -f."""
+    from lpr.updater import SystemUpdater
+
+    command = SystemUpdater(tmp_settings)._compose_command()
+    assert command.count("-f") == 1
+
+
+# ---------------------------------------------------------------------------
+# The image has to carry the client the rebuild step calls
+# ---------------------------------------------------------------------------
+
+
+def test_the_runtime_image_ships_the_client_the_rebuild_needs() -> None:
+    """`_compose_command` runs *inside* the container, against the host engine.
+
+    Without a docker CLI in the image the updater falls back to the v1
+    `docker-compose` binary, does not find that either, and fails at the build
+    step having already advanced the checkout -- new code on disk, stale image
+    running. That is a worse state than not updating at all, and it is silent
+    apart from one line in the update log, so it is worth a test that fails at
+    build time instead of at 03:00 on the gate box.
+    """
+    dockerfile = (Path(__file__).resolve().parents[1] / "docker" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert "docker-ce-cli" in dockerfile
+    assert "docker-compose-plugin" in dockerfile, "`docker compose` is a plugin, not a binary"
+
+
+def test_the_engine_socket_is_parameterised() -> None:
+    """Rootless Podman does not listen on /var/run/docker.sock.
+
+    Hard-coding it hands the container a different engine from the one running
+    the service, so the rebuild would replace an image nothing is using.
+    """
+    compose = (
+        Path(__file__).resolve().parents[1] / "docker" / "docker-compose.yml"
+    ).read_text(encoding="utf-8")
+    assert "${LPR_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock" in compose

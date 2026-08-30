@@ -39,8 +39,71 @@ logger = logging.getLogger(__name__)
 #: without this prefix is an Argon2 PHC string ("$argon2id$...").
 LEGACY_PREFIX = "sha256$"
 
+
+def iso_bound(value: str | None, *, end_of_day: bool = False) -> str | None:
+    """Canonicalise a ``since``/``until`` bound into the stored ts format.
+
+    Timestamps are stored as :func:`~lpr.contracts.utc_now_iso` produces them --
+    ``2026-08-28T14:32:11+00:00`` -- and compared *lexically*, which is only
+    equivalent to comparing instants while both sides are byte-for-byte the
+    same shape. Every bug this function exists to prevent is a violation of
+    that precondition:
+
+    * A bare ``YYYY-MM-DD`` is **shorter** than any stored timestamp, so
+      ``ts <= '2026-08-28'`` is false for every row on 2026-08-28 -- the day
+      filter that silently returned nothing. A date is a whole day, so it
+      expands to that day's first or last second depending on which end of the
+      range it is.
+    * ``2026-08-28T00:00:00.000Z`` -- what JavaScript's ``toISOString()``
+      produces -- disagrees with the stored form in both the milliseconds and
+      the ``Z``. It happens to sort correctly most of the time, which is worse
+      than never, because the disagreement only shows up on rows within a
+      second of a boundary.
+    * An offset-bearing bound like ``2026-08-28T00:00:00+03:00`` is a real
+      instant that must be *converted*, not compared as text.
+
+    Anything unparseable is passed through unchanged rather than raising: a
+    malformed filter should narrow somebody's search, not 500 their request.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        logger.debug("unparseable date bound %r, passed through as-is", text)
+        return text
+
+    # A bare date carries no time, so it stands for the whole day.
+    if len(text) == 10:
+        parsed = (
+            parsed.replace(hour=23, minute=59, second=59)
+            if end_of_day
+            else parsed.replace(hour=0, minute=0, second=0)
+        )
+
+    # Naive input is taken as UTC: everything this project writes is UTC, so a
+    # bound without an offset means the same clock as the stored rows.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
 DEFAULT_ROLE = "operator"
 ADMIN_ROLE = "admin"
+
+#: Outcomes of :meth:`PlateRepository.authorization` -- why the gate opened or
+#: stayed shut. Deliberately *not* :class:`~lpr.contracts.Action` values: these
+#: are reasons for a decision, while ``Action`` is what was recorded in the
+#: ``logs`` table, and every refusal here is still logged as ``denied`` so the
+#: history counters and the dashboard keep totalling the same things.
+PLATE_OK = "ok"
+PLATE_BLOCKED = "blocked"
+PLATE_EXPIRED = "expired"
+PLATE_UNKNOWN = "unknown"
 
 
 def normalise_plate(plate: str) -> str:
@@ -75,11 +138,13 @@ class PlateRepository:
 
     __slots__ = ()
 
-    def is_registered(self, plate: str) -> bool:
-        """True when ``plate`` may open the gate right now.
+    def authorization(self, plate: str) -> str:
+        """Why ``plate`` may or may not open the gate, in one lookup.
 
-        Three things can make a listed plate *not* count, and all three are
-        access decisions rather than bookkeeping:
+        Returns one of :data:`PLATE_OK`, :data:`PLATE_BLOCKED`,
+        :data:`PLATE_EXPIRED` or :data:`PLATE_UNKNOWN`. Three things can make a
+        listed plate *not* count, and all three are access decisions rather
+        than bookkeeping:
 
         * ``blocked`` -- on the list deliberately, to be refused. A resident
           who has moved out stays visible (and auditable) instead of being
@@ -87,20 +152,54 @@ class PlateRepository:
         * ``expires_at`` in the past -- a temporary permit that has run out.
         * absent -- never registered.
 
-        Evaluated in SQL rather than in Python so the gate decision stays one
-        indexed primary-key lookup on the recognition path.
+        The reason, not just a yes/no, because every refusal looks identical in
+        the log otherwise: an operator staring at "denied" for a resident whose
+        permit lapsed last night cannot tell it from a plate that was never
+        registered, which is exactly the call they get.
+
+        **The barrier deliberately does not consult ``plates.username``.** That
+        column records which account a car belongs to, and that account's
+        ``license_expires_at`` governs *its* access to the dashboard and the
+        API -- not this car's access to the car park. The two are different
+        subscriptions with different blast radii: a lapsed dashboard licence is
+        a billing matter, while a closed barrier strands a resident in the
+        street. Application access is enforced in
+        :func:`lpr.api.security.require_license`, and it stops there.
+
+        ``blocked`` outranks expiry, matching
+        :func:`lpr.api.schemas.plate_status`, so one plate cannot be described
+        two ways by the gate and the management screen.
+
+        Still one indexed primary-key lookup on the recognition path; only the
+        comparison moved out of SQL, so the reason survives it. Expiry is
+        compared lexically against :func:`~lpr.contracts.utc_now_iso`, which is
+        sound because every writer stores the same fixed-width UTC shape -- see
+        :func:`iso_bound` for what goes wrong when that is not true.
         """
         key = normalise_plate(plate)
         if not key:
-            return False
+            return PLATE_UNKNOWN
         conn = get_connection()
         row = conn.execute(
-            "SELECT 1 FROM plates WHERE plate = ? "
-            "AND COALESCE(blocked, 0) = 0 "
-            "AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)",
-            (key, utc_now_iso()),
+            "SELECT COALESCE(blocked, 0) AS blocked, expires_at FROM plates WHERE plate = ?",
+            (key,),
         ).fetchone()
-        return row is not None
+        if row is None:
+            return PLATE_UNKNOWN
+        if int(row["blocked"] or 0):
+            return PLATE_BLOCKED
+        expires = str(row["expires_at"] or "").strip()
+        if expires and expires <= utc_now_iso():
+            return PLATE_EXPIRED
+        return PLATE_OK
+
+    def is_registered(self, plate: str) -> bool:
+        """True when ``plate`` may open the gate right now.
+
+        A thin reading of :meth:`authorization`, which is the single place the
+        access rules live.
+        """
+        return self.authorization(plate) == PLATE_OK
 
     def is_blocked(self, plate: str) -> bool:
         """True when ``plate`` is on the list *and* flagged blocked.
@@ -109,14 +208,7 @@ class PlateRepository:
         blocked one was listed and then barred, and the two justify different
         notifications.
         """
-        key = normalise_plate(plate)
-        if not key:
-            return False
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT 1 FROM plates WHERE plate = ? AND COALESCE(blocked, 0) = 1", (key,)
-        ).fetchone()
-        return row is not None
+        return self.authorization(plate) == PLATE_BLOCKED
 
     def add(self, plate: str, note: str | None = None) -> bool:
         """Register a plate. Returns False if it was already registered."""
@@ -145,7 +237,7 @@ class PlateRepository:
         if not key:
             return False
 
-        allowed = ("owner", "apartment", "note", "expires_at", "blocked")
+        allowed = ("owner", "apartment", "note", "expires_at", "blocked", "username")
         updates = {name: fields[name] for name in allowed if name in fields}
         if not updates:
             return False
@@ -194,6 +286,7 @@ class PlateRepository:
         expires_at: str | None = None,
         blocked: bool = False,
         overwrite: bool = True,
+        username: str | None = None,
     ) -> str:
         """Insert or update one resident record. Returns what it did.
 
@@ -218,9 +311,18 @@ class PlateRepository:
             if existing is None:
                 conn.execute(
                     "INSERT INTO plates "
-                    "(plate, added_at, note, owner, apartment, expires_at, blocked) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (key, utc_now_iso(), note, owner, apartment, expires_at, int(blocked)),
+                    "(plate, added_at, note, owner, apartment, expires_at, blocked, username) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        key,
+                        utc_now_iso(),
+                        note,
+                        owner,
+                        apartment,
+                        expires_at,
+                        int(blocked),
+                        username,
+                    ),
                 )
                 return "added"
 
@@ -228,8 +330,8 @@ class PlateRepository:
             # first admitted, not when a spreadsheet last mentioned it.
             conn.execute(
                 "UPDATE plates SET note = ?, owner = ?, apartment = ?, "
-                "expires_at = ?, blocked = ? WHERE plate = ?",
-                (note, owner, apartment, expires_at, int(blocked), key),
+                "expires_at = ?, blocked = ?, username = ? WHERE plate = ?",
+                (note, owner, apartment, expires_at, int(blocked), username, key),
             )
             return "updated"
 
@@ -285,19 +387,25 @@ class LogRepository:
     ) -> list[LprEvent]:
         """Filtered, paginated history, newest first.
 
-        ``since`` / ``until`` are ISO-8601 UTC strings compared lexically,
-        which is exactly equivalent to comparing the instants because the
-        format is fixed-width (see ``contracts.utc_now_iso``).
+        ``since`` / ``until`` accept a bare ``YYYY-MM-DD`` date, a full ISO-8601
+        timestamp in any timezone, or the ``...Z`` form a browser produces.
+        :func:`iso_bound` folds all of them into the stored format first, which
+        is what makes the lexical comparison below equivalent to comparing
+        instants; passing a bound through raw is how a whole-day filter ends up
+        matching nothing.
         """
         clauses: list[str] = []
         params: list[Any] = []
 
-        if since:
+        start = iso_bound(since)
+        end = iso_bound(until, end_of_day=True)
+
+        if start:
             clauses.append("ts >= ?")
-            params.append(since)
-        if until:
+            params.append(start)
+        if end:
             clauses.append("ts <= ?")
-            params.append(until)
+            params.append(end)
         if camera:
             clauses.append("camera = ?")
             params.append(str(camera))
@@ -326,15 +434,22 @@ class LogRepository:
         camera: str | None = None,
         plate: str | None = None,
     ) -> int:
-        """Total rows a :meth:`query` with the same filters would match."""
+        """Total rows a :meth:`query` with the same filters would match.
+
+        Bounds go through :func:`iso_bound` exactly as in :meth:`query`. They
+        have to: a count that disagreed with the list it is counting would be a
+        subtler bug than either one being wrong alone.
+        """
         clauses: list[str] = []
         params: list[Any] = []
-        if since:
+        start = iso_bound(since)
+        end = iso_bound(until, end_of_day=True)
+        if start:
             clauses.append("ts >= ?")
-            params.append(since)
-        if until:
+            params.append(start)
+        if end:
             clauses.append("ts <= ?")
-            params.append(until)
+            params.append(end)
         if camera:
             clauses.append("camera = ?")
             params.append(str(camera))
@@ -397,16 +512,33 @@ class LogRepository:
         ).fetchall()
         return [_row_to_event(row) for row in rows]
 
-    def dates(self) -> list[str]:
+    def dates(self, tz_offset_minutes: int = 0) -> list[str]:
         """Distinct ``YYYY-MM-DD`` days that have log rows, newest first.
 
-        Replaces the legacy ``log_dates`` bookkeeping table, which had to be
-        kept in sync by hand with the per-day ``logs_*`` tables.
+        ``tz_offset_minutes`` is minutes **east of UTC** -- 180 for Turkey --
+        and buckets the rows into that timezone's calendar days rather than
+        UTC's. It matters because these strings become the options in the
+        history day picker: a gate read at 01:30 in Istanbul is stored as
+        22:30 the previous day in UTC, so a UTC-bucketed list offers the
+        operator a day that is not the day they were working.
+
+        Defaults to 0, i.e. UTC days, which is the right answer for a caller
+        that has no opinion (a script, a test) and preserves the previous
+        behaviour for anyone who does not pass it. Deliberately *not*
+        ``date(ts, 'localtime')``: that reads the timezone of the server
+        process, which in a container is UTC no matter where the site is.
         """
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT DISTINCT date(ts) AS day FROM logs ORDER BY day DESC"
-        ).fetchall()
+        offset = int(tz_offset_minutes)
+        if offset:
+            rows = conn.execute(
+                "SELECT DISTINCT date(ts, ?) AS day FROM logs ORDER BY day DESC",
+                (f"{offset:+d} minutes",),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT date(ts) AS day FROM logs ORDER BY day DESC"
+            ).fetchall()
         return [row["day"] for row in rows if row["day"]]
 
     def purge_older_than(self, days: int) -> int:
@@ -640,10 +772,17 @@ class UserRepository:
             return cur.rowcount > 0
 
     def delete(self, username: str) -> bool:
+        """Remove an account.
+
+        Any plates recorded against it keep working: ``plates.username`` is
+        ownership metadata, not a gate permit, so losing it changes nothing at
+        the barrier. See :meth:`PlateRepository.authorization`.
+        """
         name = (username or "").strip()
         if not name:
             return False
         with transaction() as conn:
+            conn.execute("UPDATE plates SET username = NULL WHERE username = ?", (name,))
             cur = conn.execute("DELETE FROM users WHERE username = ?", (name,))
             return cur.rowcount > 0
 

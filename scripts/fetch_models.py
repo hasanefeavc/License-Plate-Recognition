@@ -17,18 +17,29 @@ pipeline is actually loading. Pass --force to fetch it anyway.
 Train the plate model with ``scripts/train_plate_detector.py``; see
 README_TRAINING.md.
 
+It also fetches the **EasyOCR** detection/recognition networks on request
+(``--easyocr``). Those are ~100 MB and EasyOCR downloads them lazily on first
+use, into ``models/easyocr`` -- another bind-mounted volume. Pre-filling that
+directory from the host is what turns a container cold start from "wait for a
+100 MB download, and hang if the link drops" into a local file read. Run it
+once per machine.
+
 Usage:
     python scripts/fetch_models.py
+    python scripts/fetch_models.py --easyocr
+    python scripts/fetch_models.py --easyocr --only-easyocr
     python scripts/fetch_models.py --models-dir /custom/path --force
 
 Exit codes:
     0  download succeeded, was skipped, or a custom plate model is installed
     1  network/download error (offline, DNS failure, HTTP error, ...)
+    2  --easyocr was asked for but easyocr is not installed here
 """
 
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -94,6 +105,82 @@ def download(url: str, dest: Path, timeout: float = 30.0) -> None:
     tmp_dest.replace(dest)
 
 
+#: Weight files a default ``easyocr.Reader(["en"])`` needs on disk. Used to
+#: report what the cache is missing; EasyOCR itself decides what to download.
+EASYOCR_WEIGHTS = ("craft_mlt_25k.pth", "english_g2.pth")
+
+
+def fetch_easyocr(models_dir: Path, timeout: float = 120.0) -> int:
+    """Populate ``models_dir/easyocr`` by constructing a Reader once.
+
+    Deliberately done by *using* EasyOCR rather than by fetching URLs
+    ourselves. The download locations, filenames and MD5s are internal to the
+    library and have changed between 1.x releases; driving the library means
+    this script cannot go stale against the pin in requirements.txt, and what
+    lands on disk is by construction exactly what the service will look for.
+
+    The reader is built on CPU whatever the host has. This only writes files --
+    a GPU would be claimed, initialised and thrown away for nothing, and on the
+    gate box it may well be busy serving the running container.
+    """
+    target = models_dir / "easyocr"
+    target.mkdir(parents=True, exist_ok=True)
+
+    missing = [name for name in EASYOCR_WEIGHTS if not (target / name).is_file()]
+    if not missing:
+        print(f"[fetch_models] EasyOCR weights already cached in {target} -- nothing to do.")
+        return 0
+
+    try:
+        import easyocr
+    except ImportError:
+        print(
+            "[fetch_models] ERROR: --easyocr needs the easyocr package installed here.\n"
+            "[fetch_models]        pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"[fetch_models] Fetching EasyOCR weights into {target} (missing: {', '.join(missing)})")
+    print("[fetch_models] This is ~100 MB and runs once per machine.")
+
+    # Same reasoning as lpr.ocr.recognizer._bounded_sockets: EasyOCR calls
+    # urlretrieve without a timeout, so an interrupted download would otherwise
+    # hang this script forever instead of failing and telling you to retry.
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        easyocr.Reader(
+            ["en"],
+            gpu=False,
+            model_storage_directory=str(target),
+            user_network_directory=str(target),
+            download_enabled=True,
+            verbose=False,
+        )
+    except Exception as exc:
+        print(f"[fetch_models] ERROR: EasyOCR weight download failed: {exc}", file=sys.stderr)
+        print(
+            "[fetch_models] Retry when the network is stable, or raise --easyocr-timeout.",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        socket.setdefaulttimeout(previous)
+
+    still_missing = [name for name in EASYOCR_WEIGHTS if not (target / name).is_file()]
+    if still_missing:
+        # Not fatal: a future release may rename these, and the reader above
+        # constructed successfully, which is the outcome that actually matters.
+        print(
+            f"[fetch_models] NOTE: expected {', '.join(still_missing)} in {target} but the "
+            "reader built successfully; the release may use different filenames."
+        )
+    else:
+        print(f"[fetch_models] EasyOCR weights cached in {target}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -112,9 +199,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Re-download even if the baseline weights file already exists.",
     )
+    parser.add_argument(
+        "--easyocr",
+        action="store_true",
+        help=(
+            "Also pre-fetch the EasyOCR networks into <models-dir>/easyocr, so the "
+            "container never downloads them at startup."
+        ),
+    )
+    parser.add_argument(
+        "--only-easyocr",
+        action="store_true",
+        help="Fetch the EasyOCR networks and skip the YOLO baseline entirely.",
+    )
+    parser.add_argument(
+        "--easyocr-timeout",
+        type=float,
+        default=120.0,
+        help="Socket timeout, in seconds, for the EasyOCR download (default: 120).",
+    )
     args = parser.parse_args(argv)
 
     models_dir: Path = args.models_dir
+    if args.only_easyocr:
+        return fetch_easyocr(models_dir, args.easyocr_timeout)
     baseline_path = models_dir / BASELINE_NAME
     plate_path = models_dir / PLATE_MODEL_NAME
 
@@ -127,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[fetch_models] This is what the pipeline loads (detection.model_path).")
         print(f"[fetch_models] Skipping the generic {BASELINE_NAME} download -- nothing to do.")
         print("[fetch_models] Use --force to fetch the baseline anyway.")
-        return 0
+        return fetch_easyocr(models_dir, args.easyocr_timeout) if args.easyocr else 0
 
     if baseline_path.exists() and not args.force:
         print(f"[fetch_models] {baseline_path} already exists, skipping download (use --force to redo).")
@@ -152,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         print(f"[fetch_models] Saved baseline weights to {baseline_path}")
+
+    if args.easyocr:
+        print()
+        status = fetch_easyocr(models_dir, args.easyocr_timeout)
+        if status != 0:
+            return status
 
     print()
     print(f"[fetch_models] NOTE: {baseline_path.name} is a generic COCO model, not a plate detector.")

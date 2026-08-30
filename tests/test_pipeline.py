@@ -1006,3 +1006,324 @@ def test_the_capture_loop_runs_on_the_worker_thread(tmp_settings) -> None:
 def test_the_worker_is_a_daemon_so_it_cannot_hold_shutdown_open(tmp_settings) -> None:
     worker = CameraWorker("entry", tmp_settings.cameras.entry)
     assert worker.daemon is True
+
+
+# ---------------------------------------------------------------------------
+# Expired permits at the barrier
+# ---------------------------------------------------------------------------
+
+
+def _days_from_now(days: float) -> str:
+    """A stored-format UTC timestamp ``days`` from now; negative is the past."""
+    from datetime import UTC, datetime, timedelta
+
+    moment = datetime.now(UTC) + timedelta(days=days)
+    return moment.replace(microsecond=0).isoformat()
+
+
+def test_expired_permit_keeps_the_gate_closed(db, frame, caplog) -> None:
+    """The bug this file's ``denied`` test could not catch.
+
+    A plate whose permit lapsed is still *on the list* and still unblocked, so
+    a membership-only check waves it through: the relay fires and the log says
+    "gate opened" for a resident whose access ended yesterday. The assertion
+    that matters is ``relay.triggers == 0`` -- the repository returning False
+    proves nothing about the barrier, which the orchestrator drives.
+    """
+    import logging
+
+    PlateRepository().upsert("34ABC123", owner="Ahmet", expires_at=_days_from_now(-1))
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay)
+
+    with caplog.at_level(logging.INFO, logger="lpr.pipeline.orchestrator"):
+        events = pipeline.process_frame("entry", frame)
+
+    assert relay.triggers == 0, "an expired permit must not open the barrier"
+    assert [e.action for e in events] == [str(Action.DENIED)]
+    assert pipeline.stats().grants == 0
+    assert pipeline.stats().denials == 1
+    assert LogRepository().recent(10)[0].action == str(Action.DENIED)
+    assert "34ABC123 EXPIRED, gate kept closed" in caplog.text
+
+
+def test_live_permit_still_opens_the_gate(db, frame) -> None:
+    """The other side of the boundary: a valid end date is not a refusal."""
+    PlateRepository().upsert("34ABC123", expires_at=_days_from_now(1))
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert relay.triggers == 1
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+
+
+def _expired_operator(username: str = "bekci") -> None:
+    """An account whose *application* licence ran out yesterday."""
+    from lpr.db import UserRepository
+    from lpr.user_license import STATUS_EXPIRED
+
+    users = UserRepository()
+    users.register(username, "parola1234", "operator")
+    users.set_license(
+        username,
+        "eski-anahtar",
+        _days_from_now(-1),
+        STATUS_EXPIRED,
+        duration_days=30,
+        activated_at=_days_from_now(-31),
+    )
+
+
+def test_a_lapsed_user_licence_never_closes_the_barrier(db, frame, caplog) -> None:
+    """The separation this whole design rests on, asserted at the relay.
+
+    ``users.license_expires_at`` is a subscription to the dashboard and the
+    API. The car park is not party to it. A resident whose landlord stopped
+    paying for the software must still get through the gate, so the plate row
+    alone decides -- and the assertion has to be ``relay.triggers == 1``,
+    because the repository returning a verdict proves nothing about the
+    barrier the orchestrator drives.
+    """
+    import logging
+
+    _expired_operator()
+    PlateRepository().upsert("34ABC123", owner="Ahmet", username="bekci")
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay)
+
+    with caplog.at_level(logging.INFO, logger="lpr.pipeline.orchestrator"):
+        events = pipeline.process_frame("entry", frame)
+
+    assert relay.triggers == 1, "a registered plate must open the gate"
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert pipeline.stats().grants == 1
+    assert "34ABC123 registered, gate opened" in caplog.text
+
+
+def test_the_plates_own_expiry_still_decides_for_a_lapsed_users_car(
+    db, frame
+) -> None:
+    """The other half: the *plate's* permit is the one that can refuse.
+
+    Otherwise this pair would pass for the wrong reason -- a gate that opened
+    for everything would satisfy the test above.
+    """
+    _expired_operator()
+    PlateRepository().upsert(
+        "34ABC123", username="bekci", expires_at=_days_from_now(-1)
+    )
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert relay.triggers == 0
+    assert [e.action for e in events] == [str(Action.DENIED)]
+
+
+def test_expired_permit_still_alerts_as_unauthorized(db, frame) -> None:
+    """Naming the refusal in the log must not silence the notification.
+
+    ``Notifier.wants`` answers False for any category it does not know, so
+    routing expired plates to a new ``expired`` reason would have swapped a
+    clearer log line for a missed alert. This pins the mapping that keeps the
+    existing alert flowing.
+    """
+    PlateRepository().upsert("34ABC123", expires_at=_days_from_now(-1))
+    notifier = RecordingNotifier()
+    pipeline = _build_pipeline(db, notifier=notifier)
+
+    pipeline.process_frame("entry", frame)
+
+    assert notifier.reasons == ["unauthorized"]
+
+
+# ---------------------------------------------------------------------------
+# Fast path: the first confident read of a registered plate
+# ---------------------------------------------------------------------------
+
+
+class LadderRecognizer:
+    """A recogniser shaped like the real one: cheap first view, costly rest.
+
+    ``views`` counts the OCR passes actually taken, which is the whole point of
+    the fast path -- the saving is passes not run, and a test that only checked
+    the verdict could not see it. ``accept`` is honoured exactly as
+    ``_BaseRecognizer.ballots`` honours it: checked after every view, and the
+    ladder stops on the first True.
+    """
+
+    def __init__(self, reads: list[Any]) -> None:
+        self._reads = list(reads)
+        self.views = 0
+
+    def recognize(self, crop: Any, accept: Any = None) -> Any:
+        best = self._reads[0]
+        for read in self._reads:
+            self.views += 1
+            best = read
+            if accept is not None and accept(best):
+                break
+        return best
+
+    def warmup(self) -> None:  # pragma: no cover - protocol completeness
+        pass
+
+
+def _read(text: str = "34ABC123", confidence: float = 0.95) -> PlateRead:
+    return PlateRead(text=text, confidence=confidence, raw_text=text, valid=True)
+
+
+def _ladder(text: str = "34ABC123", confidence: float = 0.95) -> LadderRecognizer:
+    """Three views, all agreeing. Only the first should ever be needed."""
+    return LadderRecognizer([_read(text, confidence)] * 3)
+
+
+def test_a_registered_plate_opens_the_gate_on_its_first_view(db, frame, caplog) -> None:
+    """The saving, asserted where it happens: two OCR passes never run.
+
+    The voter here confirms *nothing* — so an event at all proves the decision
+    did not come through the multi-frame path, and `views == 1` proves the
+    enhanced views were never computed.
+    """
+    import logging
+
+    PlateRepository().upsert("34ABC123", owner="Ahmet")
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    recognizer = _ladder()
+    pipeline = _build_pipeline(db, recognizer=recognizer, voter=voter, relay=relay)
+
+    with caplog.at_level(logging.INFO, logger="lpr.pipeline.orchestrator"):
+        events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 1, "the escalation ladder should have stopped at view 1"
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert relay.triggers == 1
+    assert voter.submissions == [], "the fast path must not go through the voter"
+    assert pipeline.stats().fast_path_hits == 1
+    assert "34ABC123 registered, gate opened" in caplog.text
+
+
+def test_an_unregistered_plate_still_pays_for_the_whole_ladder(db, frame) -> None:
+    """The fast path is for cars that may come in, not for confident reads.
+
+    A stranger at the barrier is exactly the case the enhanced views and the
+    multi-frame vote exist for, so nothing about that path may be skipped.
+    """
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    recognizer = _ladder("99ZZZ99")
+    pipeline = _build_pipeline(db, recognizer=recognizer, voter=voter, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3, "an unknown plate must not exit early"
+    assert events == []
+    assert relay.triggers == 0
+    assert voter.submissions, "the read belongs to the voter, as before"
+    assert pipeline.stats().fast_path_hits == 0
+
+
+def test_a_blocked_plate_never_takes_the_fast_path(db, frame) -> None:
+    """`authorization`, not membership. A barred resident is still listed."""
+    PlateRepository().upsert("34ABC123", owner="Ahmet", blocked=True)
+    relay = FakeRelay()
+    recognizer = _ladder()
+    pipeline = _build_pipeline(db, recognizer=recognizer, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3
+    assert relay.triggers == 0
+    assert [e.action for e in events] == [str(Action.DENIED)]
+
+
+def test_an_expired_permit_never_takes_the_fast_path(db, frame) -> None:
+    """The same, for the other refusal the plate row can carry."""
+    PlateRepository().upsert("34ABC123", expires_at=_days_from_now(-1))
+    relay = FakeRelay()
+    recognizer = _ladder()
+    pipeline = _build_pipeline(db, recognizer=recognizer, relay=relay)
+
+    pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3
+    assert relay.triggers == 0
+
+
+def test_the_fast_path_can_be_switched_off(db, frame) -> None:
+    """A site that wants every read confirmed by several frames keeps that."""
+    db.fast_path.enabled = False
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    recognizer = _ladder()
+    pipeline = _build_pipeline(db, recognizer=recognizer, voter=voter, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3
+    assert events == [] and relay.triggers == 0
+    assert voter.submissions, "with the fast path off, every read goes to the voter"
+
+
+def test_the_fast_path_cannot_undercut_the_ocr_threshold(db, frame) -> None:
+    """A read the ordinary path would discard must not open the gate.
+
+    The two thresholds live in different sections and are set by different
+    people; a fast path that accepted a 0.5 read while `ocr.min_confidence`
+    said 0.8 would be an accuracy regression wearing the word "optimisation".
+    """
+    db.fast_path.min_confidence = 0.1
+    db.ocr.min_confidence = 0.8
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    recognizer = _ladder(confidence=0.5)
+    pipeline = _build_pipeline(db, recognizer=recognizer, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3, "0.5 is below ocr.min_confidence and must not qualify"
+    assert relay.triggers == 0
+    assert events == []
+
+
+def test_a_recogniser_that_never_heard_of_the_fast_path_still_works(db, frame) -> None:
+    """The `Recognizer` protocol is one method, and third parties implement it.
+
+    `FakeRecognizer.recognize` takes only a crop. The orchestrator must detect
+    that at construction and stay on the ordinary path rather than calling it
+    with a keyword it cannot accept.
+    """
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, relay=relay)  # the plain FakeRecognizer
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert relay.triggers == 1
+    assert pipeline.stats().fast_path_hits == 0
+
+
+def test_the_fast_path_survives_a_database_wobble(db, frame, monkeypatch) -> None:
+    """A failed lookup falls back to the full path instead of killing the read."""
+    PlateRepository().upsert("34ABC123")
+    recognizer = _ladder()
+    voter = FakeVoter(confirm=False)
+    pipeline = _build_pipeline(db, recognizer=recognizer, voter=voter)
+
+    def boom(_self: Any, _plate: str) -> str:
+        raise RuntimeError("database is busy")
+
+    # Patched on the class: PlateRepository uses __slots__, so the instance
+    # cannot carry an override.
+    monkeypatch.setattr(PlateRepository, "authorization", boom)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3, "a lookup failure must not count as a hit"
+    assert events == []

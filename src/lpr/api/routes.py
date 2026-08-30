@@ -59,6 +59,7 @@ from lpr.api.schemas import (
     RelayTriggerOut,
     StatsOut,
     SystemEventOut,
+    SystemUpdateIn,
     SystemUpdateOut,
     TokenOut,
     LicenseKeyIn,
@@ -77,6 +78,8 @@ from lpr.api.security import (
     authenticate_user,
     create_token,
     current_user,
+    license_forbidden,
+    license_refusal,
     require_admin,
     require_license,
     token_ttl_seconds,
@@ -107,6 +110,15 @@ STREAM_BOUNDARY = "lprframe"
 #: How long a stream may go without a frame before it gives up (seconds).
 _STREAM_IDLE_TIMEOUT_S = 30.0
 
+#: How often to look again once a camera has stopped producing frames.
+#:
+#: Polling a silent camera at :data:`STREAM_MAX_FPS` was 30 thread-pool hops a
+#: second returning ``None`` every time, and the pool it borrows is the same one
+#: serving every other request -- so one dark camera made the whole dashboard
+#: feel slow. Half a second still notices a camera coming back well inside the
+#: reconnect the browser would attempt anyway.
+_STREAM_IDLE_POLL_S = 0.5
+
 CurrentUser = Annotated[AuthUser, Depends(current_user)]
 AdminUser = Annotated[AuthUser, Depends(require_admin)]
 #: Authenticated, and licensed if the role needs one. Everything that *operates*
@@ -133,6 +145,35 @@ def _camera_role(camera: str) -> str:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Bilinmeyen kamera: {camera}",
         ) from None
+
+
+def _streamable_roles(pipeline: Any) -> set[str] | None:
+    """Roles with a live capture worker, or ``None`` when that is unknowable.
+
+    A camera turned off in the config -- the usual reason being two roles
+    contending for one physical device -- never gets a worker, so it has no
+    frames now and will have none later. Streaming it is a request that can
+    only end in the idle timeout.
+
+    ``None`` means "this pipeline cannot say", and the caller then allows the
+    stream rather than inventing a 404: guessing wrong in that direction breaks
+    a working camera, which is far worse than the hang this check avoids.
+    """
+    roles = getattr(pipeline, "camera_roles", None)
+    if callable(roles):
+        try:
+            return {str(role) for role in roles()}
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("camera_roles() failed", exc_info=True)
+
+    # Older pipelines and test doubles expose the same fact through stats().
+    try:
+        cameras = getattr(pipeline.stats(), "cameras", None)
+        if isinstance(cameras, dict):
+            return {str(role) for role in cameras}
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("stats().cameras unavailable", exc_info=True)
+    return None
 
 
 def _camera_status_dicts(pipeline: Any) -> list[dict[str, Any]]:
@@ -262,6 +303,25 @@ async def health(request: Request, user_repo: deps.UserRepo) -> HealthOut:
     summary="Giriş yap",
 )
 async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
+    """Exchange credentials for a bearer token.
+
+    Two things have to be true, and they are different questions. The password
+    says *who* this is; the licence says whether that person may use the
+    application at all. A lapsed licence is refused here with **403** and
+    :data:`LICENSE_LAPSED_DETAIL` rather than at the first API call, so an
+    expired account never holds a token in the first place.
+
+    ``license_key`` on the body is the way back in. Activation normally needs a
+    session, and refusing the session would otherwise strand an operator
+    holding a perfectly good key: locked out of the dashboard, and locked out
+    of the endpoint that would unlock it. Sending the key with the credentials
+    activates it first and lets the same request through -- the login screen
+    offers the field once the server has answered with the lapse.
+
+    None of this touches the barrier: a resident's plate keeps working while
+    the account it is recorded against cannot log in. See
+    :meth:`lpr.db.repository.PlateRepository.authorization`.
+    """
     user = await _in_thread(authenticate_user, user_repo, payload.username, payload.password)
     if user is None:
         raise HTTPException(
@@ -269,6 +329,16 @@ async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
             detail="Kullanıcı adı veya parola hatalı",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Only after the password checked out. Activating on an unauthenticated
+    # request would let anyone holding a key burn it against any username.
+    if payload.license_key:
+        await _activate_license_key(user_repo, user.username, payload.license_key)
+
+    lapsed = await license_refusal(user, user_repo)
+    if lapsed is not None:
+        raise license_forbidden(lapsed)
+
     # Session length follows the account: an admin stays signed in, an operator
     # gets a shift. A per-account override on the row beats both.
     ttl_min = await _account_ttl(user_repo, user.username)
@@ -466,6 +536,9 @@ async def delete_user(
     immediately invalidate the token that made it, which reads as the dashboard
     breaking. Ask another admin.
 
+    Any plates recorded against the account keep working: ``plates.username``
+    is ownership metadata, not a gate permit, so the cars are unaffected.
+
     The last-admin check comes first because when both apply -- the sole
     administrator deleting their own account -- it is the one that says what to
     do next.
@@ -536,7 +609,7 @@ async def _last_admin(user_repo: Any) -> bool:
     tags=["plates"],
     summary="Kayıtlı plakalar",
 )
-async def list_plates(_: CurrentUser, plate_repo: deps.PlateRepo) -> PlateListOut:
+async def list_plates(_: LicensedUser, plate_repo: deps.PlateRepo) -> PlateListOut:
     """Every registered plate, as bare strings *and* as resident records.
 
     Both shapes come back from one request. ``plates`` is what the desktop
@@ -590,16 +663,22 @@ async def add_plate(payload: PlateIn, _: LicensedUser, plate_repo: deps.PlateRep
     """
     upsert = getattr(plate_repo, "upsert", None)
     if callable(upsert):
-        outcome = await _in_thread_kw(
-            upsert,
-            payload.plate,
-            owner=payload.owner,
-            apartment=payload.apartment,
-            note=payload.note,
-            expires_at=payload.expires_at,
-            blocked=payload.blocked,
-            overwrite=False,
-        )
+        fields: dict[str, Any] = {
+            "owner": payload.owner,
+            "apartment": payload.apartment,
+            "note": payload.note,
+            "expires_at": payload.expires_at,
+            "blocked": payload.blocked,
+            "overwrite": False,
+        }
+        # Sent only when the caller named a subscriber, so a repository that
+        # predates the column still serves the common case. When one *is*
+        # named it is passed regardless: failing loudly beats registering the
+        # car with its subscriber silently dropped, which would leave it
+        # governed by no licence at all.
+        if payload.username is not None:
+            fields["username"] = payload.username
+        outcome = await _in_thread_kw(upsert, payload.plate, **fields)
         added = outcome == "added"
     else:  # pragma: no cover - repository predating the resident columns
         added = await _in_thread(plate_repo.add, payload.plate, payload.note)
@@ -690,7 +769,7 @@ async def delete_plate(
 
 @router.get("/api/logs", response_model=list[LogOut], tags=["logs"], summary="Kayıtlar")
 async def list_logs(
-    _: CurrentUser,
+    _: LicensedUser,
     log_repo: deps.LogRepo,
     since: Annotated[str | None, Query(examples=["2026-05-01"])] = None,
     until: Annotated[str | None, Query(examples=["2026-05-02"])] = None,
@@ -732,8 +811,28 @@ async def list_logs(
     tags=["logs"],
     summary="Kayıt bulunan günler",
 )
-async def log_dates(_: CurrentUser, log_repo: deps.LogRepo) -> list[str]:
-    return [str(day) for day in await _in_thread(log_repo.dates)]
+async def log_dates(
+    _: LicensedUser,
+    log_repo: deps.LogRepo,
+    tz_offset: Annotated[int, Query(ge=-840, le=840, examples=[180])] = 0,
+) -> list[str]:
+    """Days that have log rows, newest first, as ``YYYY-MM-DD``.
+
+    ``tz_offset`` is minutes **east of UTC** (180 for Turkey), and decides
+    whose calendar day the rows are bucketed into. The browser passes its own
+    offset so the picker offers the operator *their* days: a read at 01:30 in
+    Istanbul is stored as 22:30 the day before in UTC, and without this it
+    would be offered under a date the operator never worked.
+
+    The bounds are the real ones -- UTC-12:00 to UTC+14:00 -- so a nonsense
+    offset is a 422 rather than a silently skewed day list.
+
+    Whatever this returns, the client must filter with the matching day
+    boundaries; a list bucketed one way and a range computed another is how
+    a day that plainly has rows comes back empty.
+    """
+    days = await _in_thread(log_repo.dates, int(tz_offset))
+    return [str(day) for day in days]
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +895,7 @@ async def _parking_state(log_repo: Any, meta_repo: Any, settings: Settings) -> P
     summary="Doluluk ve kapasite",
 )
 async def parking_state(
-    _: CurrentUser,
+    _: LicensedUser,
     log_repo: deps.LogRepo,
     meta_repo: deps.MetaRepo,
     settings: deps.AdminSettings,
@@ -832,7 +931,7 @@ async def set_parking_capacity(
 
 
 @router.get("/api/stats", response_model=StatsOut, tags=["pipeline"], summary="İstatistikler")
-async def stats(request: Request, _: CurrentUser) -> StatsOut:
+async def stats(request: Request, _: LicensedUser) -> StatsOut:
     pipeline = deps.get_pipeline(request)
     raw = pipeline.stats()
     started_at = float(getattr(raw, "started_at", 0.0) or 0.0)
@@ -845,6 +944,7 @@ async def stats(request: Request, _: CurrentUser) -> StatsOut:
         grants=int(getattr(raw, "grants", 0)),
         denials=int(getattr(raw, "denials", 0)),
         ocr_skipped=int(getattr(raw, "ocr_skipped", 0)),
+        fast_path_hits=int(getattr(raw, "fast_path_hits", 0)),
         cameras=[CameraStatusOut.model_validate(cam) for cam in _camera_status_dicts(pipeline)],
     )
 
@@ -855,7 +955,7 @@ async def stats(request: Request, _: CurrentUser) -> StatsOut:
     tags=["pipeline"],
     summary="Sistem metrikleri",
 )
-async def metrics(request: Request, _: CurrentUser) -> MetricsOut:
+async def metrics(request: Request, _: LicensedUser) -> MetricsOut:
     """Flat operational counters for a dashboard or a scrape job.
 
     Deliberately a superset of ``/api/stats`` minus the per-camera detail:
@@ -886,6 +986,7 @@ async def metrics(request: Request, _: CurrentUser) -> MetricsOut:
         grants=int(getattr(raw, "grants", 0)),
         denials=int(getattr(raw, "denials", 0)),
         ocr_skipped=int(getattr(raw, "ocr_skipped", 0)),
+        fast_path_hits=int(getattr(raw, "fast_path_hits", 0)),
         motion_skipped=sum(int(cam.get("motion_skipped", 0)) for cam in cameras),
         frames_read=sum(int(cam.get("frames_read", 0)) for cam in cameras),
         frames_dropped=sum(int(cam.get("frames_dropped", 0)) for cam in cameras),
@@ -906,7 +1007,7 @@ async def metrics(request: Request, _: CurrentUser) -> MetricsOut:
     tags=["pipeline"],
     summary="Kamera durumları",
 )
-async def cameras(request: Request, _: CurrentUser) -> list[CameraStatusOut]:
+async def cameras(request: Request, _: LicensedUser) -> list[CameraStatusOut]:
     pipeline = deps.get_pipeline_optional(request)
     if pipeline is None:
         settings = deps.get_settings_dep()
@@ -1112,14 +1213,21 @@ async def trigger_relay(
 
 
 async def stream_user(
+    user_repo: deps.UserRepo,
     token: Annotated[str | None, Query(description="Bearer token (tarayıcı <img> için)")] = None,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> AuthUser:
-    """Auth for the MJPEG endpoint.
+    """Auth *and* licence for the MJPEG endpoint.
 
     An ``<img src=...>`` tag cannot set an ``Authorization`` header, so the
     token may also arrive as a query parameter here. The desktop client uses
     the header.
+
+    The licence is checked here rather than through :data:`LicensedUser`
+    because this endpoint takes its credential differently -- and a live camera
+    feed is exactly the kind of access a lapsed account must not keep. Skipping
+    it would leave the one screen an unlicensed operator most wants still
+    working.
     """
     raw = credentials.credentials if credentials and credentials.credentials else token
     if not raw:
@@ -1129,13 +1237,18 @@ async def stream_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        return user_from_token(raw)
+        user = user_from_token(raw)
     except AuthError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+    lapsed = await license_refusal(user, user_repo)
+    if lapsed is not None:
+        raise license_forbidden(lapsed)
+    return user
 
 
 async def _mjpeg_iterator(
@@ -1163,12 +1276,18 @@ async def _mjpeg_iterator(
                 yield header + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
                 yield frame
                 yield b"\r\n"
+                delay = frame_budget
             else:
-                idle_for += frame_budget
+                # Back off while there is nothing to send. The camera is
+                # configured (the endpoint refused it otherwise), so this is a
+                # live camera gone quiet -- worth waiting for, not worth
+                # asking about thirty times a second.
+                idle_for += _STREAM_IDLE_POLL_S
                 if idle_for >= _STREAM_IDLE_TIMEOUT_S:
                     logger.info("Kare gelmediği için akış kapatıldı: %s", camera)
                     break
-            await asyncio.sleep(frame_budget)
+                delay = _STREAM_IDLE_POLL_S
+            await asyncio.sleep(delay)
     except asyncio.CancelledError:  # pragma: no cover - normal disconnect path
         raise
     except (ConnectionResetError, BrokenPipeError):  # pragma: no cover
@@ -1192,6 +1311,19 @@ async def stream(
 ) -> StreamingResponse:
     role = _camera_role(camera)
     pipeline = deps.get_pipeline(request)
+
+    # A disabled camera is refused here rather than in the generator. Entering
+    # the loop for one costs a held connection for the full idle timeout, and a
+    # browser only allows a handful of connections per host -- so the dead
+    # stream is paid for by every *other* request on the page, which is what
+    # made the dashboard load slowly rather than merely show one blank tile.
+    available = _streamable_roles(pipeline)
+    if available is not None and role not in available:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Kamera etkin değil: {role}",
+        )
+
     return StreamingResponse(
         _mjpeg_iterator(request, pipeline, role, quality),
         media_type=f"multipart/x-mixed-replace; boundary={STREAM_BOUNDARY}",
@@ -1223,7 +1355,7 @@ def _update_out(status_obj: Any, accepted: bool = False) -> SystemUpdateOut:
     tags=["system"],
     summary="Sistem sürümü",
 )
-async def system_version(request: Request, _: CurrentUser) -> VersionOut:
+async def system_version(request: Request, _: LicensedUser) -> VersionOut:
     """The deployed version and git revision.
 
     Readable by any authenticated user: an operator who can see that the site
@@ -1263,7 +1395,11 @@ async def system_update_status(request: Request, _: LicensedUser) -> SystemUpdat
         503: {"description": "Sistem güncellemesi devre dışı"},
     },
 )
-async def system_update(request: Request, user: LicensedUser) -> SystemUpdateOut:
+async def system_update(
+    request: Request,
+    user: LicensedUser,
+    payload: SystemUpdateIn | None = None,
+) -> SystemUpdateOut:
     """Pull from the configured remote and rebuild the stack. Admin only.
 
     Returns **202 Accepted**, not 200: the work is detached onto its own thread
@@ -1272,12 +1408,15 @@ async def system_update(request: Request, user: LicensedUser) -> SystemUpdateOut
     promise this endpoint can honestly make -- the client must poll
     ``GET /api/system/update`` and ``GET /api/system/version`` for the outcome.
 
-    Nothing about *what* is pulled comes from the caller; see
+    The body is optional and carries at most ``force``, which asks for the
+    rebuild to happen even when the pull brings nothing new. Nothing about
+    *what* is pulled or built comes from the caller either way; see
     :class:`lpr.config.SystemUpdateConfig`.
     """
+    force = bool(payload.force) if payload is not None else False
     updater = deps.get_system_updater(request)
     try:
-        state = updater.start()
+        state = updater.start(force=force)
     except RuntimeError as exc:
         detail = str(exc)
         # Disabled is a deployment state (503); already-running is a conflict
@@ -1289,7 +1428,11 @@ async def system_update(request: Request, user: LicensedUser) -> SystemUpdateOut
         )
         raise HTTPException(status_code=code, detail=detail) from exc
 
-    logger.warning("Sistem güncellemesi '%s' tarafından tetiklendi", user.username)
+    logger.warning(
+        "Sistem %s '%s' tarafından tetiklendi",
+        "yeniden derlemesi (zorla)" if force else "güncellemesi",
+        user.username,
+    )
     return _update_out(state, accepted=True)
 
 
@@ -1425,7 +1568,7 @@ async def export_plates(_: LicensedUser, plate_repo: deps.PlateRepo) -> Response
     responses={200: {"content": {"text/csv": {}}}},
 )
 async def export_events(
-    _: CurrentUser,
+    _: LicensedUser,
     log_repo: deps.LogRepo,
     since: Annotated[str | None, Query(max_length=32)] = None,
     until: Annotated[str | None, Query(max_length=32)] = None,
@@ -1520,9 +1663,26 @@ async def activate_user_license(
     binding an operator could activate a colleague's key and inherit its
     validity.
     """
+    return _user_license_out(
+        await _activate_license_key(user_repo, user.username, payload.key)
+    )
+
+
+async def _activate_license_key(user_repo: Any, username: str, key: str) -> Any:
+    """Bind one key to ``username`` and store the resulting expiry.
+
+    Shared by ``POST /api/license/activate`` and the login route, which is the
+    point: an operator activating from the login screen and one activating from
+    the dashboard must get the same validation, the same countdown and the same
+    error, or the recovery path would be a second implementation of the rule.
+
+    Raises 400 for a key that does not check out -- including one issued to
+    somebody else, because a key is issued to a person and without that binding
+    an operator could inherit a colleague's validity.
+    """
     from lpr.user_license import activate
 
-    state = await _in_thread(activate, payload.key, user.username)
+    state = await _in_thread(activate, key, username)
     if not state.valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1533,8 +1693,8 @@ async def activate_user_license(
     # now plus the duration the key carries, and written once.
     stored = await _in_thread_kw(
         user_repo.set_license,
-        user.username,
-        payload.key,
+        username,
+        key,
         state.expires_at,
         state.status,
         duration_days=state.duration_days,
@@ -1543,16 +1703,16 @@ async def activate_user_license(
     if not stored:  # pragma: no cover - account deleted mid-request
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Kullanıcı bulunamadı: {user.username}",
+            detail=f"Kullanıcı bulunamadı: {username}",
         )
 
     logger.info(
         "Lisans etkinleştirildi: %s (%s gün, bitiş %s)",
-        user.username,
+        username,
         state.duration_days,
         state.expires_at,
     )
-    return _user_license_out(state)
+    return state
 
 
 @router.post(

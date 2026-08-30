@@ -177,14 +177,19 @@ class YoloPlateDetector:
 
     Backend
     -------
-    If an ``.onnx`` export sits next to the configured ``.pt``, it is used
-    instead: ONNX Runtime is materially faster than PyTorch for this model on
-    the headless CPU box this deploys to. The swap is invisible to everything
-    downstream -- ultralytics runs tracking as a predictor callback, so
-    ByteTrack, ``persist=True`` and the per-stream state below all behave
-    identically on either backend. Produce the export with
-    ``scripts/export_onnx.py``; disable the preference with
-    ``detection.prefer_onnx: false``.
+    On a **CPU** host, an ``.onnx`` export sitting next to the configured
+    ``.pt`` is used instead: ONNX Runtime is materially faster than PyTorch for
+    this model there. The swap is invisible to everything downstream --
+    ultralytics runs tracking as a predictor callback, so ByteTrack,
+    ``persist=True`` and the per-stream state below all behave identically on
+    either backend. Produce the export with ``scripts/export_onnx.py``; disable
+    the preference with ``detection.prefer_onnx: false``.
+
+    On a **CUDA** host the export is ignored and the ``.pt`` runs on the GPU --
+    see :meth:`_onnx_wanted`. The device itself comes from
+    ``detection.device`` via :func:`lpr.accel.resolve_torch_device`, which
+    resolves ``"auto"`` by probing and degrades to CPU rather than raising when
+    a requested GPU is not usable.
 
     Per-stream isolation
     --------------------
@@ -261,7 +266,7 @@ class YoloPlateDetector:
         with it (wrong imgsz, corrupt graph, no onnxruntime installed) falls
         back to the ``.pt`` with a warning instead of taking the gate down.
         """
-        candidate = self._onnx_candidate(self.weights_path) if self.prefer_onnx else None
+        candidate = self._onnx_candidate(self.weights_path) if self._onnx_wanted() else None
 
         if candidate is not None:
             logger.info("found ONNX export %s; verifying it before use", candidate.name)
@@ -296,6 +301,29 @@ class YoloPlateDetector:
             except Exception:  # pragma: no cover - some backends ignore .to()
                 logger.debug("model.to(%s) failed; using the model's default device", self.device)
         return model, self.weights_path
+
+    def _onnx_wanted(self) -> bool:
+        """Whether to look for an ONNX export at all.
+
+        ``prefer_onnx`` exists because ONNX Runtime beats PyTorch on the *CPU*
+        gate boxes. On CUDA that reasoning inverts: requirements.txt installs
+        the CPU ``onnxruntime`` wheel deliberately (the GPU build is a 250 MB
+        download ultralytics would otherwise AutoUpdate into the container at
+        runtime), so adopting the export here would quietly move detection off
+        the GPU and onto the CPU -- slower than the ``.pt`` it replaced, and
+        invisible apart from one INFO line. Install ``onnxruntime-gpu``
+        explicitly if you want the export on a CUDA host.
+        """
+        if not self.prefer_onnx:
+            return False
+        if self.device.startswith("cuda"):
+            logger.info(
+                "running on %s, so the .pt is used directly; the ONNX preference is "
+                "ignored because this image ships the CPU onnxruntime wheel",
+                self.device,
+            )
+            return False
+        return True
 
     @staticmethod
     def _onnx_candidate(weights_path: Path) -> Path | None:
@@ -382,18 +410,23 @@ class YoloPlateDetector:
 
     @staticmethod
     def _resolve_device(device: str) -> str:
-        """Turn ``"auto"`` into a concrete torch device string."""
-        wanted = (device or "auto").strip().lower()
-        if wanted != "auto":
-            return wanted
-        try:
-            import torch
+        """Turn a configured device into a concrete torch device string.
 
-            if torch.cuda.is_available():
-                return "cuda"
-        except Exception:
-            logger.debug("torch CUDA probe failed; falling back to cpu", exc_info=True)
-        return "cpu"
+        Delegates to :func:`lpr.accel.resolve_torch_device` so the detector and
+        the OCR backend cannot disagree about whether this machine has a GPU,
+        and so the probe (which builds a CUDA context) is paid once per process
+        rather than once per component.
+
+        Note that an *explicit* ``cuda`` on a machine without one is downgraded
+        to CPU rather than passed through. It used to be passed through, and
+        the failure that produced was badly misleading: ultralytics raised
+        while loading the weights, :func:`lpr.detect.build_detector` caught it,
+        and the pipeline came up on the contour detector -- so a device typo
+        showed up as an accuracy collapse, not as a device error.
+        """
+        from lpr.accel import resolve_torch_device
+
+        return resolve_torch_device(device)
 
     @staticmethod
     def _resolve_plate_classes(model: Any) -> set[int] | None:

@@ -7,7 +7,9 @@ Two things make this endpoint fiddlier than it looks:
 
 1. **Auth.** A browser cannot attach an ``Authorization`` header to a WebSocket
    handshake, so the bearer token arrives as the ``?token=`` query parameter.
-   An invalid or missing token is closed with policy-violation code ``1008``.
+   An invalid or missing token is closed with policy-violation code ``1008``,
+   and so is a token whose account no longer holds a live licence -- the
+   socket is application access like any other endpoint.
 
 2. **Threading.** ``pipeline.subscribe()`` hands back a *thread-safe*
    ``queue.Queue`` that pipeline worker threads push into. Calling ``q.get()``
@@ -29,7 +31,7 @@ from typing import Any
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from lpr.api.security import AuthError, AuthUser, user_from_token
+from lpr.api.security import AuthError, AuthUser, license_refusal, user_from_token
 
 logger = logging.getLogger(__name__)
 
@@ -192,13 +194,46 @@ async def _authenticate(websocket: WebSocket, token: str | None) -> AuthUser | N
     """
     await websocket.accept()
     try:
-        return user_from_token(token or "")
+        user = user_from_token(token or "")
     except AuthError as exc:
         logger.info("WebSocket kimlik doğrulaması reddedildi: %s", exc)
-        await _safe_send(websocket, {"type": "error", "detail": str(exc)})
-        with contextlib.suppress(Exception):
-            await websocket.close(code=CLOSE_POLICY_VIOLATION, reason=str(exc))
+        await _close_policy(websocket, str(exc))
         return None
+
+    # The licence, on the same terms as every HTTP request. A socket is a
+    # standing subscription to the site's events, so an account refused at
+    # login and on every endpoint must not keep one open -- and this is the
+    # channel the dashboard runs on, so leaving it ungated would leave a
+    # lapsed operator watching the gate live.
+    lapsed = await license_refusal(user, _user_repository(websocket))
+    if lapsed is not None:
+        await _close_policy(websocket, lapsed)
+        return None
+    return user
+
+
+def _user_repository(websocket: WebSocket) -> Any:
+    """The app's user repository, or ``None`` when there is none to consult.
+
+    A WebSocket route cannot take the repository as a FastAPI dependency the
+    way the HTTP handlers do, so it is read off ``app.state`` -- the same
+    object ``deps.get_user_repository`` caches there. ``None`` fails open in
+    :func:`~lpr.api.security.license_refusal`, which is the right direction for
+    a check layered on an already-valid token.
+    """
+    return getattr(websocket.app.state, "user_repository", None)
+
+
+async def _close_policy(websocket: WebSocket, detail: str) -> None:
+    """Tell the client why, then close with 1008.
+
+    The detail is sent as a message first: browsers do not reliably expose the
+    close reason, and "your licence lapsed" is not something the dashboard can
+    infer from a bare code.
+    """
+    await _safe_send(websocket, {"type": "error", "detail": detail})
+    with contextlib.suppress(Exception):
+        await websocket.close(code=CLOSE_POLICY_VIOLATION, reason=detail)
 
 
 async def _watch_for_close(websocket: WebSocket) -> None:

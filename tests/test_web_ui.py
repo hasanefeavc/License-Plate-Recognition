@@ -364,6 +364,99 @@ def test_the_update_button_shows_a_spinner_while_it_runs() -> None:
     assert "setUpdateBusy" in script
 
 
+# ---------------------------------------------------------------------------
+# Forced rebuild
+# ---------------------------------------------------------------------------
+
+
+def test_the_force_rebuild_button_is_present_and_named() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="update-force"' in html
+    assert "Zorla Yeniden Derle" in html
+
+
+def test_the_force_button_explains_what_it_costs() -> None:
+    """It causes the same outage as an update while buying no new code.
+
+    An operator reaching for it needs to know that before they press it, not
+    after the barrier has stopped answering.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    start = html.index('id="update-force"')
+    panel = html[start : start + 2000]
+    assert "yeniden başlatır" in panel.lower(), "say that it restarts the service"
+    assert "devre dışı" in panel.lower(), "say that the gate goes down"
+
+
+def test_the_force_button_posts_the_flag() -> None:
+    """Without the body the button is just a slower "Sistemi Güncelle"."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function runUpdate") :]
+    body = body[: body.index("\n  }\n")]
+    assert 'JSON.stringify({ force: true })' in body
+    assert '"/api/system/update"' in body
+
+
+def test_the_plain_update_button_still_posts_no_body() -> None:
+    """An older server that knows no request body must keep working."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function runUpdate") :]
+    body = body[: body.index("\n  }\n")]
+    assert "force ? JSON.stringify({ force: true }) : undefined" in body
+
+
+def test_the_force_button_asks_for_confirmation_too() -> None:
+    """Both triggers take the gate down; both need a mis-click guard."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function runUpdate") :]
+    body = body[: body.index("\n  }\n")]
+
+    # One confirm serves both paths, so it has to name which one it is about.
+    assert body.index("window.confirm") < body.index('"/api/system/update"')
+    assert "zorla yeniden derlenecek" in body.lower()
+
+
+def test_the_click_handlers_pass_a_boolean_not_the_event() -> None:
+    """`addEventListener("click", runUpdate)` would make `force` a MouseEvent.
+
+    A MouseEvent is truthy, so wiring the plain button that way would turn
+    every ordinary update into a forced rebuild. Both handlers must therefore
+    call through with an explicit boolean.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'addEventListener("click", runUpdate)' not in script
+    assert '"click", () => runUpdate(false)' in script
+    assert '"click", () => runUpdate(true)' in script
+
+
+def test_both_triggers_are_disabled_while_either_one_runs() -> None:
+    """They share a single-flight endpoint; the second press would only 409."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function setUpdateBusy") :]
+    body = body[: body.index("\n  }\n")]
+    assert '"update-run", "update-force"' in body
+
+    gating = script[script.index("function setUpdateAvailable") :]
+    gating = gating[: gating.index("\n  }\n")]
+    assert '"update-force"' in gating, "a disabled server must disable this button too"
+
+
+def test_a_forced_rebuild_is_confirmed_by_status_not_by_a_new_commit() -> None:
+    """A rebuild deliberately changes no commit, so the poll cannot wait for one.
+
+    The commit-change branch is the *update* success path. For a forced run the
+    server answering again with a finished status is the only evidence there
+    is, and reporting "Sistem zaten güncel" for it would read as a failure.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function pollForRestart") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "force = false" in body, "the poll has to know which run it is watching"
+    assert "status.running" in body
+    assert 'force ? "Yeniden derleme tamamlandı." : "Sistem zaten güncel."' in body
+
+
 def test_the_client_polls_for_the_restart_instead_of_awaiting_the_post() -> None:
     """The POST is 202; success can only be observed by the commit changing."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
@@ -411,6 +504,225 @@ def test_the_panel_displays_the_version_but_tracks_the_commit() -> None:
     poll = script[script.index("async function pollForRestart") :]
     poll = poll[: poll.index("\n  }\n")]
     assert "info.commit" in poll, "restart detection must watch the commit hash"
+
+
+# ---------------------------------------------------------------------------
+# Camera streams and polling
+# ---------------------------------------------------------------------------
+
+
+def _fn(script: str, name: str) -> str:
+    """The body of one top-level function in app.js."""
+    body = script[script.index(name) :]
+    return body[: body.index("\n  }\n")]
+
+
+def test_streams_are_not_attached_before_the_cameras_are_known() -> None:
+    """The reported hang.
+
+    `exit` is commonly disabled -- one device cannot serve two roles -- and it
+    then has no worker, so its stream endpoint 404s. Requesting it anyway cost
+    a browser connection per attempt, and a browser allows only a handful per
+    host, so the dead tile was paid for by every other request on the page.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function startSession")
+
+    assert 'attachStream("exit")' not in body
+    assert 'attachStream("entry")' not in body
+    assert "refreshStats()" in body, "the stats read is what discovers the cameras"
+
+
+def test_only_the_cameras_the_server_reports_are_streamed() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function syncStreams")
+
+    assert "roles.includes(role)" in body
+    assert "attachStream(role)" in body
+    assert "detachStream(role)" in body
+
+
+def test_syncing_streams_does_not_restart_a_running_one() -> None:
+    """It runs on every stats poll, so it has to be idempotent.
+
+    Re-pointing a healthy <img> every few seconds would tear down and rebuild
+    a working MJPEG connection on a timer -- the same connection churn the
+    change is meant to remove.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function syncStreams")
+    assert "if (!streamState(role).active) attachStream(role)" in body
+
+
+def test_a_failing_stream_backs_off_instead_of_hammering() -> None:
+    """An <img> cannot read a status code, so a 404 looks like a quiet camera.
+
+    Retrying every three seconds forever is indistinguishable from a request
+    storm; the gap has to widen and the retry has to stop being scheduled once
+    the server has said the camera does not exist.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function scheduleStreamRetry")
+
+    assert "STREAM_RETRY_MAX_MS" in body, "the backoff needs a ceiling"
+    assert "Math.pow(2, stream.failures - 1)" in body
+    assert "state.cameraRoles.includes(role)" in body, "a known-absent camera is not retried"
+
+
+def test_the_retry_ceiling_is_declared_and_generous() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "const STREAM_RETRY_MAX_MS = 30000;" in script
+
+
+def test_stream_listeners_are_wired_exactly_once() -> None:
+    """The request-storm bug.
+
+    The <img> elements outlive the session, but attachStream ran again on every
+    login and re-added its listeners. After N logins one `error` fired N
+    reconnect timers on the same element, so the retry rate grew with every
+    session rather than staying flat.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function attachStream")
+
+    assert "if (!stream.wired)" in body
+    assert "stream.wired = true" in body
+
+
+def test_detaching_a_stream_cancels_its_pending_retry() -> None:
+    """A cleared <img> with a live timer re-points itself seconds later."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function detachStream")
+
+    assert "clearTimeout(stream.retry)" in body
+    assert "removeAttribute(\"src\")" in body
+    assert "stream.active = false" in body
+
+
+def test_the_polling_timers_live_in_one_idempotent_pair() -> None:
+    """`startTimers` clearing first is what makes a second call harmless."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function startTimers")
+
+    assert body.index("stopTimers()") < body.index("setInterval"), (
+        "stop before start, or re-focusing stacks a second copy of every interval"
+    )
+    assert "STATS_INTERVAL_MS" in body and "PARKING_INTERVAL_MS" in body
+
+
+def test_every_polling_timer_is_cleared_together() -> None:
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function stopTimers")
+
+    for timer in ("statsTimer", "parkingTimer", "uptimeTimer"):
+        assert f"clearInterval(state.{timer})" in body
+        assert f"state.{timer} = null" in body
+
+
+def test_logout_stops_the_timers_through_the_same_helper() -> None:
+    """Two places clearing timers by hand is how one of them gets forgotten."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = _fn(script, "function logout")
+    assert "stopTimers()" in body
+
+
+def test_a_hidden_tab_stops_polling_and_resumes_cleanly() -> None:
+    """Browsers throttle timers in background tabs unpredictably.
+
+    A resumed tab firing its backlog is exactly what "several requests a
+    second" looks like from the server's side.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    handler = script[script.index('document.addEventListener("visibilitychange"') :]
+    handler = handler[: handler.index("\n    });")]
+
+    assert "document.hidden" in handler
+    assert "stopTimers()" in handler
+    assert "startTimers()" in handler
+
+
+def test_the_poll_intervals_are_seconds_apart_not_milliseconds() -> None:
+    """Guards the actual cadence, which is what "polling storm" would mean."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    stats = int(re.search(r"const STATS_INTERVAL_MS = (\d+);", script).group(1))
+    parking = int(re.search(r"const PARKING_INTERVAL_MS = (\d+);", script).group(1))
+
+    assert 3000 <= stats <= 5000, f"stats polls every {stats}ms"
+    assert parking >= stats, "parking changes more slowly than the counters"
+
+
+# ---------------------------------------------------------------------------
+# History date filtering
+# ---------------------------------------------------------------------------
+
+
+def test_the_day_filter_sends_instants_not_a_bare_date() -> None:
+    """The bug: a bare `YYYY-MM-DD` upper bound matched nothing.
+
+    It is shorter than any stored timestamp, so a lexical `ts <= ?` put every
+    row on the chosen day after the bound -- while "Tümü", which sends no dates
+    at all, kept working. The client now sends full instants.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function loadHistory") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "dayRange(day)" in body
+    assert 'params.set("since", day)' not in body, "the bare day must not be a bound"
+    assert 'params.set("until", day)' not in body
+
+
+def test_the_day_range_is_built_in_local_time() -> None:
+    """`new Date(y, m - 1, d)` is local; parsing the string would be UTC.
+
+    The trap is `new Date("2026-08-28").toISOString().slice(0, 10)`, which
+    parses the bare date as UTC midnight and formats it back in UTC -- east of
+    Greenwich that is a different calendar day, so the filter silently asks for
+    yesterday.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function dayRange") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "new Date(year, month - 1, date, 0, 0, 0, 0)" in body
+    assert "new Date(year, month - 1, date, 23, 59, 59, 999)" in body
+    assert ".slice(0, 10)" not in body, "the UTC round-trip is the bug, not the fix"
+
+
+def test_the_day_list_is_requested_in_the_same_timezone_as_the_filter() -> None:
+    """A list bucketed in UTC and a range computed locally disagree by hours.
+
+    That disagreement is indistinguishable from the original symptom: the
+    operator picks a day the server offered and gets nothing back.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function loadHistoryDays") :]
+    body = body[: body.index("\n  }\n")]
+    assert "tz_offset=${tzOffsetMinutes()}" in body
+
+
+def test_the_timezone_offset_sign_is_flipped_for_the_server() -> None:
+    """`getTimezoneOffset()` is minutes *to add to local to reach UTC*.
+
+    It reports -180 in Turkey, not +180. Passing it through unnegated moves the
+    day boundary six hours the wrong way -- code that looks right until someone
+    opens the history just after midnight.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function tzOffsetMinutes") :]
+    body = body[: body.index("\n  }\n")]
+    assert "-new Date().getTimezoneOffset()" in body
+
+
+def test_the_csv_export_uses_the_same_range_as_the_table() -> None:
+    """It hardcoded +00:00, exporting a UTC day while the table showed a local one."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function downloadCsv") :]
+    body = body[: body.index("\n  }\n")]
+
+    assert "dayRange(day)" in body
+    assert "T00:00:00+00:00" not in body
+    assert "T23:59:59+00:00" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -502,8 +814,13 @@ def test_the_add_form_omits_blank_optional_fields() -> None:
     assert "if (value) body[key] = value;" in body
 
 
-def test_the_table_renders_all_four_status_badges() -> None:
-    """Aktif / Engelli / Süresi Doldu / Misafir, each visually distinct."""
+def test_the_table_renders_every_status_badge() -> None:
+    """One badge per status `plate_status` can return, each visually distinct.
+
+    The vocabularies have to stay in step: a status the server derives but the
+    page has no entry for renders as an unlabelled blank, which reads as "no
+    status" rather than the refusal it actually is.
+    """
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     block = script[script.index("const PLATE_STATUS") :]
     block = block[: block.index("\n  };")]
@@ -600,7 +917,7 @@ def test_plate_controls_are_open_to_operators() -> None:
     """Operators are the people at the barrier; plate CRUD is their job.
 
     The server gates these endpoints on a live licence rather than on the role,
-    and an unlicensed operator gets a 402 and the licence dialog — being told
+    and an unlicensed operator gets the licence dialog — being told
     why beats the control quietly vanishing.
     """
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
@@ -810,13 +1127,44 @@ def test_the_badge_shows_remaining_days_for_an_operator() -> None:
     assert "days_remaining" in body and "gün" in body
 
 
-def test_a_402_opens_the_licence_dialog() -> None:
-    """402 means "your licence lapsed" — distinct from 403, which offers nothing."""
+def test_a_lapsed_licence_opens_the_licence_dialog() -> None:
+    """Both refusals are 403; the detail is what separates them.
+
+    A role refusal offers the operator nothing to do, so the dialog must open
+    for the lapse only.
+    """
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("async function api(") :]
     body = body[: body.index("\n  }\n")]
-    assert "response.status === 402" in body
+    assert "isLicenseLapse(response.status, detail)" in body
     assert "onLicenseLapsed" in body
+
+
+def test_the_page_matches_the_servers_wording_for_a_lapse() -> None:
+    """The client keys the dialog on this string, so it has to be *the* string."""
+    from lpr.api.security import LICENSE_LAPSED_DETAIL
+
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert f'const LICENSE_LAPSED = "{LICENSE_LAPSED_DETAIL}"' in script
+    assert "status === 403" in script[script.index("function isLicenseLapse") :]
+
+
+def test_the_login_screen_offers_the_key_after_a_lapse() -> None:
+    """An expired account is refused a token, and activation needs one.
+
+    Without the key box on the login screen the refusal would be a dead end:
+    an operator holding a valid replacement key with nowhere to type it.
+    """
+    page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="login-license-key"' in page
+    # Hidden until the server has actually named the lapse.
+    assert 'id="login-license" hidden' in page
+
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("async function submitCredentials") :]
+    body = body[: body.index("\n  }\n")]
+    assert "body.license_key = key" in body
+    assert "showLicenseField(true)" in body
 
 
 def test_the_dialog_is_offered_once_per_lapse() -> None:
@@ -1023,3 +1371,74 @@ def test_the_element_registry_covers_every_id_it_dereferences() -> None:
 
     absent = sorted(name for name in registered if f'id="{name}"' not in html)
     assert not absent, f"registered but absent from the page: {absent}"
+
+
+# ---------------------------------------------------------------------------
+# The history table is an operational audit log, not a licensing surface
+# ---------------------------------------------------------------------------
+
+
+def _modal(html: str, modal_id: str) -> str:
+    """The markup of one top-level modal, from its id to the next modal's.
+
+    Crude but exact enough for placement assertions, and it avoids adding an
+    HTML-parser dependency to a suite whose whole point is that the dashboard
+    is static files.
+    """
+    start = html.index(f'<div id="{modal_id}"')
+    rest = html[start + 1 :]
+    following = [
+        rest.index(marker)
+        for marker in ('<div id="modal-', "\n<!-- ")
+        if marker in rest
+    ]
+    end = min(following) if following else len(rest)
+    return rest[:end]
+
+
+def test_the_history_table_has_only_operational_columns() -> None:
+    """Geçmiş Kayıtlar answers "which car, when, which gate, what happened".
+
+    A licensing control has no business in that view: nothing in it reads the
+    value, and an operator scanning yesterday's entries had a licence duration
+    dropdown sitting between the filters and the rows.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    history = _modal(html, "modal-history")
+
+    headers = re.findall(r"<th[^>]*>\s*([^<]+?)\s*</th>", history)
+    assert headers == ["ZAMAN", "KAMERA", "PLAKA", "DURUM", "GÜVEN"]
+
+    assert "LİSANS" not in history.upper()
+    assert 'id="license-days"' not in history
+
+
+def test_the_licence_duration_control_lives_with_the_users_it_serves() -> None:
+    """It feeds "Lisans Üret" in the user table, so it belongs in that modal.
+
+    Asserted positively as well as negatively: deleting the control outright
+    would satisfy "not in the history modal" while breaking licence issuing.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    users = _modal(html, "modal-users")
+
+    assert 'id="license-days"' in users
+    assert 'id="license-days-custom"' in users
+
+
+def test_the_history_rows_render_one_cell_per_header() -> None:
+    """A stale cell would silently shift every column right of it."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    body = script[script.index("function renderHistory") :]
+    body = body[: body.index("\n  }\n")]
+
+    # One cell(...) call per column in the tr.append(...) list.
+    appended = body[body.index("tr.append(") :]
+    assert appended.count("cell(") == 5, "five headers, five cells"
+    assert "license" not in appended.lower()
+
+
+def test_licence_state_is_still_shown_in_the_header() -> None:
+    """Removing it from the log must not remove it from the operator's view."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="license-badge"' in html

@@ -27,7 +27,11 @@ from typing import Final
 #: v7 split generation from activation: ``license_duration_days`` and
 #: ``license_activated_at``, so the countdown starts when the operator enters
 #: the key rather than when the admin cuts it.
-SCHEMA_VERSION: Final[int] = 7
+#: v8 added ``plates.username``, recording which account a car belongs to. It
+#: is ownership metadata for the management screen only: the barrier never
+#: reads it, because a user's licence governs their access to the dashboard and
+#: not their car's access to the car park.
+SCHEMA_VERSION: Final[int] = 8
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -44,7 +48,8 @@ CREATE TABLE IF NOT EXISTS plates (
     owner      TEXT,
     apartment  TEXT,
     expires_at TEXT,
-    blocked    INTEGER NOT NULL DEFAULT 0
+    blocked    INTEGER NOT NULL DEFAULT 0,
+    username   TEXT
 )
 """
 
@@ -64,6 +69,11 @@ PLATES_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
     ("apartment", "ALTER TABLE plates ADD COLUMN apartment TEXT"),
     ("expires_at", "ALTER TABLE plates ADD COLUMN expires_at TEXT"),
     ("blocked", "ALTER TABLE plates ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"),
+    # Ownership metadata: which account a car belongs to. Deliberately *not* a
+    # foreign key, and deliberately not consulted at the barrier -- see
+    # ``PlateRepository.authorization``. NULL means "not recorded", which is
+    # what every pre-v8 row is.
+    ("username", "ALTER TABLE plates ADD COLUMN username TEXT"),
 )
 
 CREATE_USERS: Final[str] = """
@@ -228,15 +238,17 @@ PLATE_COLUMNS: Final[tuple[str, ...]] = (
     "expires_at",
     "blocked",
     "added_at",
+    "username",
 )
 
 SELECT_PLATE_DETAIL: Final[str] = (
-    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked "
+    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked, username "
     "FROM plates WHERE plate = ?"
 )
 
 SELECT_PLATES_DETAIL: Final[str] = (
-    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked FROM plates ORDER BY plate"
+    "SELECT plate, added_at, note, owner, apartment, expires_at, blocked, username "
+    "FROM plates ORDER BY plate"
 )
 
 #: Never selects ``password_hash``. The licence *key* is included because an

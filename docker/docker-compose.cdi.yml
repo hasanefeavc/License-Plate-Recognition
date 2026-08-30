@@ -1,0 +1,29 @@
+# GPU passthrough for engines that speak CDI rather than Docker's device driver
+# API -- Podman, and Docker Engine >= 25 with CDI enabled.
+#
+# Why this file exists: the `deploy.resources.reservations.devices` block in
+# docker-compose.yml is the Docker Engine spelling. Podman's Docker-compatible
+# API accepts it and silently does nothing -- the container starts, no device
+# is passed, and the service logs "no CUDA device visible to torch ...; running
+# on CPU" while appearing perfectly healthy. Checking `docker version` does not
+# reveal this: the CLI can be Docker while the socket behind it is Podman
+# (`docker info` reports the real Server Version).
+#
+# The device name below comes from the host's CDI spec, generated once with:
+#   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#   nvidia-ctk cdi list        # shows the names this file may use
+#
+# Use it as an overlay, never on its own:
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.cdi.yml up -d
+#
+# Verify the device really arrived -- a container that started proves nothing:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.cdi.yml \
+#     run --rm lpr-api python -c "import torch; print(torch.cuda.is_available())"
+#
+# `devices` is merged by Compose, so the camera nodes from the base file are
+# kept and this only adds the GPU.
+services:
+  lpr-api:
+    devices:
+      - "nvidia.com/gpu=all"

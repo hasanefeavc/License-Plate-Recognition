@@ -34,12 +34,13 @@ recognition.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import queue
 import threading
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from lpr.contracts import (
     Action,
@@ -50,6 +51,7 @@ from lpr.contracts import (
     PipelineStats,
     PlateDetection,
     PlateRead,
+    PredicateRecognizer,
     Recognizer,
     Relay,
     TrackAwareVoter,
@@ -57,7 +59,16 @@ from lpr.contracts import (
     Voter,
     utc_now_iso,
 )
-from lpr.db import LogRepository, PlateRepository, SystemEventRepository, init_db
+from lpr.db import (
+    PLATE_BLOCKED,
+    PLATE_EXPIRED,
+    PLATE_OK,
+    PLATE_UNKNOWN,
+    LogRepository,
+    PlateRepository,
+    SystemEventRepository,
+    init_db,
+)
 from lpr.db.connection import close_all as close_thread_connection
 from lpr.pipeline.camera import CameraWorker
 from lpr.pipeline.snapshots import SnapshotWriter
@@ -76,6 +87,83 @@ RETENTION_INTERVAL_S = 24 * 60 * 60
 #: How long a processing thread blocks waiting for a frame before looping
 #: round to re-check the stop flag.
 _FRAME_WAIT_S = 0.5
+
+#: What the gate log says about each refusal. Every one of these is recorded as
+#: ``Action.DENIED``; only the sentence differs. Keeping the distinction in the
+#: message rather than in a new ``Action`` value is deliberate -- the ``logs``
+#: table's ``action`` column is what ``stats_since`` totals and what the
+#: dashboard colours, so a fifth value would quietly stop expired cars being
+#: counted as denials and would render unlabelled in the live feed.
+_DENIAL_LOG = {
+    PLATE_EXPIRED: "EXPIRED, gate kept closed",
+    PLATE_BLOCKED: "blocked, denied",
+    PLATE_UNKNOWN: "not registered, denied",
+}
+
+#: Notification category per refusal, for :meth:`PipelineOrchestrator._notify_reason`.
+#:
+#: An expired permit deliberately raises the *same* ``unauthorized`` alert it
+#: always did. :meth:`lpr.notify.Notifier.wants` answers False for any category
+#: it does not know, so minting an ``expired`` one here would have silently
+#: stopped a lapsed resident from alerting anybody -- turning a clearer log
+#: line into a missed notification. Splitting the category is a notifier
+#: change, with its own config flag, not a side effect of this one.
+_NOTIFY_REASON = {
+    PLATE_EXPIRED: "unauthorized",
+    PLATE_BLOCKED: "blacklisted",
+    PLATE_UNKNOWN: "unauthorized",
+}
+
+
+def _accepts_predicate(recognizer: Any) -> bool:
+    """True when ``recognizer.recognize`` takes the ``accept`` predicate.
+
+    Probed once, at construction, rather than discovered by catching a
+    ``TypeError`` per frame: that would also swallow a genuine ``TypeError``
+    raised *inside* a recogniser and quietly downgrade the site to the slow
+    path for the rest of its uptime.
+    """
+    try:
+        return "accept" in inspect.signature(recognizer.recognize).parameters
+    except (TypeError, ValueError, AttributeError):  # pragma: no cover - exotic callables
+        return False
+
+
+class _FastPathProbe:
+    """One detection's early exit, and a record of whether it fired.
+
+    Handed to the recogniser as the ``accept`` predicate. Per-detection rather
+    than per-orchestrator on purpose: a camera thread each side of the gate
+    runs :meth:`PipelineOrchestrator.process_frame` concurrently, and a flag on
+    the orchestrator would let the entry camera's hit be read as the exit
+    camera's. A short-lived object owned by the call has no such race.
+
+    Never raises into the recogniser. A database wobble mid-read must fall back
+    to the ordinary path -- which will consult the same repository again a
+    moment later, through the code that is allowed to fail loudly -- rather
+    than take down the OCR pass it was invited into.
+    """
+
+    __slots__ = ("_authorize", "_min_confidence", "fired", "plate")
+
+    def __init__(self, min_confidence: float, authorize: Callable[[str], str]) -> None:
+        self._min_confidence = min_confidence
+        self._authorize = authorize
+        self.fired = False
+        self.plate = ""
+
+    def __call__(self, verdict: PlateRead) -> bool:
+        if not verdict.is_usable or verdict.confidence < self._min_confidence:
+            return False
+        try:
+            if self._authorize(verdict.text) != PLATE_OK:
+                return False
+        except Exception:
+            logger.debug("Fast-path lookup failed; using the full path", exc_info=True)
+            return False
+        self.fired = True
+        self.plate = verdict.text
+        return True
 
 
 class PipelineOrchestrator:
@@ -126,6 +214,29 @@ class PipelineOrchestrator:
         # Only wired when the voter offers the hook; anything else is untouched.
         if hasattr(voter, "on_vote"):
             voter.on_vote = self.publish_telemetry
+
+        # Fast path. Two things have to be true for it to arm: the operator
+        # left it on, and the recogniser understands the `accept` predicate --
+        # a test double or a third-party engine implementing only the
+        # `Recognizer` protocol does not, and must keep working unchanged.
+        fast_path = getattr(settings, "fast_path", None)
+        self._fast_path_enabled = bool(getattr(fast_path, "enabled", False)) and (
+            _accepts_predicate(recognizer)
+        )
+        # Floored at ocr.min_confidence: opening the gate on a read the
+        # ordinary path would have thrown away is an accuracy regression, not
+        # an optimisation, and the two thresholds are set in different files by
+        # different people.
+        self._fast_path_min_confidence = max(
+            float(getattr(fast_path, "min_confidence", 1.0)),
+            float(settings.ocr.min_confidence),
+        )
+        if self._fast_path_enabled:
+            logger.info(
+                "Fast-path enabled: a registered plate read at >= %.2f opens the "
+                "gate on its first frame",
+                self._fast_path_min_confidence,
+            )
 
         self._plates = PlateRepository()
         self._logs = LogRepository()
@@ -304,6 +415,7 @@ class PipelineOrchestrator:
                 grants=self._stats.grants,
                 denials=self._stats.denials,
                 ocr_skipped=self._stats.ocr_skipped,
+                fast_path_hits=self._stats.fast_path_hits,
                 cameras=cameras,
             )
 
@@ -622,7 +734,23 @@ class PipelineOrchestrator:
                     self._stats.ocr_skipped += 1
                 continue
 
-            read = self._recognizer.recognize(detection.crop)
+            # The probe is what turns the OCR ladder into an early exit: the
+            # recogniser stops the moment its running vote is a registered
+            # plate read confidently enough, instead of computing the enhanced
+            # views that exist to rescue crops this one did not need.
+            probe = (
+                _FastPathProbe(self._fast_path_min_confidence, self._plates.authorization)
+                if self._fast_path_enabled
+                else None
+            )
+            if probe is not None:
+                # Narrowed rather than duck-typed: `_accepts_predicate` proved
+                # at construction that this recogniser takes the predicate.
+                read = cast(PredicateRecognizer, self._recognizer).recognize(
+                    detection.crop, accept=probe
+                )
+            else:
+                read = self._recognizer.recognize(detection.crop)
             if self._track_voter is not None:
                 self._track_voter.note_recognized(camera, track_id)
             if not read.is_usable:
@@ -655,7 +783,28 @@ class PipelineOrchestrator:
                 }
             )
 
-            confirmed = self._submit(camera, read, track_id)
+            confirmed: str | None
+            if probe is not None and probe.fired:
+                # The multi-frame vote is skipped, not merely won early: this
+                # plate is on the list and was read cleanly, so the frames the
+                # voter would spend agreeing with itself are latency at a
+                # barrier with a car sitting in front of it. `probe.plate` is
+                # the exact string that was authorised -- identical to
+                # `read.text` by construction, since the vote it accepted is
+                # the vote the recogniser then returned, but acting on the
+                # string that actually cleared the whitelist keeps that
+                # equivalence from being load-bearing.
+                with self._stats_lock:
+                    self._stats.fast_path_hits += 1
+                logger.debug(
+                    "Camera %s: %s cleared the fast path at %.2f",
+                    camera,
+                    probe.plate,
+                    read.confidence,
+                )
+                confirmed = probe.plate
+            else:
+                confirmed = self._submit(camera, read, track_id)
             if not confirmed:
                 continue
 
@@ -704,12 +853,16 @@ class PipelineOrchestrator:
         ``blacklisted`` outranks ``unauthorized``: a plate that is on the list
         and barred is a different (and usually more urgent) thing than one that
         was never listed, and an operator filtering their inbox needs them
-        apart.
+        apart. An expired permit alerts as ``unauthorized``, exactly as it did
+        before the gate log learned to name it: see ``_NOTIFY_REASON`` for why
+        that is not the same question as what the log line says.
         """
         if self._notifier is None or event.action != str(Action.DENIED):
             return None
         try:
-            reason = "blacklisted" if self._plates.is_blocked(event.plate) else "unauthorized"
+            reason = _NOTIFY_REASON.get(
+                self._plates.authorization(event.plate), "unauthorized"
+            )
             return reason if self._notifier.wants(reason) else None
         except Exception:
             logger.debug("Bildirim gerekçesi belirlenemedi", exc_info=True)
@@ -813,12 +966,12 @@ class PipelineOrchestrator:
             return event
 
         try:
-            registered = self._plates.is_registered(plate)
+            verdict = self._plates.authorization(plate)
         except Exception:
             logger.exception("Plate lookup failed for %s", plate)
             return self._record(camera, plate, Action.ERROR, confidence)
 
-        if registered:
+        if verdict == PLATE_OK:
             try:
                 # Non-blocking by contract: the pulse happens on the relay's
                 # own worker thread, so this returns in microseconds.
@@ -830,9 +983,15 @@ class PipelineOrchestrator:
             logger.info("Camera %s: %s registered, gate opened", camera, plate)
             return self._record(camera, plate, Action.GRANTED, confidence)
 
+        # Every remaining verdict keeps the barrier shut. The relay is not
+        # touched on any of these paths -- that is the whole point of routing
+        # the decision through one branch rather than a chain of ifs that a
+        # later edit could thread a `trigger()` back into.
         with self._stats_lock:
             self._stats.denials += 1
-        logger.info("Camera %s: %s not registered, denied", camera, plate)
+        logger.info(
+            "Camera %s: %s %s", camera, plate, _DENIAL_LOG.get(verdict, "denied")
+        )
         return self._record(camera, plate, Action.DENIED, confidence)
 
     def _record(

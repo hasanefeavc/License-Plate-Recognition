@@ -79,6 +79,12 @@ _HEADER_ALIASES: dict[str, str] = {
     "expiresat": "expires_at",
     "expires": "expires_at",
     "expiry": "expires_at",
+    "kullanici": "username",
+    "kullaniciadi": "username",
+    "abone": "username",
+    "username": "username",
+    "user": "username",
+    "subscriber": "username",
     "engelli": "blocked",
     "karaliste": "blocked",
     "blocked": "blocked",
@@ -273,16 +279,23 @@ def parse_plate_csv(
             continue
 
         blocked_raw = (record.get("blocked") or "").strip().lower()
+        fields: dict[str, Any] = {
+            "owner": record.get("owner"),
+            "apartment": record.get("apartment"),
+            "note": record.get("note"),
+            "expires_at": record.get("expires_at"),
+            "blocked": blocked_raw in _TRUTHY,
+            "overwrite": overwrite,
+        }
+        # Only when the sheet actually carried a subscriber column, so a
+        # repository predating it still imports the files it always did. A
+        # sheet that *does* name one and cannot store it fails the row loudly
+        # below rather than importing the car ungoverned.
+        subscriber = (record.get("username") or "").strip()
+        if subscriber:
+            fields["username"] = subscriber
         try:
-            outcome = plate_repo.upsert(
-                plate,
-                owner=record.get("owner"),
-                apartment=record.get("apartment"),
-                note=record.get("note"),
-                expires_at=record.get("expires_at"),
-                blocked=blocked_raw in _TRUTHY,
-                overwrite=overwrite,
-            )
+            outcome = plate_repo.upsert(plate, **fields)
         except Exception as exc:
             report.invalid += 1
             report.errors.append(f"Satır {line_number}: kaydedilemedi ({exc}).")

@@ -21,8 +21,11 @@ from lpr.detect.preprocess import (  # noqa: E402  (must follow the skip guards)
     deskew,
     enhance_frame,
     enhance_plate,
+    hard_case_variants,
+    invert,
     letterbox,
     normalize_lighting,
+    otsu_binarize,
     rectify_perspective,
     sharpness,
     stretch_contrast,
@@ -572,6 +575,204 @@ def test_rectify_perspective_never_raises_on_junk() -> None:
 
 
 # ---------------------------------------------------------------------------
+# minAreaRect fallback
+#
+# approxPolyDP only finds the outline when the border traces cleanly enough to
+# collapse to four points. On a dirty or partly occluded plate it does not, and
+# the crop used to get no geometric correction at all -- deskew refuses
+# anything past 15 degrees, so a plate rotated further than that had nothing.
+# ---------------------------------------------------------------------------
+
+
+def make_rotated_plate_scene(degrees: float = 25.0) -> np.ndarray:
+    """A bordered plate rotated well past what `deskew` is willing to correct.
+
+    The canvas is sized so the *rotated* plate still fits inside it with a
+    margin. Rotating `make_plate_scene()` in place instead pushes the plate's
+    corners off the edge, which leaves no closed outline for the contour pass
+    to find and quietly tests nothing.
+    """
+    canvas_h, canvas_w = 180, 264
+    plate_h, plate_w = 60, 240
+
+    scene = np.full((canvas_h, canvas_w, 3), 40, dtype=np.uint8)
+    plate = np.full((plate_h, plate_w, 3), 240, dtype=np.uint8)
+    cv2.rectangle(plate, (0, 0), (plate_w - 1, plate_h - 1), (30, 30, 30), 2)
+    for index in range(6):
+        x = 15 + index * 38
+        plate[12 : plate_h - 12, x : x + 16] = 20
+
+    top, left = (canvas_h - plate_h) // 2, (canvas_w - plate_w) // 2
+    scene[top : top + plate_h, left : left + plate_w] = plate
+
+    matrix = cv2.getRotationMatrix2D((canvas_w / 2.0, canvas_h / 2.0), degrees, 1.0)
+    return cv2.warpAffine(scene, matrix, (canvas_w, canvas_h), borderMode=cv2.BORDER_REPLICATE)
+
+
+def test_a_plate_rotated_past_the_deskew_limit_is_still_rectified() -> None:
+    """The gap the fallback closes, end to end.
+
+    `deskew` refuses anything past MAX_DESKEW_DEGREES (15) as more likely a bad
+    contour than a real tilt, so a plate at 25 degrees gets no rotation from
+    it. Rectification is what is left, and it has to produce something
+    plate-shaped rather than declining.
+    """
+    rectified = rectify_perspective(make_rotated_plate_scene(25.0))
+
+    assert rectified is not None
+    aspect = rectified.shape[1] / rectified.shape[0]
+    assert 1.2 <= aspect <= 8.0, f"rectified to a non-plate aspect {aspect:.2f}"
+
+
+def test_the_min_area_fallback_finds_a_quad_when_the_polygon_fit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force every polygon approximation to miss, and the outline is still found.
+
+    Monkeypatching `approxPolyDP` into always returning a pentagon is the only
+    reliable way to exercise this: which real crops defeat the polygon fit
+    depends on OpenCV's contour tracing, so a fixture chosen to fail today
+    might start succeeding on the next version and silently stop testing the
+    fallback.
+    """
+    from lpr.detect import preprocess as pre
+
+    def never_a_quad(contour, epsilon, closed):  # type: ignore[no-untyped-def]
+        return np.zeros((5, 1, 2), dtype=np.int32)
+
+    monkeypatch.setattr(pre.cv2, "approxPolyDP", never_a_quad)
+
+    gray = cv2.cvtColor(make_rotated_plate_scene(), cv2.COLOR_BGR2GRAY)
+    quad = pre._plate_quad(gray)
+
+    assert quad is not None, "minAreaRect should have supplied the four corners"
+    assert quad.shape == (4, 2)
+
+
+def test_the_min_area_fallback_accepts_a_well_filled_rectangle() -> None:
+    """A plate border fills nearly all of its own bounding rectangle."""
+    from lpr.detect.preprocess import _min_area_quad
+
+    box = cv2.boxPoints(((100.0, 50.0), (160.0, 40.0), 20.0)).astype(np.int32)
+    quad = _min_area_quad(box.reshape(-1, 1, 2))
+
+    assert quad is not None
+    assert quad.shape == (4, 2)
+
+
+def test_the_min_area_fallback_rejects_a_shape_that_is_not_a_rectangle() -> None:
+    """The guard that makes the fallback safe.
+
+    `minAreaRect` returns a rectangle for *any* contour, an L-shaped shadow
+    edge included, and warping a crop onto one of those destroys it. An L fills
+    little of its own bounding box, so the fill ratio rejects it.
+    """
+    from lpr.detect.preprocess import _min_area_quad
+
+    ell = np.array(
+        [[0, 0], [100, 0], [100, 20], [20, 20], [20, 100], [0, 100]],
+        dtype=np.int32,
+    ).reshape(-1, 1, 2)
+    assert _min_area_quad(ell) is None
+
+
+def test_the_min_area_fallback_never_raises_on_junk() -> None:
+    from lpr.detect.preprocess import _min_area_quad
+
+    assert _min_area_quad(np.zeros((0, 1, 2), dtype=np.int32)) is None
+
+
+# ---------------------------------------------------------------------------
+# Low-light: Otsu, inversion and the hard-case views
+# ---------------------------------------------------------------------------
+
+
+def make_night_crop(scale: float = 0.18) -> np.ndarray:
+    """A plate at night: correct structure, almost all of the range missing."""
+    crop = make_plate_crop()
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return (gray.astype(np.float32) * scale).astype(np.uint8)
+
+
+def test_otsu_binarize_splits_a_dark_crop_into_two_levels() -> None:
+    """The low-light case: dark, but still bimodal, so one global cut works."""
+    binary = otsu_binarize(make_night_crop())
+
+    assert binary is not None
+    assert set(np.unique(binary)).issubset({0, 255})
+    assert 0 in np.unique(binary) and 255 in np.unique(binary)
+
+
+def test_otsu_recovers_contrast_the_adaptive_threshold_loses() -> None:
+    """Why Otsu is here at all, rather than reusing `enhance_plate`'s variant.
+
+    On a uniformly dark crop every neighbourhood is flat, so an adaptive
+    threshold cuts each one against its own noise. Otsu takes a single cut from
+    the whole histogram, which is what that crop actually needs.
+    """
+    night = make_night_crop()
+    binary = otsu_binarize(night)
+    assert binary is not None
+
+    # The glyph bars are at a known place; they must survive as one solid run.
+    column = binary[binary.shape[0] // 2]
+    transitions = int(np.count_nonzero(np.diff(column.astype(np.int16)) != 0))
+    assert 2 <= transitions <= 24, f"expected clean glyph edges, got {transitions}"
+
+
+def test_otsu_declines_on_a_crop_with_nothing_to_split() -> None:
+    """A flat wall has no two modes; thresholding it would return noise."""
+    assert otsu_binarize(np.full((40, 160), 90, dtype=np.uint8)) is None
+
+
+def test_otsu_never_raises_on_junk() -> None:
+    assert otsu_binarize(None) is None  # type: ignore[arg-type]
+    assert otsu_binarize(np.zeros((0, 0), dtype=np.uint8)) is None
+
+
+def test_invert_is_its_own_inverse() -> None:
+    crop = make_night_crop()
+    assert np.array_equal(invert(invert(crop)), crop)
+
+
+def test_invert_flips_a_light_on_dark_plate_to_dark_on_light() -> None:
+    """The IR-illuminator case: bright glyphs on a dark field, back to normal."""
+    reversed_polarity = invert(cv2.cvtColor(make_plate_crop(), cv2.COLOR_BGR2GRAY))
+    restored = invert(reversed_polarity)
+
+    # The field is the bright majority again, as both recognisers expect.
+    assert float(restored.mean()) > float(reversed_polarity.mean())
+
+
+def test_invert_never_raises_on_junk() -> None:
+    assert invert(None) is None  # type: ignore[arg-type]
+    empty = np.zeros((0, 0), dtype=np.uint8)
+    assert invert(empty) is empty
+
+
+def test_hard_case_variants_offers_otsu_and_both_inversions() -> None:
+    variants = hard_case_variants(make_night_crop())
+    assert len(variants) == 3
+    assert all(v.size > 0 for v in variants)
+
+
+def test_hard_case_variants_still_offers_an_inversion_without_otsu() -> None:
+    """A flat crop has no Otsu, but its negative is still worth a pass."""
+    variants = hard_case_variants(np.full((40, 160), 90, dtype=np.uint8))
+    assert len(variants) == 1
+
+
+def test_hard_case_variants_accepts_a_colour_crop() -> None:
+    """It sits behind `enhance_plate` in the pipeline but must not assume it."""
+    assert len(hard_case_variants(make_plate_crop())) == 3
+
+
+def test_hard_case_variants_never_raises_on_junk() -> None:
+    assert hard_case_variants(None) == []  # type: ignore[arg-type]
+    assert hard_case_variants(np.zeros((0, 0), dtype=np.uint8)) == []
+
+
+# ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
 
@@ -600,12 +801,51 @@ def test_build_detector_falls_back_to_contours_without_weights() -> None:
     assert isinstance(detector, ContourPlateDetector)
 
 
-def test_device_auto_resolves_without_torch_installed() -> None:
+def test_device_auto_resolves_without_torch_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lpr import accel
     from lpr.detect.yolo import YoloPlateDetector
 
     assert YoloPlateDetector._resolve_device("auto") in {"cpu", "cuda"}
     assert YoloPlateDetector._resolve_device("cpu") == "cpu"
+
+    # An explicit GPU request is honoured only when there is a GPU. On a CPU
+    # runner it must come back as "cpu" rather than being passed through:
+    # ultralytics raises on an unavailable device, build_detector catches that
+    # and silently substitutes the far weaker contour detector, so passing the
+    # bad device through turns a config error into an accuracy regression.
+    monkeypatch.setattr(accel, "cuda_available", lambda: False)
+    assert YoloPlateDetector._resolve_device("CUDA") == "cpu"
+    assert YoloPlateDetector._resolve_device("0") == "cpu"
+
+    monkeypatch.setattr(accel, "cuda_available", lambda: True)
     assert YoloPlateDetector._resolve_device("CUDA") == "cuda"
+    # ultralytics spells GPU ordinals bare; torch's .to() needs the prefix.
+    assert YoloPlateDetector._resolve_device("0") == "cuda:0"
+    assert YoloPlateDetector._resolve_device("auto") == "cuda"
+
+
+def test_onnx_export_is_ignored_on_a_cuda_host() -> None:
+    """The ONNX preference is a CPU optimisation and must not pull us off the GPU.
+
+    requirements.txt installs the CPU onnxruntime wheel deliberately, so
+    adopting an export on a CUDA box would move detection from the GPU to the
+    CPU -- slower than the .pt it replaced, and announced only by one INFO line.
+    """
+    from lpr.detect.yolo import YoloPlateDetector
+
+    detector = YoloPlateDetector.__new__(YoloPlateDetector)
+    detector.prefer_onnx = True
+
+    detector.device = "cpu"
+    assert detector._onnx_wanted() is True
+    detector.device = "cuda"
+    assert detector._onnx_wanted() is False
+    detector.device = "cuda:0"
+    assert detector._onnx_wanted() is False
+
+    detector.prefer_onnx = False
+    detector.device = "cpu"
+    assert detector._onnx_wanted() is False
 
 
 def test_contour_detector_satisfies_the_protocol_and_never_raises() -> None:
