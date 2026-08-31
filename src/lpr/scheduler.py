@@ -165,6 +165,70 @@ class NightlyUpdateJob:
         return "started"
 
 
+class NightlyBackupJob:
+    """Takes one database backup and prunes the old ones.
+
+    Separate from :class:`NightlyUpdateJob` because the two have nothing in
+    common but a clock: a backup runs whether or not OTA is enabled, must run
+    on a site that never updates, and must not be skipped because an update
+    check failed. Tying them together would mean the sites least likely to be
+    maintained were also the ones with no backups.
+    """
+
+    def __init__(self, events: EventSink | None = None, keep: int = 7) -> None:
+        self.events = events
+        self.keep = max(1, int(keep))
+
+    def record(self, message: str, level: str = "info", detail: str | None = None) -> None:
+        logger.log(logging.WARNING if level != "info" else logging.INFO, message)
+        if self.events is None:
+            return
+        try:
+            self.events.write(source="backup", message=message, level=level, detail=detail)
+        except Exception:  # pragma: no cover - the trail is never load-bearing
+            logger.debug("Yedekleme olayı kaydedilemedi", exc_info=True)
+
+    def run_once(self) -> str:
+        """Back up, then prune. Returns ``ok``, ``failed`` or ``skipped``."""
+        from lpr.db.backup import backup_database, prune_backups
+
+        result = backup_database()
+        if result.path is None and result.error is None:
+            return "skipped"  # in-memory database; nothing to copy
+        if not result.ok:
+            self.record("Veritabanı yedeği alınamadı.", "error", result.error)
+            return "failed"
+
+        pruned = prune_backups(keep=self.keep)
+        self.record(
+            f"Veritabanı yedeklendi ({result.bytes_written / 1024 / 1024:.1f} MB)."
+            + (f" {pruned} eski yedek silindi." if pruned else ""),
+            "info",
+            str(result.path),
+        )
+        return "ok"
+
+
+async def nightly_backup_loop(
+    job: NightlyBackupJob,
+    hour: int,
+    minute: int = 0,
+    sleeper: Any = None,
+) -> None:
+    """Run ``job`` every day at ``hour:minute``, forever. Never raises out."""
+    sleep = sleeper or asyncio.sleep
+    while True:
+        try:
+            await sleep(seconds_until(hour, minute))
+            # VACUUM INTO holds a read lock for the length of the copy, so it
+            # goes on a thread rather than stalling the event loop.
+            await asyncio.to_thread(job.run_once)
+        except asyncio.CancelledError:  # pragma: no cover - shutdown path
+            raise
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Gecelik yedekleme görevi başarısız")
+
+
 async def nightly_update_loop(
     job: NightlyUpdateJob,
     hour: int,

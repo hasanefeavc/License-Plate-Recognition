@@ -285,3 +285,168 @@ def test_retention_pass_trims_both_the_log_table_and_the_snapshots(db, frame) ->
     pipeline._retention_loop()
 
     assert not stale.exists()
+
+
+# ---------------------------------------------------------------------------
+# Disk pressure: the size ceiling and the free-space floor
+# ---------------------------------------------------------------------------
+
+
+def _fill(directory: Path, count: int, size: int = 1024) -> list[Path]:
+    """`count` snapshot files, each `size` bytes, with increasing mtimes.
+
+    The mtimes are set explicitly rather than left to the filesystem: several
+    files written in the same millisecond would otherwise sort arbitrarily,
+    and every assertion here is about deletion *order*.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index in range(count):
+        path = directory / f"2026-01-01_00-00-{index:02d}_34ABC{index:02d}.jpg"
+        path.write_bytes(b"x" * size)
+        os.utime(path, (1_700_000_000 + index, 1_700_000_000 + index))
+        paths.append(path)
+    return paths
+
+
+def test_the_size_ceiling_deletes_oldest_first(tmp_path: Path) -> None:
+    """What survives must always be the most recent evidence.
+
+    An operator reaching for a snapshot is investigating something that just
+    happened, so deleting newest-first would throw away exactly what is wanted.
+    """
+    directory = tmp_path / "snapshots"
+    paths = _fill(directory, count=10, size=1024)
+    writer = SnapshotWriter(directory, max_total_bytes=5 * 1024)
+
+    deleted = writer.enforce_limits()
+
+    assert deleted == 5
+    survivors = sorted(p.name for p in directory.glob("*.jpg"))
+    assert survivors == sorted(p.name for p in paths[5:]), "the newest five survive"
+
+
+def test_nothing_is_deleted_while_under_the_ceiling(tmp_path: Path) -> None:
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=4, size=1024)
+    writer = SnapshotWriter(directory, max_total_bytes=1024 * 1024)
+    assert writer.enforce_limits() == 0
+    assert len(list(directory.glob("*.jpg"))) == 4
+
+
+def test_a_zero_ceiling_disables_the_check(tmp_path: Path) -> None:
+    """Age remains the only limit, which is the previous behaviour."""
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=6, size=1024)
+    writer = SnapshotWriter(directory, max_total_bytes=0, min_free_bytes=0)
+    assert writer.enforce_limits() == 0
+    assert len(list(directory.glob("*.jpg"))) == 6
+
+
+def test_the_free_space_floor_triggers_deletion(tmp_path: Path, monkeypatch) -> None:
+    """The disk can fill for reasons that have nothing to do with snapshots.
+
+    Logs, a database that grew, another service on the same volume. The size
+    ceiling would be satisfied and the gate log would still stop being
+    writable, which is why this is a separate limit rather than a tuning of
+    the first.
+    """
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=10, size=1024)
+    writer = SnapshotWriter(directory, max_total_bytes=0, min_free_bytes=8 * 1024)
+
+    reclaimed = {"free": 0}
+
+    def fake_free() -> int:
+        return 1024 + reclaimed["free"]
+
+    monkeypatch.setattr(writer, "free_bytes", fake_free)
+    deleted = writer.enforce_limits()
+
+    assert deleted > 0, "a full volume must force snapshots out"
+    assert len(list(directory.glob("*.jpg"))) < 10
+
+
+def test_the_last_snapshot_is_never_deleted(tmp_path: Path, monkeypatch) -> None:
+    """If one file is the difference, the limit is misconfigured.
+
+    Deleting the only remaining piece of evidence would not fix a volume that
+    something else is filling, and it would destroy the last thing an operator
+    could look at.
+    """
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=3, size=1024)
+    writer = SnapshotWriter(directory, max_total_bytes=1)
+    monkeypatch.setattr(writer, "free_bytes", lambda: 0)
+
+    writer.enforce_limits()
+
+    assert len(list(directory.glob("*.jpg"))) == 1, "one survivor is kept"
+
+
+def test_disk_pressure_raises_an_event(tmp_path: Path) -> None:
+    """Pressure that only appears in a log line is pressure nobody acts on."""
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=8, size=1024)
+    seen: list[tuple[str, dict]] = []
+    writer = SnapshotWriter(
+        directory, max_total_bytes=3 * 1024, on_pressure=lambda s, d: seen.append((s, d))
+    )
+
+    writer.enforce_limits()
+
+    assert len(seen) == 1
+    source, detail = seen[0]
+    assert source == "snapshot_retention"
+    assert detail["deleted"] == 5
+    assert detail["reason"] == "size ceiling"
+    assert detail["reclaimed_bytes"] == 5 * 1024
+    assert writer.pressure_events == 1
+
+
+def test_a_failing_pressure_sink_does_not_break_retention(tmp_path: Path) -> None:
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=8, size=1024)
+
+    def explode(_source: str, _detail: dict) -> None:
+        raise RuntimeError("event store is down")
+
+    writer = SnapshotWriter(directory, max_total_bytes=3 * 1024, on_pressure=explode)
+    assert writer.enforce_limits() == 5, "deletion still happened"
+
+
+def test_a_disabled_writer_deletes_nothing(tmp_path: Path) -> None:
+    """It does not own the directory it was pointed at, so it must not prune it."""
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=8, size=1024)
+    writer = SnapshotWriter(directory, enabled=False, max_total_bytes=1024)
+    assert writer.enforce_limits() == 0
+    assert len(list(directory.glob("*.jpg"))) == 8
+
+
+def test_a_missing_directory_is_not_an_error(tmp_path: Path) -> None:
+    writer = SnapshotWriter(tmp_path / "never-created", max_total_bytes=1024)
+    assert writer.enforce_limits() == 0
+    assert writer.total_bytes() == 0
+
+
+def test_total_bytes_counts_only_snapshots(tmp_path: Path) -> None:
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=3, size=1024)
+    (directory / "notes.txt").write_bytes(b"y" * 9999)
+    writer = SnapshotWriter(directory)
+    assert writer.total_bytes() == 3 * 1024
+
+
+def test_unknowable_free_space_does_not_trigger_deletion(tmp_path: Path, monkeypatch) -> None:
+    """A stat that fails is not evidence of a full disk.
+
+    Deleting evidence because the free-space check errored would destroy data
+    on the strength of a failed measurement.
+    """
+    directory = tmp_path / "snapshots"
+    _fill(directory, count=6, size=1024)
+    writer = SnapshotWriter(directory, max_total_bytes=0, min_free_bytes=1024 * 1024)
+    monkeypatch.setattr(writer, "free_bytes", lambda: None)
+    assert writer.enforce_limits() == 0
+    assert len(list(directory.glob("*.jpg"))) == 6

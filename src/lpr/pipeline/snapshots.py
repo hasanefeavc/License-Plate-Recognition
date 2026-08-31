@@ -97,11 +97,22 @@ class SnapshotWriter:
         queue_size: int = 64,
         retention_days: int = 10,
         enabled: bool = True,
+        max_total_bytes: int = 0,
+        min_free_bytes: int = 0,
+        on_pressure: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.directory = Path(directory)
         self.quality = max(1, min(100, int(quality)))
         self.retention_days = max(0, int(retention_days))
         self.enabled = bool(enabled)
+        self.max_total_bytes = max(0, int(max_total_bytes))
+        self.min_free_bytes = max(0, int(min_free_bytes))
+        #: Called when a size or free-space limit forced a deletion, so the
+        #: orchestrator can raise a system event and an e-mail. Disk pressure
+        #: that only ever appears in a log line is disk pressure nobody acts on
+        #: until the volume is full.
+        self.on_pressure = on_pressure
+        self.pressure_events = 0
 
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(queue_size)))
         self._stop_event = threading.Event()
@@ -380,6 +391,151 @@ class SnapshotWriter:
         if errors:
             logger.warning("%d snapshots could not be deleted", errors)
         return deleted
+
+    # -- disk pressure ---------------------------------------------------
+
+    def _snapshot_files(self) -> list[tuple[float, int, Path]]:
+        """Every snapshot as ``(mtime, size, path)``, oldest first.
+
+        One ``stat`` per file and one sort, so the caller can answer both
+        "how much is there" and "what goes next" without walking twice.
+        """
+        entries: list[tuple[float, int, Path]] = []
+        for path in self.directory.glob(f"*{SNAPSHOT_SUFFIX}"):
+            try:
+                info = path.stat()
+            except OSError:
+                continue  # deleted under us; the next pass will not see it
+            entries.append((info.st_mtime, info.st_size, path))
+        entries.sort(key=lambda item: item[0])
+        return entries
+
+    def total_bytes(self) -> int:
+        """Bytes currently occupied by snapshots."""
+        if not self.directory.is_dir():
+            return 0
+        return sum(size for _mtime, size, _path in self._snapshot_files())
+
+    def free_bytes(self) -> int | None:
+        """Free space on the snapshot volume, or ``None`` if unknowable."""
+        try:
+            import shutil
+
+            return int(shutil.disk_usage(self.directory).free)
+        except (OSError, ValueError):
+            logger.debug("Could not read free space for %s", self.directory, exc_info=True)
+            return None
+
+    def enforce_limits(self) -> int:
+        """Delete oldest-first until the size and free-space limits are met.
+
+        Returns the number of files deleted.
+
+        Age-based retention is the normal mechanism and this is the backstop
+        for the case age cannot cover: a site busy enough that ten days of
+        evidence does not fit. Deletion is strictly oldest-first, so what
+        survives is always the most recent evidence -- which is what an
+        operator investigating an incident actually wants.
+
+        Runs even when both limits would be satisfied by doing nothing, and
+        returns 0; the cost is one directory listing, and the alternative is a
+        flag that goes stale.
+        """
+        if not self.enabled or not self.directory.is_dir():
+            return 0
+        if self.max_total_bytes <= 0 and self.min_free_bytes <= 0:
+            return 0
+
+        entries = self._snapshot_files()
+        if not entries:
+            return 0
+
+        total = sum(size for _mtime, size, _path in entries)
+        free = self.free_bytes()
+
+        over_size = self.max_total_bytes > 0 and total > self.max_total_bytes
+        under_free = (
+            self.min_free_bytes > 0 and free is not None and free < self.min_free_bytes
+        )
+        if not (over_size or under_free):
+            return 0
+
+        reason = "size ceiling" if over_size else "free space"
+        logger.warning(
+            "Snapshot %s reached: %.1f MB used, %s free. Deleting oldest first.",
+            reason,
+            total / 1024 / 1024,
+            "unknown" if free is None else f"{free / 1024 / 1024:.1f} MB",
+        )
+
+        deleted = 0
+        reclaimed = 0
+        for _mtime, size, path in entries:
+            still_over = self.max_total_bytes > 0 and total > self.max_total_bytes
+            still_short = (
+                self.min_free_bytes > 0
+                and free is not None
+                and (free + reclaimed) < self.min_free_bytes
+            )
+            if not (still_over or still_short):
+                break
+            # Never delete the last snapshot on the disk. If one file is the
+            # difference between meeting the limit and not, the limit is
+            # misconfigured or the volume is full of something else, and
+            # deleting the only piece of evidence left would not fix either.
+            if deleted >= len(entries) - 1:
+                logger.error(
+                    "Snapshot retention could not free enough space: %d file(s) left, "
+                    "%.1f MB still used. Check snapshots.max_total_mb / min_free_mb, "
+                    "and whether something else is filling this volume.",
+                    len(entries) - deleted,
+                    total / 1024 / 1024,
+                )
+                break
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                total -= size
+                continue
+            except OSError as exc:
+                logger.warning("Could not delete snapshot %s: %s", path, exc)
+                continue
+            total -= size
+            reclaimed += size
+            deleted += 1
+
+        if deleted:
+            self.pressure_events += 1
+            logger.warning(
+                "Deleted %d snapshot(s) (%.1f MB) to satisfy the %s limit",
+                deleted,
+                reclaimed / 1024 / 1024,
+                reason,
+            )
+            self._notify_pressure(reason, deleted, reclaimed, total, free)
+        return deleted
+
+    def _notify_pressure(
+        self, reason: str, deleted: int, reclaimed: int, remaining: int, free: int | None
+    ) -> None:
+        """Hand one disk-pressure event to the sink. Never raises."""
+        sink = self.on_pressure
+        if sink is None:
+            return
+        try:
+            sink(
+                "snapshot_retention",
+                {
+                    "reason": reason,
+                    "deleted": deleted,
+                    "reclaimed_bytes": reclaimed,
+                    "remaining_bytes": remaining,
+                    "free_bytes": free,
+                    "directory": str(self.directory),
+                },
+            )
+        except Exception:  # pragma: no cover - telemetry is never load-bearing
+            logger.debug("Disk-pressure sink failed", exc_info=True)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (

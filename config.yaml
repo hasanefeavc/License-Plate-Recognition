@@ -16,7 +16,25 @@ cameras:
     width: 640
     height: 480
     fps_limit: 30
+    # First reconnect delay; later attempts back off exponentially (with
+    # jitter, so several cameras behind one NVR do not retry in lockstep) up
+    # to reconnect_max_delay_s.
     reconnect_delay_s: 5.0
+    reconnect_max_delay_s: 60.0
+    # Seconds without a frame before the watchdog forces a reconnect. This is
+    # the guard against the failure that takes a gate offline silently: a TCP
+    # connection that stays open while the camera stops sending. read() has no
+    # timeout of its own, so the capture thread parks forever, /health keeps
+    # answering 200, and the barrier simply never opens again.
+    stall_timeout_s: 15.0
+    # RTSP only. tcp rather than FFmpeg's default udp: on a congested or
+    # wifi-bridged link udp drops packets and produces torn frames, which
+    # surface as OCR errors that are really decode errors.
+    rtsp_transport: tcp
+    # FFmpeg socket timeout, in seconds. Passed as stimeout (microseconds) via
+    # OPENCV_FFMPEG_CAPTURE_OPTIONS -- the only way in, since OpenCV exposes no
+    # API for it. Catches a stalled stream before the watchdog has to.
+    open_timeout_s: 5.0
     # Frames held between capture and recognition. Deliberately shallow: the
     # queue drops its oldest entry when full, so a deep queue does not buy
     # throughput, it buys latency -- recognition works through stale frames and
@@ -29,6 +47,10 @@ cameras:
     height: 480
     fps_limit: 30
     reconnect_delay_s: 5.0
+    reconnect_max_delay_s: 60.0
+    stall_timeout_s: 15.0
+    rtsp_transport: tcp
+    open_timeout_s: 5.0
     queue_size: 2
   motion:
     enabled: true
@@ -162,6 +184,13 @@ voting:
 
 relay:
   enabled: true
+  # serial | gpio | modbus | http | mock | auto (auto = serial).
+  driver: auto
+  # Refuse to fall back to a mock relay. Turn this ON for every real site: a
+  # mocked relay logs every vehicle as granted while no barrier moves, which
+  # looks like success everywhere except at the gate. LPR_ENV=production
+  # enables it regardless of this flag.
+  require_hardware: false
   port: auto
   baud: 9600
   open_byte: "A"
@@ -190,7 +219,19 @@ database:
 snapshots:
   enabled: true
   dir: ""
+  # Three limits; the tightest wins. Age alone is not enough -- it bounds how
+  # old the evidence gets, not how much of it there is, and a busy gate writes
+  # tens of gigabytes inside a ten-day window. The snapshot directory and the
+  # database usually share a volume, so snapshots filling the disk is what
+  # stops the gate log being writable.
   retention_days: 10
+  # Total ceiling for the snapshot directory, in MB. 0 disables. Enforced
+  # oldest-first, so what survives is always the most recent evidence.
+  max_total_mb: 20000
+  # Keep at least this much free on the volume, in MB. 0 disables. Separate
+  # from the ceiling above: this one notices the disk filling for reasons that
+  # have nothing to do with snapshots.
+  min_free_mb: 2000
   jpeg_quality: 80
   queue_size: 64
 

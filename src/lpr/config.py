@@ -68,8 +68,54 @@ class CameraConfig(BaseModel):
     width: int = 1280
     height: int = 720
     fps_limit: int = 15
+    #: First reconnect delay. Subsequent attempts back off exponentially up to
+    #: ``reconnect_max_delay_s``, so a camera that is off for the night stops
+    #: retrying every five seconds for eight hours.
     reconnect_delay_s: float = 5.0
+    #: Ceiling on the backoff. A camera that comes back must be picked up
+    #: within about this long, so it is minutes rather than hours.
+    reconnect_max_delay_s: float = 60.0
     queue_size: int = 2
+
+    #: Seconds without a frame before the watchdog forces a reconnect. 0
+    #: disables it.
+    #:
+    #: This is the failure that took a gate offline silently: a TCP connection
+    #: that stays open while the camera stops sending. ``VideoCapture.read()``
+    #: blocks with no timeout of its own, so the capture thread parks forever,
+    #: the process stays alive, ``/health`` keeps answering 200, and the
+    #: barrier simply never opens again. Nothing in the logs says so, because
+    #: nothing happened.
+    #:
+    #: 15 s is comfortably longer than the FFmpeg socket timeout below (which
+    #: should catch this first) and shorter than a driver arriving at a
+    #: barrier is willing to wait.
+    stall_timeout_s: float = 15.0
+
+    #: RTSP transport. ``tcp`` or ``udp``; anything else is passed through.
+    #:
+    #: FFmpeg defaults to UDP, which on a busy or wifi-bridged site drops
+    #: packets and produces torn frames and half-decoded plates -- read errors
+    #: that look like OCR errors. TCP costs a little latency and removes that
+    #: whole class of failure, which is the right trade at a gate.
+    rtsp_transport: str = "tcp"
+
+    #: Socket timeout handed to FFmpeg, in seconds. 0 leaves FFmpeg's default
+    #: (no timeout), which is what allows the indefinite block described above.
+    #: Applied to network sources only; a V4L2 device ignores it.
+    open_timeout_s: float = 5.0
+
+    @property
+    def is_network_source(self) -> bool:
+        """True for a URL rather than a local device index or path.
+
+        Only network sources get the FFmpeg options: passing them to a V4L2
+        capture is harmless but misleading, and the watchdog's forced release
+        is a different proposition on a local device (see
+        :meth:`~lpr.pipeline.camera.CameraWorker._force_release`).
+        """
+        source = (self.source or "").strip().lower()
+        return "://" in source
 
     @property
     def enabled(self) -> bool:
@@ -457,6 +503,21 @@ class RelayConfig(BaseModel):
     """
 
     enabled: bool = True
+    #: Which driver to use. ``serial`` (the default, a USB/RS-232 board),
+    #: ``gpio`` (a Raspberry Pi pin), ``modbus`` (an RTU or TCP coil),
+    #: ``http`` (a networked IP relay), or ``mock``.
+    #:
+    #: ``auto`` keeps the historical behaviour: serial when a port resolves,
+    #: mock otherwise. That fallback is convenient for a bench and dangerous on
+    #: a site -- see ``require_hardware``.
+    driver: str = "auto"
+    #: Refuse to fall back to MockRelay. With this on, a relay that cannot be
+    #: opened is a loud failure at start-up instead of a gate that logs every
+    #: plate as "granted" while no barrier moves.
+    #:
+    #: Off by default so a developer's checkout still runs, and turned on by
+    #: every real deployment. ``LPR_ENV=production`` turns it on regardless.
+    require_hardware: bool = False
     port: str = "auto"
     baud: int = 9600
     open_byte: str = "A"
@@ -477,6 +538,42 @@ class RelayConfig(BaseModel):
         if self.port == "auto":
             return default_serial_port()
         return self.port
+
+    # -- GPIO -------------------------------------------------------------
+
+    #: BCM pin number driven for a ``gpio`` relay.
+    gpio_pin: int = Field(default=17, ge=0, le=63)
+    #: True when the relay board closes on a LOW signal, which most cheap
+    #: opto-isolated boards do. Getting this backwards holds the gate open for
+    #: the life of the process instead of pulsing it, so it is explicit rather
+    #: than guessed.
+    gpio_active_low: bool = True
+
+    # -- Modbus -----------------------------------------------------------
+
+    #: ``rtu`` (serial) or ``tcp``.
+    modbus_mode: str = "tcp"
+    modbus_host: str = "192.168.1.100"
+    modbus_port: int = Field(default=502, ge=1, le=65535)
+    #: Slave/unit id on the bus.
+    modbus_unit: int = Field(default=1, ge=0, le=247)
+    #: Coil address toggled for one pulse.
+    modbus_coil: int = Field(default=0, ge=0)
+
+    # -- IP / HTTP relay ---------------------------------------------------
+
+    #: URL hit to close the contact. ``{pulse_ms}`` in the string is
+    #: substituted, which is what boards with a built-in timer want.
+    http_open_url: str = ""
+    #: URL hit to open it again. Blank means the board self-releases, which is
+    #: the normal case for a timer board -- and then ``pulse_ms`` is set on the
+    #: board, not here.
+    http_close_url: str = ""
+    http_method: str = "GET"
+    http_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    #: Optional HTTP basic auth for the board's web interface.
+    http_user: str = ""
+    http_password: str = ""
 
 
 class SmtpConfig(BaseModel):
@@ -588,7 +685,21 @@ class DatabaseConfig(BaseModel):
 
 
 class SnapshotsConfig(BaseModel):
-    """Event snapshots: one JPEG per gate decision, on a rolling window."""
+    """Event snapshots: one JPEG per gate decision, on a rolling window.
+
+    Retention has three limits and the tightest one wins. Age alone is not
+    enough: ``retention_days`` bounds *how old* the evidence gets, not how much
+    of it there is, and a busy site produces far more of it than a quiet one.
+    A gate handling a few thousand vehicles a day writes tens of gigabytes
+    inside a ten-day window.
+
+    That matters more than a full disk usually does, because of what fills up
+    with it. The snapshot directory and the SQLite database normally share a
+    volume, so the disk that snapshots fill is the disk the gate log is written
+    to -- and SQLite writes start failing. The barrier keeps working and stops
+    being able to say what it did, which is the one failure an operator cannot
+    reconstruct afterwards.
+    """
 
     enabled: bool = True
     #: Empty means ``<app.data_dir>/snapshots``. Set an absolute (or
@@ -602,6 +713,28 @@ class SnapshotsConfig(BaseModel):
     #: Frames awaiting encoding. Beyond this the writer drops rather than
     #: letting a slow disk push back on the recognition threads.
     queue_size: int = 64
+    #: Total size ceiling for the snapshot directory, in megabytes. 0 disables
+    #: it and leaves age as the only limit. Enforced oldest-first, so what
+    #: survives is always the most recent evidence -- which is what an
+    #: operator investigating an incident is looking for.
+    max_total_mb: int = Field(default=20_000, ge=0)
+    #: Keep at least this many megabytes free on the snapshot volume. 0
+    #: disables the check.
+    #:
+    #: Distinct from ``max_total_mb`` and not redundant with it: the size
+    #: ceiling bounds what *this* service writes, while the free-space floor
+    #: notices the disk filling for any other reason -- logs, a database that
+    #: grew, another service on the same volume -- and still protects the gate
+    #: log by giving back space.
+    min_free_mb: int = Field(default=2_000, ge=0)
+
+    @property
+    def max_total_bytes(self) -> int:
+        return int(self.max_total_mb) * 1024 * 1024
+
+    @property
+    def min_free_bytes(self) -> int:
+        return int(self.min_free_mb) * 1024 * 1024
 
 
 class ParkingConfig(BaseModel):

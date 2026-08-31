@@ -81,6 +81,15 @@ UpdateState = Literal["idle", "running", "restarting", "succeeded", "failed"]
 _VALID_STATES = ("idle", "running", "restarting", "succeeded", "failed")
 
 #: Steps are reported to the UI by name so a failure can say which one broke.
+#: Boots allowed while a rollback is armed before the update is reverted.
+#:
+#: 1, not 3. A boot that reaches `verify_after_restart` has already proved the
+#: interpreter, the imports and the config; if it then fails to start serving,
+#: retrying the identical image does not change the outcome, it only leaves the
+#: gate down for longer. The one attempt exists so a slow volume mount or a
+#: cold model cache is not mistaken for a broken build.
+MAX_BOOT_ATTEMPTS = 1
+
 STEP_REVISION = "revision"
 STEP_PULL = "pull"
 STEP_BUILD = "build"
@@ -167,6 +176,18 @@ class UpdateStatus:
     #: the UI can say "yeniden derlendi" rather than claiming an upgrade that
     #: did not happen, and so the restored post-restart status keeps saying it.
     forced: bool = False
+    #: Commit to return to if the new build does not come up healthy. Set
+    #: before the rebuild and cleared once the new container has proved
+    #: itself; a value here on startup means the last update is still
+    #: unverified.
+    rollback_commit: str | None = None
+    #: How many times a container has booted while the rollback was armed.
+    #: The new build gets a couple of chances -- a first boot can fail on a
+    #: cold cache or a slow volume mount -- and is then rolled back.
+    boot_attempts: int = 0
+    #: Set when a rollback was actually performed, so the UI can say what
+    #: happened rather than reporting a mysterious version change.
+    rolled_back: bool = False
     log: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -184,6 +205,9 @@ class UpdateStatus:
             "commit_before": self.commit_before,
             "commit_after": self.commit_after,
             "forced": self.forced,
+            "rollback_commit": self.rollback_commit,
+            "boot_attempts": self.boot_attempts,
+            "rolled_back": self.rolled_back,
             "log": list(self.log),
         }
 
@@ -481,6 +505,9 @@ class SystemUpdater:
                 commit_before=payload.get("commit_before"),
                 commit_after=payload.get("commit_after"),
                 forced=forced,
+                rollback_commit=payload.get("rollback_commit"),
+                boot_attempts=int(payload.get("boot_attempts") or 0),
+                rolled_back=bool(payload.get("rolled_back")),
                 log=tuple(str(line) for line in payload.get("log") or ())[-40:],
             )
         except Exception:
@@ -629,11 +656,18 @@ class SystemUpdater:
             return
 
         # Persisted *before* the rebuild: compose is about to kill this
-        # container, so this is the last chance to leave a breadcrumb.
+        # container, so this is the last chance to leave a breadcrumb -- and
+        # the breadcrumb now includes where to go back to. Arming the rollback
+        # here rather than after the build is the whole point: after the build
+        # there is no "here" left to run anything.
+        rollback_to = self.status.commit_before
         self._set(
             step=STEP_BUILD,
             state="restarting",
             detail="Yeniden derleniyor ve başlatılıyor...",
+            rollback_commit=rollback_to,
+            boot_attempts=0,
+            rolled_back=False,
         )
         self._persist()
 
@@ -646,15 +680,26 @@ class SystemUpdater:
         if build.output:
             self._append_log(build.output)
         if not build.ok:
-            self._fail(STEP_BUILD, self._explain_build_failure(build))
+            # The one failure mode we can handle synchronously: the build
+            # broke, so compose never replaced this container and this thread
+            # is still alive to undo the checkout.
+            detail = self._explain_build_failure(build)
+            if rollback_to and self._rollback_checkout(rollback_to, "derleme başarısız"):
+                detail += f" Depo {rollback_to[:7]} sürümüne geri alındı."
+            self._set(rollback_commit=None)
+            self._fail(STEP_BUILD, detail)
             return
 
         status = self.status
+        # Reaching here means compose returned without replacing this
+        # container -- an unusual but real outcome (nothing to recreate). The
+        # new build never got a chance to fail, so the rollback is disarmed.
         self._set(
             state="succeeded",
             step=STEP_BUILD,
             detail=("Yeniden derleme tamamlandı." if force else "Güncelleme tamamlandı."),
             finished_at=time.time(),
+            rollback_commit=None,
         )
         self._persist()
         logger.info(
@@ -730,6 +775,129 @@ class SystemUpdater:
             logger.info("Sistem güncellemesi: değişiklik yok (%s)", after)
             return False
 
+        return True
+
+    # -- rollback ---------------------------------------------------------
+
+    def _rollback_checkout(self, commit: str, reason: str) -> bool:
+        """``git reset --hard <commit>``. Returns whether it worked.
+
+        The checkout only. Rebuilding from it is a separate decision, because
+        the two failure modes want different things: a build that broke leaves
+        this container running and only needs the source put back, while a
+        build that *succeeded* and then would not start needs a rebuild from
+        the restored source as well.
+        """
+        if not commit:
+            return False
+        repo = self.repo_dir
+        if not (repo / ".git").exists():
+            logger.error("Geri alınamıyor: %s bir git deposu değil", repo)
+            return False
+
+        logger.warning("Geri alınıyor (%s): git reset --hard %s", reason, commit)
+        self._append_log(f"$ git reset --hard {commit}  # {reason}")
+        result = self._run(["git", "reset", "--hard", commit], repo, self.git_timeout)
+        self._append_log(result.output or "")
+        if not result.ok:
+            logger.error("Geri alma başarısız: %s", result.output)
+            return False
+        self._set(rolled_back=True)
+        return True
+
+    def verify_after_restart(self) -> str:
+        """Decide what to do about an update that has not proved itself yet.
+
+        Called once at startup, before the API begins serving. Returns one of
+        ``"clean"`` (nothing pending), ``"pending"`` (this boot is on trial),
+        ``"rolled-back"`` or ``"rollback-failed"``.
+
+        The shape of this is forced by how the update works. ``docker compose
+        up -d --build`` destroys the container running the updater, so nothing
+        can watch the result from where the update was started -- the process
+        that would do the watching is the one being replaced. The only observer
+        left is the *new* container, and the only thing it can report is that
+        it got far enough to run this code.
+
+        So: the rebuild arms a rollback and records the commit to return to.
+        Every boot while it is armed counts as an attempt. Reaching this method
+        proves the interpreter, the imports and the configuration are sound, so
+        a first attempt is left on trial and :meth:`confirm_healthy` disarms it
+        once the API is actually serving. A second boot with the rollback still
+        armed means the previous attempt never got that far -- it crashed after
+        this point, or wedged before serving -- and the build is reverted.
+
+        What this cannot cover, and no in-container mechanism can: a build that
+        fails so early the interpreter never reaches this line. That needs a
+        supervisor outside the container; the state file is written so one can
+        read it.
+        """
+        pending = self.status.rollback_commit
+        if not pending:
+            return "clean"
+
+        attempts = int(self.status.boot_attempts) + 1
+        self._set(boot_attempts=attempts)
+        self._persist()
+
+        if attempts <= MAX_BOOT_ATTEMPTS:
+            logger.warning(
+                "Güncelleme doğrulanmayı bekliyor (deneme %d/%d). Sağlıklı "
+                "başlatma onaylanana kadar %s sürümüne geri dönüş hazır.",
+                attempts,
+                MAX_BOOT_ATTEMPTS,
+                pending[:7],
+            )
+            return "pending"
+
+        logger.error(
+            "Yeni sürüm %d denemede sağlıklı başlayamadı; %s sürümüne geri alınıyor.",
+            attempts - 1,
+            pending[:7],
+        )
+        if not self._rollback_checkout(pending, "sağlık kapısı"):
+            self._set(
+                state="failed",
+                detail=(
+                    f"Yeni sürüm başlatılamadı ve otomatik geri alma da başarısız. "
+                    f"Elle geri alın: git reset --hard {pending}"
+                ),
+                rollback_commit=None,
+            )
+            self._persist()
+            return "rollback-failed"
+
+        self._set(
+            state="failed",
+            step=STEP_BUILD,
+            detail=(
+                f"Yeni sürüm sağlıklı başlayamadı; {pending[:7]} sürümüne geri "
+                "alındı. Bu sürümle yeniden derlemek için Yeniden Derle'yi kullanın."
+            ),
+            finished_at=time.time(),
+            rollback_commit=None,
+        )
+        self._persist()
+        return "rolled-back"
+
+    def confirm_healthy(self) -> bool:
+        """Disarm the rollback: this build is serving. Returns whether it was armed.
+
+        Called once the API is actually up, not merely importable. That
+        distinction is the gate: an update that breaks a route, a migration or
+        the pipeline build gets far enough to run
+        :meth:`verify_after_restart` and never reaches here, so the next boot
+        finds the rollback still armed and reverts.
+        """
+        if not self.status.rollback_commit:
+            return False
+        logger.info("Yeni sürüm sağlıklı; geri alma iptal edildi.")
+        self._set(
+            rollback_commit=None,
+            boot_attempts=0,
+            detail=self.status.detail or "Güncelleme doğrulandı.",
+        )
+        self._persist()
         return True
 
     def _compose_command(self) -> list[str]:

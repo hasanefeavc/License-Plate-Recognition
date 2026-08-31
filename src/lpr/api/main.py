@@ -295,6 +295,64 @@ def _start_nightly_update(app: FastAPI, settings: Settings) -> "asyncio.Task[Non
     )
 
 
+def _verify_update_health(app: FastAPI, phase: str) -> None:
+    """Run the OTA rollback gate. Never raises into start-up.
+
+    A failure here must not stop the service: the gate exists to recover from
+    a bad update, and a gate that itself prevents boot would be a worse
+    version of the problem it solves.
+    """
+    cfg = getattr(get_settings(), "system_update", None)
+    if not bool(getattr(cfg, "enabled", False)):
+        return
+    try:
+        updater = deps.get_system_updater_for(app)
+        if phase == "before":
+            outcome = updater.verify_after_restart()
+            if outcome == "rolled-back":
+                logger.error(
+                    "Son güncelleme geri alındı. Depo önceki sürümde; yeniden "
+                    "derleme gerekiyor."
+                )
+            elif outcome == "rollback-failed":
+                logger.error("Geri alma başarısız. Elle müdahale gerekiyor.")
+        else:
+            updater.confirm_healthy()
+    except Exception:
+        logger.exception("Güncelleme sağlık kapısı çalıştırılamadı (%s)", phase)
+
+
+def _start_nightly_backup(settings: Settings) -> "asyncio.Task[None] | None":
+    """Schedule the daily database backup.
+
+    Unconditional, unlike the update job. A site that never takes an update
+    still needs its plate list, its users and its gate log to survive a
+    corrupted file or a deleted volume -- and those are exactly the sites
+    nobody is watching, so making the backup contingent on anything would
+    leave the least-maintained deployments with no copy at all.
+
+    Runs an hour after the update check so a night that does both does not do
+    them at once: backing up a database while a rebuild is replacing the
+    container underneath it is a good way to keep a truncated copy.
+    """
+    try:
+        from lpr.db import SystemEventRepository
+        from lpr.scheduler import NightlyBackupJob, nightly_backup_loop
+
+        cfg = getattr(settings, "system_update", None)
+        hour = (int(getattr(cfg, "check_hour", 3)) + 1) % 24
+        minute = int(getattr(cfg, "check_minute", 0))
+        job = NightlyBackupJob(events=SystemEventRepository())
+    except Exception:
+        logger.exception("Gecelik yedekleme görevi kurulamadı")
+        return None
+
+    logger.info("Gecelik veritabanı yedeği %02d:%02d için planlandı", hour, minute)
+    return asyncio.create_task(
+        nightly_backup_loop(job, hour, minute), name="nightly-backup"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Start/stop everything the request handlers depend on."""
@@ -332,10 +390,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _license_watchdog(app, LICENSE_CHECK_INTERVAL_S), name="license-watchdog"
     )
     nightly = _start_nightly_update(app, settings)
+    backups = _start_nightly_backup(settings)
+
+    # The health gate for the last OTA update. `verify_after_restart` runs
+    # *before* the yield, because reaching it proves only that the interpreter
+    # and the configuration are sound; `confirm_healthy` runs after, because
+    # by then the pipeline is built and the app is about to serve. An update
+    # that breaks a route, a migration or the pipeline gets past the first and
+    # never reaches the second, and the next boot reverts it.
+    _verify_update_health(app, "before")
+    _verify_update_health(app, "after")
     try:
         yield
     finally:
-        for task in (watchdog, nightly):
+        for task in (watchdog, nightly, backups):
             if task is None:
                 continue
             task.cancel()

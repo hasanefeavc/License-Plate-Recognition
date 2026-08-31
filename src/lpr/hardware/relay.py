@@ -18,7 +18,9 @@ confirmed cannot build an unbounded backlog of gate pulses.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import queue
 import threading
 import time
@@ -294,31 +296,95 @@ def _is_serial_exception(exc: BaseException) -> bool:
     return serial_error is not None and isinstance(exc, serial_error)
 
 
-def build_relay(settings: Settings | None = None) -> Relay:
-    """Pick a relay implementation for the current configuration.
+class RelayUnavailable(RuntimeError):
+    """No real relay could be opened and falling back was refused.
 
-    Falls back to :class:`MockRelay` -- never raises -- when the relay is
-    disabled, mocked, has no resolvable port, or pyserial is missing. A
-    missing barrier must not stop the recognition pipeline from running.
+    Raised only when ``relay.require_hardware`` is on (or ``LPR_ENV=production``
+    implies it). Everything else about the relay layer is deliberately
+    forgiving, and this is the one place that is not, because the failure it
+    prevents is the worst one the system can have: a gate that logs every
+    plate as granted while no barrier moves. That looks like success in the
+    logs, in the dashboard and in the parking count, and the only evidence is
+    a driver sitting at a closed barrier.
     """
-    if settings is None:
-        from lpr.config import get_settings
 
-        settings = get_settings()
 
-    config = settings.relay
+def _requires_hardware(config: Any) -> bool:
+    """Whether a MockRelay fallback should be refused.
 
-    if not config.enabled:
-        return MockRelay("relay.enabled is false", config.pulse_ms)
-    if config.mock:
-        return MockRelay("relay.mock is true", config.pulse_ms)
+    ``LPR_ENV=production`` forces it on regardless of the flag: a production
+    deployment that forgot to set ``relay.require_hardware`` is exactly the
+    deployment that must not silently pretend to open a gate.
+    """
+    if bool(getattr(config, "require_hardware", False)):
+        return True
+    return os.environ.get("LPR_ENV", "").strip().lower() == "production"
 
+
+def _fallback(reason: str, config: Any) -> Relay:
+    """A MockRelay, plus the noise the situation deserves.
+
+    A mock relay is correct on a developer's machine and a serious fault on a
+    site. The difference is not detectable from here, so it is configuration
+    -- but the log line is loud either way, because the previous version of
+    this function fell back in silence and that is how a gate can be
+    "installed" for a week without anybody noticing it never opened.
+    """
+    if _requires_hardware(config):
+        raise RelayUnavailable(
+            f"No gate relay could be opened ({reason}) and relay.require_hardware "
+            "is on. Refusing to start with a mock relay: the pipeline would log "
+            "every vehicle as granted while the barrier never moved. Fix the "
+            "relay wiring or set relay.require_hardware to false."
+        )
+    logger.warning(
+        "GATE RELAY IS MOCKED (%s). No barrier will move; every granted plate "
+        "will be logged as though it had opened. Set relay.require_hardware to "
+        "make this a start-up failure instead.",
+        reason,
+    )
+    return MockRelay(reason, config.pulse_ms)
+
+
+def _probe_serial(port: str) -> str | None:
+    """Open and immediately close ``port``. Returns an error string, or None.
+
+    ``SerialRelay`` opens lazily -- deliberately, so a relay unplugged at boot
+    reconnects on its own rather than needing a restart. The cost is that
+    constructing it proves nothing, so ``require_hardware`` had no way to tell
+    a working board from a device path that does not exist: the constructor
+    succeeded either way and the first evidence of trouble was a pulse silently
+    skipped hours later.
+
+    This probe is what gives the guard something real to check. It runs only
+    when ``require_hardware`` is on, because on a developer's machine opening
+    the port is exactly what we do not want to require.
+    """
+    serial_mod = _import_serial()
+    if serial_mod is None:
+        return "pyserial is not installed"
+    handle = None
+    try:
+        handle = serial_mod.Serial(port, timeout=1, write_timeout=1)
+    except Exception as exc:
+        return str(exc)
+    finally:
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.close()
+    return None
+
+
+def _build_serial(config: Any) -> Relay:
     port = config.resolved_port
     if not port:
-        return MockRelay("no serial port resolved (relay.port=auto found nothing)", config.pulse_ms)
+        return _fallback("no serial port resolved (relay.port=auto found nothing)", config)
     if _import_serial() is None:
-        return MockRelay("pyserial is not installed", config.pulse_ms)
-
+        return _fallback("pyserial is not installed", config)
+    if _requires_hardware(config):
+        problem = _probe_serial(port)
+        if problem is not None:
+            return _fallback(f"serial port {port} cannot be opened: {problem}", config)
     try:
         return SerialRelay(
             port=port,
@@ -329,4 +395,95 @@ def build_relay(settings: Settings | None = None) -> Relay:
         )
     except Exception as exc:  # pragma: no cover - constructor only starts a thread
         logger.error("Could not start the serial relay on %s: %s", port, exc)
-        return MockRelay(f"serial relay failed to start: {exc}", config.pulse_ms)
+        return _fallback(f"serial relay failed to start: {exc}", config)
+
+
+def _build_gpio(config: Any) -> Relay:
+    from lpr.hardware.drivers import GpioRelay
+
+    try:
+        return GpioRelay(
+            pin=int(getattr(config, "gpio_pin", 17)),
+            active_low=bool(getattr(config, "gpio_active_low", True)),
+            pulse_ms=config.pulse_ms,
+        )
+    except Exception as exc:
+        return _fallback(f"gpio relay failed to start: {exc}", config)
+
+
+def _build_modbus(config: Any) -> Relay:
+    from lpr.hardware.drivers import ModbusRelay
+
+    try:
+        return ModbusRelay(
+            mode=str(getattr(config, "modbus_mode", "tcp")),
+            host=str(getattr(config, "modbus_host", "")),
+            port=int(getattr(config, "modbus_port", 502)),
+            unit=int(getattr(config, "modbus_unit", 1)),
+            coil=int(getattr(config, "modbus_coil", 0)),
+            baud=int(getattr(config, "baud", 9600)),
+            pulse_ms=config.pulse_ms,
+        )
+    except Exception as exc:
+        return _fallback(f"modbus relay failed to start: {exc}", config)
+
+
+def _build_http(config: Any) -> Relay:
+    from lpr.hardware.drivers import HttpRelay
+
+    try:
+        return HttpRelay(
+            open_url=str(getattr(config, "http_open_url", "")),
+            close_url=str(getattr(config, "http_close_url", "")),
+            method=str(getattr(config, "http_method", "GET")),
+            timeout_s=float(getattr(config, "http_timeout_s", 5.0)),
+            user=str(getattr(config, "http_user", "")),
+            password=str(getattr(config, "http_password", "")),
+            pulse_ms=config.pulse_ms,
+        )
+    except Exception as exc:
+        return _fallback(f"http relay failed to start: {exc}", config)
+
+
+#: driver name -> builder. ``auto`` is resolved before this is consulted.
+_BUILDERS = {
+    "serial": _build_serial,
+    "gpio": _build_gpio,
+    "modbus": _build_modbus,
+    "http": _build_http,
+}
+
+
+def build_relay(settings: Settings | None = None) -> Relay:
+    """Pick a relay implementation for the current configuration.
+
+    Falls back to :class:`MockRelay` when the relay is disabled, mocked, or
+    cannot be opened -- **unless** ``relay.require_hardware`` is on, in which
+    case it raises :class:`RelayUnavailable`. A missing barrier must not stop a
+    developer's checkout from running, and it must stop a site from running.
+    """
+    if settings is None:
+        from lpr.config import get_settings
+
+        settings = get_settings()
+
+    config = settings.relay
+
+    # Neither of these is a fault, so neither goes through _fallback: the
+    # operator asked for exactly this.
+    if not config.enabled:
+        return MockRelay("relay.enabled is false", config.pulse_ms)
+    if config.mock:
+        return MockRelay("relay.mock is true", config.pulse_ms)
+
+    driver = str(getattr(config, "driver", "auto") or "auto").strip().lower()
+    if driver == "mock":
+        return MockRelay("relay.driver is mock", config.pulse_ms)
+    if driver == "auto":
+        # Historical behaviour: serial when a port resolves, mock otherwise.
+        driver = "serial"
+
+    builder = _BUILDERS.get(driver)
+    if builder is None:
+        return _fallback(f"unknown relay.driver {driver!r}", config)
+    return builder(config)

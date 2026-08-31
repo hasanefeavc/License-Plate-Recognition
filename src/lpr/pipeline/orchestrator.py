@@ -35,6 +35,7 @@ recognition.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import queue
 import threading
@@ -83,6 +84,15 @@ SUBSCRIBER_QUEUE_SIZE = 256
 
 #: How often the retention thread wakes up (24h).
 RETENTION_INTERVAL_S = 24 * 60 * 60
+
+#: How often the snapshot size / free-space limits are checked.
+#:
+#: Far shorter than the daily age-based pass, because the two answer different
+#: questions. Age is a policy and a day's granularity is fine for it. Disk
+#: pressure is an emergency: a busy site can fill a volume between two daily
+#: passes, and when it does, SQLite writes start failing and the gate stops
+#: being able to record what it did.
+DISK_CHECK_INTERVAL_S = 5 * 60
 
 #: How long a processing thread blocks waiting for a frame before looping
 #: round to re-check the stop flag.
@@ -256,6 +266,11 @@ class PipelineOrchestrator:
             queue_size=snapshots.queue_size,
             retention_days=snapshots.retention_days,
             enabled=snapshots.enabled,
+            # getattr: an older config.yaml without the pressure keys keeps the
+            # previous age-only behaviour rather than failing to start.
+            max_total_bytes=int(getattr(snapshots, "max_total_bytes", 0)),
+            min_free_bytes=int(getattr(snapshots, "min_free_bytes", 0)),
+            on_pressure=self._on_disk_pressure,
         )
 
         self._cameras: dict[str, CameraWorker] = {}
@@ -1095,23 +1110,60 @@ class PipelineOrchestrator:
             getattr(getattr(self._settings, "system_update", None), "event_retention_days", 0)
         )
         try:
+            next_age_pass = 0.0
             while True:
+                now = time.monotonic()
+                if now >= next_age_pass:
+                    next_age_pass = now + RETENTION_INTERVAL_S
+                    try:
+                        self._logs.purge_older_than(days)
+                    except Exception:
+                        logger.exception("Log retention pass failed")
+                    try:
+                        self._snapshots.purge_older_than()
+                    except Exception:
+                        logger.exception("Snapshot retention pass failed")
+                    try:
+                        self._system_events.purge_older_than(event_days)
+                    except Exception:
+                        logger.exception("System event retention pass failed")
+
+                # Every tick, not once a day: see DISK_CHECK_INTERVAL_S.
                 try:
-                    self._logs.purge_older_than(days)
+                    self._snapshots.enforce_limits()
                 except Exception:
-                    logger.exception("Log retention pass failed")
-                try:
-                    self._snapshots.purge_older_than()
-                except Exception:
-                    logger.exception("Snapshot retention pass failed")
-                try:
-                    self._system_events.purge_older_than(event_days)
-                except Exception:
-                    logger.exception("System event retention pass failed")
-                if self._stop_event.wait(RETENTION_INTERVAL_S):
+                    logger.exception("Snapshot disk-pressure pass failed")
+
+                if self._stop_event.wait(DISK_CHECK_INTERVAL_S):
                     break
         finally:
             close_thread_connection()
+
+    def _on_disk_pressure(self, source: str, detail: dict[str, Any]) -> None:
+        """Record a disk-pressure deletion as a system event and an alert.
+
+        Called from the retention thread when a size or free-space limit
+        forced snapshots to be deleted early. Worth escalating rather than
+        logging: evidence being dropped before its retention window is up
+        means the site is under-provisioned, and the operator only finds out
+        when they go looking for an image that is not there.
+        """
+        try:
+            reclaimed_mb = int(detail.get("reclaimed_bytes", 0)) / 1024 / 1024
+            free = detail.get("free_bytes")
+            free_mb = "bilinmiyor" if free is None else f"{int(free) / 1024 / 1024:.0f} MB"
+            message = (
+                f"Disk baskisi: {detail.get('deleted', 0)} anlık görüntü silindi "
+                f"({reclaimed_mb:.0f} MB), boş alan {free_mb}"
+            )
+            self._system_events.write(
+                source=source,
+                message=message,
+                level="warning",
+                detail=json.dumps(detail, ensure_ascii=False),
+            )
+        except Exception:
+            logger.debug("Disk-pressure system event could not be written", exc_info=True)
 
     # ------------------------------------------------------------------
 

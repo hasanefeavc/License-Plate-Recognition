@@ -31,14 +31,19 @@ OpenCV to be installed.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import queue
+import random
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from lpr.contracts import CameraStatus, Frame
+from lpr.masking import mask_text, mask_url
 from lpr.platform_compat import default_camera_backend
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -46,8 +51,61 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+#: OpenCV reads FFmpeg private options from here, and only at capture
+#: construction. There is no API for them.
+_FFMPEG_OPTIONS_ENV = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+
 #: How many recent frame intervals feed the rolling FPS estimate.
 _FPS_WINDOW = 30
+
+#: Multiplier and cap for the reconnect backoff, plus how much jitter to add.
+#:
+#: Jitter matters on a site with several cameras behind one NVR: without it,
+#: every worker that lost the stream at the same moment retries at the same
+#: moment, and the NVR gets a synchronised burst each cycle instead of a
+#: trickle. +/-20% is enough to spread them.
+_BACKOFF_FACTOR = 2.0
+_BACKOFF_JITTER = 0.2
+
+#: How often the watchdog wakes to check for a stalled stream.
+_WATCHDOG_TICK_S = 1.0
+
+
+def ffmpeg_capture_options(config: CameraConfig) -> str | None:
+    """The ``OPENCV_FFMPEG_CAPTURE_OPTIONS`` value for this camera, or None.
+
+    OpenCV gives no API for FFmpeg's private options; the only way in is this
+    environment variable, read by the FFMPEG backend when a capture is opened.
+    Format is ``key;value|key;value``.
+
+    Two options, both of which exist to stop a failure that has no other cure:
+
+    ``rtsp_transport;tcp``
+        FFmpeg defaults to UDP. On a congested or wifi-bridged link that means
+        dropped packets, torn frames, and plates that read as OCR errors when
+        they are really decode errors.
+
+    ``stimeout;<microseconds>``
+        FFmpeg's socket read timeout. Without it a connection that stays open
+        while the camera stops sending parks ``VideoCapture.read()`` forever,
+        the capture thread never returns, and the gate goes quietly blind with
+        a process that still answers its healthcheck. This is the single most
+        important line in the module.
+
+    Returns ``None`` for a local device, where neither option applies.
+    """
+    if not config.is_network_source:
+        return None
+    options: list[str] = []
+    transport = (getattr(config, "rtsp_transport", "") or "").strip().lower()
+    if transport:
+        options.append(f"rtsp_transport;{transport}")
+    timeout_s = float(getattr(config, "open_timeout_s", 0.0) or 0.0)
+    if timeout_s > 0:
+        # FFmpeg wants microseconds. Newer builds renamed this to `timeout`
+        # and kept `stimeout` as an alias for RTSP, which is what we use.
+        options.append(f"stimeout;{int(timeout_s * 1_000_000)}")
+    return "|".join(options) if options else None
 
 # --- motion gating ---------------------------------------------------------
 
@@ -271,10 +329,31 @@ class CameraWorker(threading.Thread):
         self._latest: Frame | None = None
         self._intervals: deque[float] = deque(maxlen=_FPS_WINDOW)
         self._last_monotonic: float | None = None
-        self._status = CameraStatus(role=self.role, source=str(config.source))
+        # Masked at construction, so every consumer of CameraStatus -- the API
+        # response, the dashboard, the GUI, a support log bundle -- gets the
+        # redacted form for free. Masking at each display site instead would
+        # mean remembering to do it at each display site.
+        self._safe_source = mask_url(config.source)
+        self._status = CameraStatus(role=self.role, source=self._safe_source)
 
         self._min_interval = 1.0 / config.fps_limit if config.fps_limit > 0 else 0.0
         self._reconnect_delay = max(0.1, float(config.reconnect_delay_s))
+        self._reconnect_max_delay = max(
+            self._reconnect_delay, float(getattr(config, "reconnect_max_delay_s", 60.0))
+        )
+        #: Current backoff, reset to `reconnect_delay` on every good frame.
+        self._backoff = self._reconnect_delay
+
+        self._stall_timeout = max(0.0, float(getattr(config, "stall_timeout_s", 0.0)))
+        self._watchdog: threading.Thread | None = None
+        #: Guards `_capture` against the watchdog and the read loop touching it
+        #: at once. Never held across a blocking read -- see `_force_release`.
+        self._capture_lock = threading.Lock()
+        #: Bumped whenever the capture handle is replaced or force-released, so
+        #: the read loop can tell "my read failed" from "the watchdog pulled
+        #: the handle out from under me" without inspecting the handle itself.
+        self._capture_generation = 0
+        self.stalls = 0
 
         if self._source is None:
             self._status.last_error = "no source configured"
@@ -347,42 +426,167 @@ class CameraWorker(threading.Thread):
             logger.info("Camera %s has no source configured; not capturing", self.role)
             return
 
-        logger.info("Camera %s starting on source %r", self.role, self._source)
+        logger.info("Camera %s starting on source %r", self.role, self._safe_source)
+        self._start_watchdog()
+        try:
+            self._capture_loop()
+        finally:
+            self._release()
+            logger.info("Camera %s stopped", self.role)
+
+    def _capture_loop(self) -> None:
         while not self._stop_event.is_set():
-            capture = self._capture
+            with self._capture_lock:
+                capture = self._capture
+                generation = self._capture_generation
+
             if capture is None:
                 capture = self._open()
                 if capture is None:
-                    if self._stop_event.wait(self._reconnect_delay):
+                    if self._sleep_backoff():
                         break
                     continue
+                with self._capture_lock:
+                    generation = self._capture_generation
 
             frame_start = time.monotonic()
             try:
                 ok, frame = capture.read()
             except Exception as exc:
-                self._record_error(f"read failed: {exc}")
+                # A read that raises after the watchdog released the handle is
+                # the watchdog working, not a new fault, and must not be logged
+                # as one -- the stall has already been reported.
+                if not self._generation_changed(generation):
+                    self._record_error(f"read failed: {exc}")
                 self._release()
-                if self._stop_event.wait(self._reconnect_delay):
+                if self._sleep_backoff():
                     break
                 continue
 
             if not ok or frame is None:
-                self._record_error("capture returned no frame")
+                if not self._generation_changed(generation):
+                    self._record_error("capture returned no frame")
                 self._release()
-                if self._stop_event.wait(self._reconnect_delay):
+                if self._sleep_backoff():
                     break
                 continue
 
             self._publish(frame)
+            # A delivered frame is the only evidence the link is healthy, so
+            # it is the only thing that resets the backoff. Resetting on a
+            # successful *open* instead would defeat the whole mechanism
+            # against a camera that accepts connections and sends nothing.
+            self._backoff = self._reconnect_delay
 
             if self._min_interval > 0.0:
                 spare = self._min_interval - (time.monotonic() - frame_start)
                 if spare > 0 and self._stop_event.wait(spare):
                     break
 
-        self._release()
-        logger.info("Camera %s stopped", self.role)
+    # -- reconnect pacing --------------------------------------------------
+
+    def _sleep_backoff(self) -> bool:
+        """Wait out the current backoff, then grow it. True if asked to stop.
+
+        Exponential with jitter. The exponential half stops a camera that is
+        off for the night from retrying every five seconds for eight hours;
+        the jitter stops every camera behind one NVR from retrying in the same
+        instant and hammering it in synchronised bursts.
+        """
+        delay = min(self._backoff, self._reconnect_max_delay)
+        spread = delay * _BACKOFF_JITTER
+        delay = max(0.1, delay + random.uniform(-spread, spread))
+
+        if delay > self._reconnect_delay * 1.5:
+            logger.info(
+                "Camera %s reconnecting in %.1fs (backed off)", self.role, delay
+            )
+        stopping = self._stop_event.wait(delay)
+        self._backoff = min(self._backoff * _BACKOFF_FACTOR, self._reconnect_max_delay)
+        return stopping
+
+    def _generation_changed(self, generation: int) -> bool:
+        with self._capture_lock:
+            return self._capture_generation != generation
+
+    # -- stall watchdog ----------------------------------------------------
+
+    def _start_watchdog(self) -> None:
+        if self._stall_timeout <= 0:
+            logger.debug("Camera %s: stall watchdog disabled", self.role)
+            return
+        self._watchdog = threading.Thread(
+            target=self._watchdog_loop, name=f"camera-watchdog-{self.role}", daemon=True
+        )
+        self._watchdog.start()
+
+    def _watchdog_loop(self) -> None:
+        """Force a reconnect when frames stop arriving.
+
+        This has to be a separate thread, and that is the whole point. The
+        capture thread is *inside* a blocking ``read()`` when a stream stalls;
+        it cannot time itself out, so nothing it could check would ever run.
+
+        ``stimeout`` (see :func:`ffmpeg_capture_options`) should catch a
+        stalled RTSP socket first and make this a no-op. This exists for the
+        cases it does not cover: a camera that keeps the socket alive while
+        sending nothing, a non-FFmpeg backend, or a USB device whose driver
+        wedges.
+        """
+        # A stream that has never delivered a frame is not stalled, it is
+        # connecting; the reconnect loop already owns that case. The watchdog
+        # only arms once there has been at least one frame to be late relative
+        # to, which is why `last_frame_ts == 0` is skipped rather than treated
+        # as "stalled since the epoch".
+        while not self._stop_event.wait(_WATCHDOG_TICK_S):
+            with self._lock:
+                last = self._status.last_frame_ts
+                connected = self._status.connected
+            if not connected or last <= 0:
+                continue
+            idle = time.time() - last
+            if idle < self._stall_timeout:
+                continue
+
+            self.stalls += 1
+            self._record_error(
+                f"no frame for {idle:.1f}s; forcing reconnect (stall #{self.stalls})"
+            )
+            logger.warning(
+                "Camera %s stalled: no frame for %.1fs on %s. Forcing a reconnect.",
+                self.role,
+                idle,
+                self._safe_source,
+            )
+            self._force_release()
+
+    def _force_release(self) -> None:
+        """Release the capture from the watchdog thread, unblocking the reader.
+
+        ``VideoCapture.release()`` while another thread sits in ``read()`` is
+        not something OpenCV documents as safe, and it is done here anyway,
+        deliberately. The alternative is a capture thread parked forever on a
+        dead stream, which is a gate that never opens again -- the failure this
+        whole mechanism exists to end. A small risk of an ugly teardown beats a
+        certainty of a silently blind barrier.
+
+        The handle reference is cleared *before* the release and the generation
+        bumped, so the read loop can never come back to an object that has been
+        freed underneath it: it sees a changed generation, discards what it
+        holds and reopens.
+        """
+        with self._capture_lock:
+            capture = self._capture
+            self._capture = None
+            self._capture_generation += 1
+        if capture is None:
+            return
+        try:
+            capture.release()
+        except Exception:  # pragma: no cover - releasing a wedged handle
+            logger.debug("Camera %s: forced release raised", self.role, exc_info=True)
+        with self._lock:
+            self._status.connected = False
 
     # -- internals ---------------------------------------------------------
 
@@ -402,14 +606,15 @@ class CameraWorker(threading.Thread):
             backend = 0
 
         try:
-            capture = (
-                cv2.VideoCapture(self._source, backend)
-                if isinstance(self._source, int)
-                else cv2.VideoCapture(self._source)
-            )
+            with self._ffmpeg_options():
+                capture = (
+                    cv2.VideoCapture(self._source, backend)
+                    if isinstance(self._source, int)
+                    else cv2.VideoCapture(self._source)
+                )
             if not capture.isOpened():
                 capture.release()
-                self._record_error(f"could not open source {self._source!r}")
+                self._record_error(f"could not open source {self._safe_source!r}")
                 return None
 
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._config.width)
@@ -421,15 +626,47 @@ class CameraWorker(threading.Thread):
             except Exception:  # pragma: no cover - backend without the property
                 pass
         except Exception as exc:
-            self._record_error(f"open failed: {exc}")
+            self._record_error(f"open failed: {mask_text(exc)}")
             return None
 
-        self._capture = capture
+        with self._capture_lock:
+            self._capture = capture
+            self._capture_generation += 1
         with self._lock:
             self._status.connected = True
             self._status.last_error = None
-        logger.info("Camera %s connected to %r", self.role, self._source)
+            # Treat the open as the first liveness tick. Without this the
+            # watchdog would compare against the *previous* connection's
+            # timestamp and fire immediately on every reconnect.
+            self._status.last_frame_ts = time.time()
+        logger.info("Camera %s connected to %s", self.role, self._safe_source)
         return capture
+
+    @contextlib.contextmanager
+    def _ffmpeg_options(self) -> Iterator[None]:
+        """Set ``OPENCV_FFMPEG_CAPTURE_OPTIONS`` for the duration of one open.
+
+        The variable is read by the FFMPEG backend when the capture is
+        constructed, and it is process-global -- so it is set immediately
+        around the constructor and restored afterwards rather than exported
+        once at startup. Two cameras with different transports would otherwise
+        race, and every unrelated FFmpeg user in the process would inherit
+        these options.
+        """
+        options = ffmpeg_capture_options(self._config)
+        if options is None:
+            yield
+            return
+        previous = os.environ.get(_FFMPEG_OPTIONS_ENV)
+        os.environ[_FFMPEG_OPTIONS_ENV] = options
+        logger.debug("Camera %s: %s=%s", self.role, _FFMPEG_OPTIONS_ENV, options)
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(_FFMPEG_OPTIONS_ENV, None)
+            else:
+                os.environ[_FFMPEG_OPTIONS_ENV] = previous
 
     def _publish(self, frame: Frame) -> None:
         """Record a captured frame, and queue it if it is worth processing.
@@ -483,14 +720,32 @@ class CameraWorker(threading.Thread):
                 self._status.frames_dropped += dropped
 
     def _record_error(self, message: str) -> None:
+        """Record a fault on the status object and log it, credentials removed.
+
+        Masking happens here rather than at each call site because this is the
+        only way a message reaches ``CameraStatus.last_error``, which the API
+        serialises straight into its camera-status response. One choke point
+        is a rule; a rule at every call site is a habit, and habits are what
+        put a password in a support log in the first place.
+        """
+        safe = mask_text(message)
         with self._lock:
             self._status.connected = False
-            self._status.last_error = message
+            self._status.last_error = safe
             self._status.fps = 0.0
-        logger.warning("Camera %s: %s", self.role, message)
+        logger.warning("Camera %s: %s", self.role, safe)
 
     def _release(self) -> None:
-        capture, self._capture = self._capture, None
+        """Close the capture and reset the motion background. Idempotent.
+
+        Takes ``_capture_lock`` and bumps the generation for the same reason
+        :meth:`_force_release` does: the watchdog may be releasing the same
+        handle at the same instant, and exactly one of them must win.
+        """
+        with self._capture_lock:
+            capture = self._capture
+            self._capture = None
+            self._capture_generation += 1
         with self._lock:
             self._status.connected = False
         if self._motion is not None:

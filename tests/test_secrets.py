@@ -146,6 +146,23 @@ def _tracked_files() -> list[str]:
 #: still match, which is what an exempted file would otherwise stop proving.
 SCANNER_SELF = "tests/test_secrets.py"
 
+#: Files that legitimately contain credential-shaped URLs, because testing
+#: credential *handling* requires a credential to hand.
+#:
+#: The exemption is deliberately narrow in two ways. It covers only the
+#: "private key in a URL" pattern -- a heuristic, matching any
+#: ``user:pass@host`` -- and not the vendor-prefix patterns, which are
+#: self-identifying and have no legitimate reason to appear anywhere. And it
+#: names individual files rather than a ``tests/`` glob, so a real key pasted
+#: into a new test is still caught.
+URL_CREDENTIAL_EXEMPT = frozenset(
+    {
+        "src/lpr/masking.py",  # documents the shape it redacts
+        "tests/test_camera.py",  # RTSP masking
+        "tests/test_relay.py",  # IP-relay URL masking
+    }
+)
+
 
 def _read_text(name: str) -> str:
     """Tracked file as text, or "" when it is binary or unreadable."""
@@ -325,6 +342,8 @@ def test_no_tracked_file_carries_a_vendor_api_token() -> None:
             continue
         text = _read_text(name)
         for label, pattern in API_TOKEN_RES:
+            if label == "private key in a URL" and name in URL_CREDENTIAL_EXEMPT:
+                continue
             if pattern.search(text):
                 offenders.append(f"{name} ({label})")
     assert not offenders, f"credential-shaped strings in tracked files: {offenders}"
@@ -478,3 +497,32 @@ def test_git_history_holds_no_key_material() -> None:
         + ", ".join(offenders)
         + " -- rewrite history with git filter-repo"
     )
+
+
+def test_the_url_exemption_does_not_cover_vendor_tokens() -> None:
+    """The narrow half of the exemption, asserted rather than assumed.
+
+    A file that is allowed to contain `user:pass@host` is not allowed to
+    contain an AWS key. Those prefixes are self-identifying and have no
+    legitimate reason to appear in a test fixture.
+    """
+    for name in URL_CREDENTIAL_EXEMPT:
+        text = _read_text(name)
+        for label, pattern in API_TOKEN_RES:
+            if label == "private key in a URL":
+                continue
+            assert not pattern.search(text), f"{name} carries a {label}"
+
+
+def test_the_exemption_names_files_rather_than_a_directory() -> None:
+    """A `tests/` glob would let a real key into any new test file."""
+    for name in URL_CREDENTIAL_EXEMPT:
+        assert name.endswith(".py")
+        assert "*" not in name
+
+
+def test_exempt_files_are_still_scanned_for_private_keys() -> None:
+    """The exemption covers one pattern, not the file."""
+    for name in URL_CREDENTIAL_EXEMPT:
+        text = _read_text(name)
+        assert not any(marker in text for marker in PRIVATE_KEY_MARKERS)

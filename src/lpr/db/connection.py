@@ -261,15 +261,28 @@ def init_db(force: bool = False) -> None:
         if path in _initialised and not force:
             return
 
-        with transaction() as tx:
-            for statement in schema.ALL_DDL:
-                tx.execute(statement)
-            _add_missing_columns(tx, "plates", schema.PLATES_ADDED_COLUMNS)
-            _add_missing_columns(tx, "users", schema.USERS_ADDED_COLUMNS)
-            tx.execute(
-                schema.UPSERT_SCHEMA_META,
-                (schema.SCHEMA_VERSION_KEY, str(schema.SCHEMA_VERSION)),
-            )
+        # A schema change is the one operation here that cannot be undone --
+        # SQLite has no downgrade path, so restoring the file is the *only*
+        # rollback. The copy is taken synchronously, before any DDL runs, and
+        # only when the stored version is behind the code's.
+        safety = _backup_before_upgrade(path)
+
+        try:
+            with transaction() as tx:
+                for statement in schema.ALL_DDL:
+                    tx.execute(statement)
+                _add_missing_columns(tx, "plates", schema.PLATES_ADDED_COLUMNS)
+                _add_missing_columns(tx, "users", schema.USERS_ADDED_COLUMNS)
+                tx.execute(
+                    schema.UPSERT_SCHEMA_META,
+                    (schema.SCHEMA_VERSION_KEY, str(schema.SCHEMA_VERSION)),
+                )
+        except Exception:
+            logger.exception("Schema upgrade failed at %s", path)
+            if safety is not None:
+                _rollback_upgrade(safety)
+            raise
+
         _initialised.add(path)
         logger.info("Database ready at %s (schema v%d)", path, schema.SCHEMA_VERSION)
 
@@ -277,6 +290,130 @@ def init_db(force: bool = False) -> None:
         # Windows nicety carried over from the legacy app; a documented
         # no-op everywhere else. All OS branching lives in platform_compat.
         hide_file(path)
+
+
+def stored_schema_version(conn: Any = None) -> int:
+    """Schema version recorded in the database, or 0 when there is none.
+
+    0 covers both a fresh file and one written before ``schema_meta`` existed.
+    Neither needs a pre-upgrade backup -- there is nothing in the first, and
+    the second predates every table this code knows how to break.
+    """
+    try:
+        connection = conn if conn is not None else get_connection()
+        row = connection.execute(
+            schema.SELECT_SCHEMA_META, (schema.SCHEMA_VERSION_KEY,)
+        ).fetchone()
+    except Exception:
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _backup_before_upgrade(path: str) -> Any:
+    """Copy the database before DDL runs, when a real upgrade is about to happen.
+
+    Returns the backup path, or ``None`` when no backup was taken -- which is
+    the normal case: an in-memory database, a fresh file, or a process that has
+    simply restarted against a database already at the current version. Taking
+    a copy on every start would be a needless megabyte per restart and would
+    push the genuinely valuable pre-upgrade copies out of any rolling window.
+
+    A failed backup **stops the upgrade**. Proceeding without one would trade a
+    recoverable situation for an unrecoverable one, and a gate that will not
+    start is a service call, while a database migrated past the point of return
+    with no copy is a lost site.
+    """
+    if path == MEMORY:
+        return None
+
+    current = stored_schema_version()
+    if current == 0:
+        logger.debug("No stored schema version at %s; nothing to preserve", path)
+        return None
+    if current >= schema.SCHEMA_VERSION:
+        return None
+
+    logger.warning(
+        "Schema upgrade v%d -> v%d at %s; taking a backup first",
+        current,
+        schema.SCHEMA_VERSION,
+        path,
+    )
+    from lpr.db.backup import backup_before_migration
+
+    result = backup_before_migration()
+    if not result.ok:
+        raise RuntimeError(
+            f"Refusing to upgrade the schema from v{current} to "
+            f"v{schema.SCHEMA_VERSION}: the pre-upgrade backup failed "
+            f"({result.error}). SQLite has no downgrade path, so without a copy "
+            "this migration could not be undone. Fix the backup location "
+            "(disk space, permissions) and restart."
+        )
+    return result.path
+
+
+def _close_connections_for_restore() -> None:
+    """Close every connection without touching ``_init_lock``.
+
+    Deliberately not :func:`shutdown`, which takes ``_init_lock`` at the end.
+    The rollback path runs *inside* that lock and it is a plain
+    ``threading.Lock``, so calling shutdown from there would deadlock the
+    process during a failed migration -- turning a recoverable database into a
+    hung service.
+
+    The connections have to go before the file is replaced: a handle open on a
+    database that is swapped underneath it keeps reading the old inode on
+    POSIX, and on Windows blocks the replacement outright.
+    """
+    global _memory_keepalive
+
+    _discard_local()
+    with _registry_lock:
+        stragglers = list(_connections.items())
+        _connections.clear()
+    for ident, conn in stragglers:
+        try:
+            conn.close()
+        except sqlite3.Error as exc:
+            logger.debug("Could not close connection from thread %s: %s", ident, exc)
+
+    if _memory_keepalive is not None:
+        try:
+            _memory_keepalive.close()
+        except sqlite3.Error:  # pragma: no cover - defensive
+            pass
+        _memory_keepalive = None
+
+
+def _rollback_upgrade(backup: Any) -> None:
+    """Restore the pre-upgrade copy after a failed migration. Never raises.
+
+    Best effort by necessity: the upgrade has already raised, and this runs on
+    the way out. If the restore also fails there is nothing further to try
+    automatically, so it says loudly where the copy is and leaves it to a
+    human -- an automated second guess at that point risks the backup too.
+    """
+    from lpr.db.backup import restore
+
+    logger.error("Rolling back the failed schema upgrade from %s", backup)
+    try:
+        _close_connections_for_restore()
+        if restore(backup):
+            logger.warning("Database rolled back to the pre-upgrade copy")
+            return
+    except Exception:
+        logger.exception("Automatic rollback raised")
+    logger.error(
+        "AUTOMATIC ROLLBACK FAILED. The pre-upgrade database is intact at %s -- "
+        "stop the service and restore it by hand before starting again.",
+        backup,
+    )
 
 
 def _add_missing_columns(tx: Any, table: str, columns: tuple[tuple[str, str], ...]) -> None:

@@ -13,6 +13,7 @@ command, and that the commands are argument lists rather than shell strings.
 from __future__ import annotations
 
 import json
+import time
 import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -953,3 +954,159 @@ def test_an_ordinary_build_failure_is_still_an_ordinary_build_failure(
     status = run_to_completion(build(tmp_settings, repo, runner))
 
     assert "docker compose başarısız" in status.detail
+
+
+# ---------------------------------------------------------------------------
+# Rollback and the health gate
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_build_rolls_the_checkout_back(tmp_settings: Any, repo: Path) -> None:
+    """The one failure that can be handled synchronously.
+
+    The build broke, so compose never replaced this container and this thread
+    is still alive to undo the checkout. Leaving the repo on the new commit
+    would mean the next restart -- or the next forced rebuild -- retried the
+    same broken code.
+    """
+    runner = AdvancingRunner(responses={"up -d --build": fail(1, "no space left on device")})
+    updater = build(tmp_settings, repo, runner)
+
+    updater.start()
+    _wait_for_idle(updater)
+
+    assert runner.ran("git reset --hard aaaaaaa"), "the checkout was not restored"
+    assert updater.status.state == "failed"
+    assert "geri alındı" in updater.status.detail
+    assert updater.status.rollback_commit is None, "the rollback was consumed"
+
+
+def test_a_rollback_that_itself_fails_is_reported(tmp_settings: Any, repo: Path) -> None:
+    runner = AdvancingRunner(
+        responses={
+            "up -d --build": fail(1, "build error"),
+            "reset --hard": fail(1, "index.lock exists"),
+        }
+    )
+    updater = build(tmp_settings, repo, runner)
+
+    updater.start()
+    _wait_for_idle(updater)
+
+    assert updater.status.state == "failed"
+    assert "geri alındı" not in updater.status.detail, "it must not claim a rollback"
+
+
+def test_the_rebuild_arms_a_rollback_before_it_starts(tmp_settings: Any, repo: Path) -> None:
+    """Arming after the build would be too late -- compose destroys the
+    container that would do the arming."""
+    state_file = repo / "last_update.json"
+    seen: dict[str, Any] = {}
+
+    class Watcher(AdvancingRunner):
+        def __call__(self, command, cwd, timeout, env=None):  # type: ignore[no-untyped-def]
+            if "up -d --build" in " ".join(command):
+                seen.update(json.loads(state_file.read_text()))
+            return super().__call__(command, cwd, timeout, env)
+
+    updater = build(tmp_settings, repo, Watcher())
+    updater.start()
+    _wait_for_idle(updater)
+
+    assert seen.get("rollback_commit") == "aaaaaaa"
+    assert seen.get("state") == "restarting"
+
+
+def test_a_clean_start_has_nothing_to_verify(tmp_settings: Any, repo: Path) -> None:
+    updater = build(tmp_settings, repo, ScriptedRunner())
+    assert updater.verify_after_restart() == "clean"
+
+
+def test_the_first_boot_after_an_update_is_on_trial(tmp_settings: Any, repo: Path) -> None:
+    """Reaching the gate proves the interpreter and the config are sound.
+
+    It does not prove the API serves, so the rollback stays armed until
+    `confirm_healthy` says otherwise.
+    """
+    (repo / "last_update.json").write_text(
+        json.dumps({"state": "restarting", "rollback_commit": "aaaaaaa", "boot_attempts": 0}),
+        encoding="utf-8",
+    )
+    updater = build(tmp_settings, repo, ScriptedRunner())
+
+    assert updater.verify_after_restart() == "pending"
+    assert updater.status.boot_attempts == 1
+    assert updater.status.rollback_commit == "aaaaaaa", "still armed"
+
+
+def test_confirming_health_disarms_the_rollback(tmp_settings: Any, repo: Path) -> None:
+    (repo / "last_update.json").write_text(
+        json.dumps({"state": "restarting", "rollback_commit": "aaaaaaa", "boot_attempts": 0}),
+        encoding="utf-8",
+    )
+    updater = build(tmp_settings, repo, ScriptedRunner())
+    updater.verify_after_restart()
+
+    assert updater.confirm_healthy() is True
+    assert updater.status.rollback_commit is None
+    assert updater.status.boot_attempts == 0
+
+    stored = json.loads((repo / "last_update.json").read_text())
+    assert stored["rollback_commit"] is None, "the disarm was persisted"
+
+
+def test_a_second_boot_with_the_rollback_still_armed_reverts(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The core of the health gate.
+
+    A first boot got far enough to run the gate and then never reached
+    `confirm_healthy` -- it crashed afterwards, or wedged before serving.
+    Retrying the identical image would only keep the gate down longer.
+    """
+    (repo / "last_update.json").write_text(
+        json.dumps({"state": "restarting", "rollback_commit": "aaaaaaa", "boot_attempts": 1}),
+        encoding="utf-8",
+    )
+    runner = ScriptedRunner()
+    updater = build(tmp_settings, repo, runner)
+
+    assert updater.verify_after_restart() == "rolled-back"
+    assert runner.ran("git reset --hard aaaaaaa")
+    assert updater.status.state == "failed"
+    assert updater.status.rolled_back is True
+    assert updater.status.rollback_commit is None
+
+
+def test_a_failed_automatic_rollback_says_what_to_do_by_hand(
+    tmp_settings: Any, repo: Path
+) -> None:
+    (repo / "last_update.json").write_text(
+        json.dumps({"state": "restarting", "rollback_commit": "aaaaaaa", "boot_attempts": 1}),
+        encoding="utf-8",
+    )
+    updater = build(
+        tmp_settings, repo, ScriptedRunner({"reset --hard": fail(1, "permission denied")})
+    )
+
+    assert updater.verify_after_restart() == "rollback-failed"
+    assert "git reset --hard aaaaaaa" in updater.status.detail
+
+
+def test_confirm_healthy_is_a_no_op_when_nothing_is_armed(
+    tmp_settings: Any, repo: Path
+) -> None:
+    updater = build(tmp_settings, repo, ScriptedRunner())
+    assert updater.confirm_healthy() is False
+
+
+def test_rollback_is_refused_outside_a_git_checkout(tmp_settings: Any, tmp_path: Path) -> None:
+    """A rebuild-only deployment has no checkout to reset."""
+    updater = build(tmp_settings, tmp_path, ScriptedRunner())
+    assert updater._rollback_checkout("aaaaaaa", "test") is False
+
+
+def _wait_for_idle(updater: SystemUpdater, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while updater.status.running and time.monotonic() < deadline:
+        time.sleep(0.02)
