@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from lpr.ocr.normalize import (
+    CASE_HINTS,
     CONFUSION_MAP,
     TURKISH_LETTERS,
     coerce_positional,
@@ -138,6 +139,10 @@ def test_strip_noise_folds_turkish_diacritics() -> None:
         # letter misread as a digit, inside the tail
         ("34ABCB2", "34ABC82"),
         ("34ABIZ12", "34ABI212"),
+        # E/3, the mirror-image pair: E in a digit slot, 3 in a letter slot
+        ("34ABC1E", "34ABC13"),
+        ("3EABC12", "33ABC12"),
+        ("06E1234", "06E1234"),
     ],
 )
 def test_confusion_map_recovery(raw: str, expected: str) -> None:
@@ -152,9 +157,85 @@ def test_confusion_map_is_bidirectional() -> None:
         assert len(source) == 1 and len(target) == 1
         assert source.isdigit() != target.isdigit()
     # the canonical pairs both ways round
-    for digit, letter in [("0", "O"), ("1", "I"), ("2", "Z"), ("8", "B"), ("5", "S")]:
+    for digit, letter in [
+        ("0", "O"),
+        ("1", "I"),
+        ("2", "Z"),
+        ("3", "E"),
+        ("8", "B"),
+        ("5", "S"),
+    ]:
         assert CONFUSION_MAP[digit] == letter
         assert CONFUSION_MAP[letter] == digit
+
+
+@pytest.mark.parametrize(
+    ("read", "expected"),
+    [
+        ("O", "0"),
+        ("D", "0"),
+        ("Q", "0"),
+        ("I", "1"),
+        ("L", "1"),
+        ("Z", "2"),
+        ("E", "3"),
+        ("A", "4"),
+        ("S", "5"),
+        ("G", "6"),
+        ("B", "8"),
+    ],
+)
+def test_every_documented_digit_slot_repair_is_available(read: str, expected: str) -> None:
+    """The digit-ward half of the table, pinned character by character.
+
+    Both blocks a plate ends in digits -- the province and the tail -- are
+    repaired through this map, so a missing entry is a plate the gate silently
+    fails to recognise rather than a visible error.
+    """
+    assert CONFUSION_MAP[read] == expected
+    assert coerce_positional(f"{read}4ABC12")[0] == expected
+    assert coerce_positional(f"34ABC1{read}")[-1] == expected
+
+
+@pytest.mark.parametrize(
+    ("read", "expected"),
+    [("0", "O"), ("1", "I"), ("2", "Z"), ("4", "A"), ("5", "S"), ("6", "G"), ("8", "B")],
+)
+def test_every_documented_letter_slot_repair_is_available(read: str, expected: str) -> None:
+    """And the letter-ward half, in the middle block."""
+    assert CONFUSION_MAP[read] == expected
+    assert coerce_positional(f"34{read}1234")[2] == expected
+
+
+# ---------------------------------------------------------------------------
+# Case-sensitive hints
+# ---------------------------------------------------------------------------
+
+
+def test_a_lowercase_b_can_be_read_as_a_six() -> None:
+    """Upper-casing first would send it down the B -> 8 repair and lose the plate.
+
+    "b4ABC12" upper-cases to "B4ABC12", whose only digit-ward repair is 8, and
+    province 84 does not exist -- so the read is discarded. Trying the
+    lowercase reading recovers province 64 (Nevsehir).
+    """
+    assert CASE_HINTS["b"] == "6"
+    read = normalize_plate("b4ABC12", confidence=0.9)
+    assert read.text == "64ABC12"
+    assert read.valid is True
+
+
+def test_the_hint_never_overrules_a_read_that_already_parses() -> None:
+    """The string as the recogniser wrote it always gets the first attempt."""
+    # "34ABCb2" parses as-is once b -> B -> 8, so the 6 reading is never reached.
+    assert normalize_plate("34ABCb2").text == "34ABC82"
+    # And a lowercase b in the *letter* block is simply a letter.
+    assert normalize_plate("06bZ1234").text == "06BZ1234"
+
+
+def test_the_hint_does_not_change_a_read_without_a_lowercase_b() -> None:
+    for plate in VALID_PLATES:
+        assert normalize_plate(plate.lower()).text == plate
 
 
 def test_coercion_prefers_the_cheapest_segmentation() -> None:

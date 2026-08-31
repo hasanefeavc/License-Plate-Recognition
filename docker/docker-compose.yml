@@ -44,13 +44,21 @@ services:
       - ../config.yaml:/app/config.yaml:ro
       - ..:/repo
       # The engine socket the OTA rebuild talks to. Parameterised because the
-      # path is not universal: rootless Podman listens on
-      # /run/user/<uid>/podman/podman.sock, and mounting /var/run/docker.sock
-      # there hands the container a *different* engine from the one running
-      # this service -- so the update would rebuild an image nothing is using,
-      # or fail on permissions. Check with `echo $DOCKER_HOST` on the host and
-      # set LPR_DOCKER_SOCK in .env to match.
-      - ${LPR_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      # path is not universal, and the default is the rootless-Podman one
+      # because that is what this deployment runs: /var/run/docker.sock there
+      # is a *different*, root-owned engine, so mounting it gives the container
+      # either "permission denied" or -- worse -- a working connection to an
+      # engine that is not running this service, rebuilding an image nothing
+      # uses.
+      #
+      # The uid in the default path is the host user's (1000 here). Check
+      # `echo $DOCKER_HOST` on the host and set LPR_DOCKER_SOCK in .env when it
+      # differs -- a Docker Engine host wants
+      # LPR_DOCKER_SOCK=/var/run/docker.sock.
+      #
+      # Read-write on purpose: the engine API is a bidirectional socket, and a
+      # read-only bind is refused at connect time, not at mount time.
+      - ${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}:/var/run/docker.sock:rw
     environment:
       LPR_SYSTEM_UPDATE__REPO_DIR: /repo
       # Put the OCR weights on the models/ volume rather than in $HOME, so they
@@ -65,6 +73,13 @@ services:
       # working with the same image.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Where the docker CLI inside this container looks for the engine. It is
+      # always the container-side path of the bind above, whatever the host
+      # socket happens to be called -- the volume line is what varies, not
+      # this. Set explicitly rather than left to the CLI's default so the
+      # value is visible in `docker inspect` when an update fails, and so the
+      # updater and the CLI cannot disagree about which socket they mean.
+      DOCKER_HOST: unix:///var/run/docker.sock
     env_file:
       - path: ../.env
         required: false

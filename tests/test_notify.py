@@ -318,6 +318,114 @@ def test_a_relay_that_wants_no_authentication_is_still_usable() -> None:
     assert EmailNotifier(config(user="", password="")).enabled is True
 
 
+# ---------------------------------------------------------------------------
+# Accounting for the alerts that are never sent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"host": ""}, ["host"]),
+        ({"to_emails": []}, ["to_emails"]),
+        ({"password": ""}, ["password"]),
+        ({"from_email": "", "user": ""}, ["from_email"]),  # sender falls back to user
+        ({"host": "", "password": ""}, ["host", "password"]),
+        ({}, []),
+    ],
+)
+def test_missing_fields_names_every_gap(overrides: Any, expected: list[str]) -> None:
+    """The startup warning has to say *which* key is empty, not just "eksik"."""
+    assert config(**overrides).missing_fields == expected
+
+
+def test_a_disabled_config_is_missing_nothing() -> None:
+    """An operator who turned e-mail off is not misconfigured."""
+    assert config(enabled=False, host="").missing_fields == []
+
+
+def test_usable_still_agrees_with_missing_fields() -> None:
+    """The two views of the same question must never disagree."""
+    for overrides in ({}, {"host": ""}, {"password": ""}, {"enabled": False}):
+        cfg = config(**overrides)
+        assert cfg.usable is (cfg.enabled and not cfg.missing_fields)
+
+
+def test_build_notifier_names_the_missing_key(tmp_settings: Any, caplog: Any) -> None:
+    """The half-configured case that shipped: user set, password blank.
+
+    Without the field name in the log this is indistinguishable from a gate
+    nobody drove up to -- the service starts, reports no error, and sends
+    nothing for the rest of its uptime.
+    """
+    import logging
+
+    tmp_settings.smtp.enabled = True
+    tmp_settings.smtp.host = "smtp.example.com"
+    tmp_settings.smtp.from_email = "gate@example.com"
+    tmp_settings.smtp.to_emails = ["guard@example.com"]
+    tmp_settings.smtp.user = "gate@example.com"
+    tmp_settings.smtp.password = ""
+
+    with caplog.at_level(logging.WARNING, logger="lpr.notify"):
+        notifier = build_notifier(tmp_settings)
+
+    assert notifier.enabled is False
+    assert "password" in caplog.text
+    assert "LPR_SMTP__PASSWORD" in caplog.text
+
+
+def test_an_alert_dropped_for_want_of_configuration_is_counted(caplog: Any) -> None:
+    """A refused vehicle nobody hears about must at least leave a trace."""
+    import logging
+
+    notifier = EmailNotifier(config(password=""), sender=RecordingSender())
+    with caplog.at_level(logging.WARNING, logger="lpr.notify"):
+        assert notifier.notify(notification()) is False
+
+    assert notifier.suppressed == 1
+    assert "34ABC123" in caplog.text
+    assert "password" in caplog.text
+
+
+def test_the_unconfigured_warning_is_written_once_per_process(caplog: Any) -> None:
+    """One refused vehicle per frame must not become one warning per frame."""
+    import logging
+
+    notifier = EmailNotifier(config(password=""), sender=RecordingSender())
+    with caplog.at_level(logging.WARNING, logger="lpr.notify"):
+        for _ in range(5):
+            notifier.notify(notification())
+
+    assert notifier.suppressed == 5, "every dropped alert is still counted"
+    assert caplog.text.count("LPR_SMTP__PASSWORD") == 0
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+
+
+def test_a_switched_off_category_is_not_a_misconfiguration(caplog: Any) -> None:
+    """Silence the operator asked for stays silent, and uncounted."""
+    import logging
+
+    notifier = EmailNotifier(config(notify_on_unauthorized=False), sender=RecordingSender())
+    with caplog.at_level(logging.WARNING, logger="lpr.notify"):
+        assert notifier.notify(notification()) is False
+
+    assert notifier.suppressed == 0
+    assert caplog.records == []
+
+
+def test_a_usable_notifier_that_was_never_started_warns(caplog: Any) -> None:
+    """Correct configuration plus a missing start() is the worst silence of all."""
+    import logging
+
+    notifier = EmailNotifier(config(), sender=RecordingSender())
+    with caplog.at_level(logging.WARNING, logger="lpr.notify"):
+        assert notifier.notify(notification()) is False
+
+    assert notifier.suppressed == 1
+    assert "start()" in caplog.text
+
+
 def test_the_shipped_config_does_not_carry_a_password(tmp_settings: Any) -> None:
     """config.yaml is committed; the credential belongs in .env."""
     from lpr.config import Settings

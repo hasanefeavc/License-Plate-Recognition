@@ -357,6 +357,16 @@ class FastPathConfig(BaseModel):
 
     Set ``enabled: false`` to keep every read on the slow path; the escalation
     saving goes with it, because the two are the same early exit.
+
+    .. deprecated::
+       These two settings now live on :class:`VotingConfig` as
+       ``voting.fast_path_enabled`` and ``voting.fast_path_confidence``, next
+       to the ``min_votes`` they short-circuit. This section is still read so
+       an existing ``config.yaml`` (or an ``LPR_FAST_PATH__*`` environment
+       variable) keeps working: :meth:`Settings._merge_legacy_fast_path` copies
+       it onto ``voting`` *only* when the operator has not set the newer keys,
+       so there is exactly one value in play at runtime and it is never the
+       stale one.
     """
 
     #: Whether the early exit is armed at all.
@@ -395,7 +405,17 @@ class VotingConfig(BaseModel):
     """
 
     window: int = 5
-    min_votes: int = 3
+    #: Reads that must agree inside the live window before the barrier moves.
+    #:
+    #: Two, not three. The third vote was buying less than it looked: by the
+    #: time two reads inside ``ttl_s`` agree on a grammatical plate -- after
+    #: the positional repair in :mod:`lpr.ocr.normalize` and the near-miss
+    #: merge in :mod:`lpr.ocr.voting` -- a third read almost never changes the
+    #: answer, it just costs another pass of the detector's ``frame_stride``
+    #: and leaves a car sitting at a closed gate. What actually guards against
+    #: a misread is that the plate has to be *registered*; agreement between
+    #: frames is the cheaper, secondary check.
+    min_votes: int = 2
     ttl_s: float = 4.0
     #: How long a confirmed plate is suppressed on the same camera. See the
     #: class docstring: on a sliding gate this must exceed the motor's travel
@@ -407,6 +427,14 @@ class VotingConfig(BaseModel):
     max_track_attempts: int = 12
     #: How long a track's state survives after the plate was last seen.
     track_ttl_s: float = 30.0
+    #: Arm the single-frame early exit for already-registered plates. See
+    #: :class:`FastPathConfig` for what is being traded.
+    fast_path_enabled: bool = True
+    #: How confident that single read must be. Floored at ``ocr.min_confidence``
+    #: in the orchestrator: a fast path that accepted reads the ordinary path
+    #: would discard would be a downgrade in accuracy wearing the word
+    #: "optimisation".
+    fast_path_confidence: float = Field(default=0.82, ge=0.0, le=1.0)
 
 
 class RelayConfig(BaseModel):
@@ -520,9 +548,38 @@ class SmtpConfig(BaseModel):
         An empty ``user`` is a different thing: an internal relay that wants no
         authentication at all, and that is left alone.
         """
-        if not (self.enabled and self.host.strip() and self.sender and self.recipients):
-            return False
-        return not self.user.strip() or bool(self.password)
+        return self.enabled and not self.missing_fields
+
+    @property
+    def missing_fields(self) -> list[str]:
+        """The settings that stand between this config and a working send.
+
+        Named individually rather than answered as one boolean so the startup
+        warning can say *which* key is empty. The failure this exists for is
+        the quiet one: ``config.yaml`` ships ``user`` filled and ``password``
+        blank, so a site that never set ``LPR_SMTP__PASSWORD`` gets a notifier
+        that is switched on, reports no error, and sends nothing -- and the
+        operator has no way to tell that from a gate nobody drove up to.
+
+        Empty when ``enabled`` is false: an operator who turned e-mail off is
+        not missing anything.
+        """
+        if not self.enabled:
+            return []
+        gaps: list[str] = []
+        if not self.host.strip():
+            gaps.append("host")
+        if not self.sender:
+            gaps.append("from_email")
+        if not self.recipients:
+            gaps.append("to_emails")
+        # A configured user with no password is half-filled, and it is the
+        # shape a deployment lands in once the credential moves out of
+        # config.yaml. An *empty* user is a different thing -- an internal
+        # relay that wants no authentication at all -- and is left alone.
+        if self.user.strip() and not self.password:
+            gaps.append("password")
+        return gaps
 
 
 class DatabaseConfig(BaseModel):
@@ -763,6 +820,30 @@ class Settings(BaseSettings):
             dotenv_settings,
             file_secret_settings,
         )
+
+    @model_validator(mode="after")
+    def _merge_legacy_fast_path(self) -> "Settings":
+        """Fold a legacy ``fast_path:`` section onto ``voting``.
+
+        The fast path used to be its own top-level section. It reads better
+        beside the ``voting.min_votes`` it exists to skip, so it moved -- but a
+        deployment upgrading in place still has the old section in its
+        ``config.yaml``, and silently ignoring it would re-arm an early exit
+        the operator had deliberately switched off.
+
+        The newer keys win whenever they were actually written down;
+        ``model_fields_set`` is what distinguishes "the operator chose 0.82"
+        from "nobody said, so it defaulted to 0.82". Only when they are absent
+        does the legacy value carry over. Nothing is copied the other way: one
+        direction means ``voting`` is the single value the pipeline reads.
+        """
+        legacy = self.fast_path.model_fields_set
+        chosen = self.voting.model_fields_set
+        if "enabled" in legacy and "fast_path_enabled" not in chosen:
+            self.voting.fast_path_enabled = self.fast_path.enabled
+        if "min_confidence" in legacy and "fast_path_confidence" not in chosen:
+            self.voting.fast_path_confidence = self.fast_path.min_confidence
+        return self
 
     @model_validator(mode="after")
     def _check_secret_key_in_production(self) -> "Settings":

@@ -1,0 +1,30 @@
+LPR — Licence Plate Recognition for gated sites
+Copyright (C) 2025-2026 Hasan Efe Avcı
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+------------------------------------------------------------------------------
+DUAL LICENSING
+
+The AGPL is not the only way to use this software. A separate commercial
+licence removes the AGPL's source-disclosure obligations for organisations that
+cannot meet them. See COMMERCIAL.md.
+
+------------------------------------------------------------------------------
+LICENCE HISTORY
+
+Releases up to and including commit 8da39ec were published under the MIT
+licence. That grant cannot be withdrawn: anyone who obtained those revisions
+under MIT keeps their MIT rights to *those* revisions. This change applies to
+every revision from the relicensing commit onward.

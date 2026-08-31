@@ -109,6 +109,13 @@ class EmailNotifier:
         self.sent = 0
         self.failed = 0
         self.dropped = 0
+        #: Alerts thrown away because the notifier was never in a position to
+        #: send them -- unusable configuration, or a worker that was not
+        #: started. Counted separately from ``dropped`` (a full queue), which
+        #: is a mail server that is merely slow. Surfaced once per process as
+        #: a warning: repeating it per refused vehicle would bury the log.
+        self.suppressed = 0
+        self._warned_unconfigured = False
 
     # -- lifecycle -------------------------------------------------------
 
@@ -169,9 +176,18 @@ class EmailNotifier:
         and the alert an operator wants is the one that just happened.
         """
         if not self.wants(notification.reason):
+            # Two very different silences share this branch. An operator who
+            # switched this category off wanted silence and gets it. An
+            # operator whose configuration is incomplete did not, and would
+            # otherwise never learn that the alert existed.
+            if not self.enabled:
+                self._warn_unconfigured(notification, self._config.missing_fields)
             return False
         if self._thread is None or not self._thread.is_alive():
-            logger.debug("E-posta çalışanı çalışmıyor, bildirim atlandı")
+            # Usable configuration but no worker: start() was never called, or
+            # the pipeline is already stopping. Worth a warning either way --
+            # this is a correctly configured site silently not alerting.
+            self._warn_unconfigured(notification, ["start() çağrılmadı"])
             return False
 
         try:
@@ -191,6 +207,23 @@ class EmailNotifier:
         except queue.Full:  # pragma: no cover - raced with another producer
             self.dropped += 1
             return False
+
+    def _warn_unconfigured(self, notification: Notification, reason: list[str]) -> None:
+        """Account for an alert nothing will ever send. Warns once per process."""
+        self.suppressed += 1
+        if self._warned_unconfigured:
+            logger.debug(
+                "Bildirim gönderilemedi (%s), yapılandırma eksik", notification.plate
+            )
+            return
+        self._warned_unconfigured = True
+        logger.warning(
+            "%s plakası için '%s' uyarısı gönderilemedi: %s. Bu uyarı süreç başına "
+            "bir kez yazılır; toplam sayı EmailNotifier.suppressed alanındadır.",
+            notification.plate,
+            notification.reason,
+            ", ".join(reason) or "e-posta kapalı",
+        )
 
     # -- consumer side ---------------------------------------------------
 
@@ -308,7 +341,8 @@ class EmailNotifier:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"EmailNotifier(enabled={self.enabled}, sent={self.sent}, "
-            f"failed={self.failed}, dropped={self.dropped})"
+            f"failed={self.failed}, dropped={self.dropped}, "
+            f"suppressed={self.suppressed})"
         )
 
 
@@ -324,8 +358,12 @@ def build_notifier(settings: "Settings | None" = None, sender: Any = None) -> Em
 
         config = SmtpConfig()
     if config.enabled and not config.usable:
+        missing = ", ".join(config.missing_fields)
         logger.warning(
-            "smtp.enabled açık ama yapılandırma eksik (host/from_email/to_emails); "
-            "e-posta bildirimleri devre dışı"
+            "smtp.enabled açık ama şu alanlar eksik: %s. E-posta bildirimleri "
+            "devre dışı; yetkisiz/kara listedeki araçlar için uyarı GÖNDERİLMEYECEK. "
+            "Parola için config.yaml yerine LPR_SMTP__PASSWORD ortam değişkenini "
+            "kullanın (Gmail'de hesap parolası değil, 16 haneli uygulama parolası).",
+            missing,
         )
     return EmailNotifier(config, sender=sender)

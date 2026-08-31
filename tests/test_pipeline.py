@@ -1256,7 +1256,7 @@ def test_an_expired_permit_never_takes_the_fast_path(db, frame) -> None:
 
 def test_the_fast_path_can_be_switched_off(db, frame) -> None:
     """A site that wants every read confirmed by several frames keeps that."""
-    db.fast_path.enabled = False
+    db.voting.fast_path_enabled = False
     PlateRepository().upsert("34ABC123")
     relay = FakeRelay()
     voter = FakeVoter(confirm=False)
@@ -1277,7 +1277,7 @@ def test_the_fast_path_cannot_undercut_the_ocr_threshold(db, frame) -> None:
     people; a fast path that accepted a 0.5 read while `ocr.min_confidence`
     said 0.8 would be an accuracy regression wearing the word "optimisation".
     """
-    db.fast_path.min_confidence = 0.1
+    db.voting.fast_path_confidence = 0.1
     db.ocr.min_confidence = 0.8
     PlateRepository().upsert("34ABC123")
     relay = FakeRelay()
@@ -1294,19 +1294,72 @@ def test_the_fast_path_cannot_undercut_the_ocr_threshold(db, frame) -> None:
 def test_a_recogniser_that_never_heard_of_the_fast_path_still_works(db, frame) -> None:
     """The `Recognizer` protocol is one method, and third parties implement it.
 
-    `FakeRecognizer.recognize` takes only a crop. The orchestrator must detect
-    that at construction and stay on the ordinary path rather than calling it
-    with a keyword it cannot accept.
+    `FakeRecognizer.recognize` takes only a crop, so the orchestrator must not
+    call it with a keyword it cannot accept. It loses the *ladder* half of the
+    fast path -- there is no predicate to stop the escalation early -- but not
+    the half that matters at the barrier: the finished read is still checked
+    against the whitelist and still opens the gate on its own frame.
     """
     PlateRepository().upsert("34ABC123")
     relay = FakeRelay()
-    pipeline = _build_pipeline(db, relay=relay)  # the plain FakeRecognizer
+    voter = FakeVoter(confirm=False)
+    pipeline = _build_pipeline(db, voter=voter, relay=relay)  # plain FakeRecognizer
 
     events = pipeline.process_frame("entry", frame)
 
     assert [e.action for e in events] == [str(Action.GRANTED)]
     assert relay.triggers == 1
+    assert pipeline.stats().fast_path_hits == 1
+    assert voter.submissions == [], "a fast-path hit does not go through the voter"
+
+
+def test_the_fast_path_still_needs_the_whitelist_without_a_predicate(db, frame) -> None:
+    """The half that survives is a whitelist check, not a confidence check.
+
+    Same recogniser as above, same confident read -- but the plate is not
+    registered, so the read belongs to the voter exactly as it always did.
+    """
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    pipeline = _build_pipeline(
+        db, recognizer=FakeRecognizer(text="99ZZZ99"), voter=voter, relay=relay
+    )
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert events == []
+    assert relay.triggers == 0
     assert pipeline.stats().fast_path_hits == 0
+    assert voter.submissions, "an unknown plate keeps the multi-frame path"
+
+
+def test_the_fast_path_fires_on_a_confident_read_the_ladder_never_probed(db, frame) -> None:
+    """A ladder that runs to the end still gets the early exit at the finish.
+
+    `accept` is consulted *during* escalation, so a recogniser whose last view
+    is the one that finally reads the plate has already spent its passes by the
+    time the answer exists. The gate must still open on this frame rather than
+    waiting for `voting.min_votes` more of them.
+    """
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    # Views 1 and 2 are unusable, so `accept` refuses them; view 3 is the plate.
+    recognizer = LadderRecognizer(
+        [
+            PlateRead(text="", confidence=0.0, raw_text="???", valid=False),
+            PlateRead(text="", confidence=0.0, raw_text="???", valid=False),
+            _read("34ABC123", 0.95),
+        ]
+    )
+    pipeline = _build_pipeline(db, recognizer=recognizer, voter=voter, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert recognizer.views == 3, "the ladder had to run; there was nothing to accept"
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert relay.triggers == 1
+    assert pipeline.stats().fast_path_hits == 1
 
 
 def test_the_fast_path_survives_a_database_wobble(db, frame, monkeypatch) -> None:

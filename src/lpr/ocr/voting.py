@@ -27,7 +27,7 @@ Design
 * Near-miss merging: two candidates one edit apart that both satisfy the
   Turkish grammar are the same plate seen through different noise, so they
   collapse onto the higher-confidence spelling *before* counting. Without
-  this, "34ABC12" x2 and "34A8C12" x1 never reaches three votes.
+  this, "34ABC12" x1 and "34A8C12" x1 never reach ``min_votes`` together.
 * Ranking is by summed confidence among the candidates that reached
   ``min_votes``, not by raw count -- three hesitant reads should not outrank
   two emphatic ones.
@@ -146,6 +146,8 @@ class MultiFrameVoter:
     Args:
         window: how many recent reads to keep per camera.
         min_votes: occurrences needed inside the live window before emitting.
+            Defaults to 2, matching ``voting.min_votes``; see
+            :class:`lpr.config.VotingConfig` for why it is not 3.
         ttl_s: age after which a read stops counting.
         cooldown_s: per (camera, plate) suppression after an emission.
         merge_distance: Levenshtein radius for near-miss merging (1 = the
@@ -160,7 +162,7 @@ class MultiFrameVoter:
     def __init__(
         self,
         window: int = 5,
-        min_votes: int = 3,
+        min_votes: int = 2,
         ttl_s: float = 4.0,
         cooldown_s: float = 10.0,
         merge_distance: int = 1,

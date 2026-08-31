@@ -258,8 +258,11 @@ The replacement stacks six independent accuracy layers:
    view's certainty, and an over-confident outlier can no longer win outright. Set
    `ocr.ensemble_backends: [paddleocr]` to add a second engine as an equal voter.
 4. **Turkish normalisation** — `^(0[1-9]|[1-7][0-9]|8[01])([A-Z]{1,3})([0-9]{2,4})$`,
-   with a *positional* confusion map (`0↔O`, `1↔I`, `8↔B`, `5↔S`, …) applied per block:
-   digits in the province code, letters in the middle, digits in the tail. Q/W/X and
+   with a *positional* confusion map (`0↔O`, `1↔I`, `8↔B`, `5↔S`, `3↔E`, …) applied per
+   block: digits in the province code, letters in the middle, digits in the tail. Case is
+   consulted where upper-casing would lose information — a lowercase `b` is the classic
+   misread of `6` where an uppercase `B` is the classic misread of `8`, so the lowercase
+   reading is tried as a fallback when the read as written does not parse. Q/W/X and
    the diacritic letters are rejected — they never appear on Turkish plates. Repairs are
    capped at **two edits**: every glyph has a mapping available, so without a cap the
    coercion is powerful enough to bend "GIRIS" (the sign above the gate) into "61R15"
@@ -450,38 +453,49 @@ this existed it paid the same bill: the full escalation ladder, then
 
 The fast path short-circuits it. After **every view** — not every stage, since
 the first stage is itself several OCR passes — the running vote is offered to
-the pipeline. If it is above `fast_path.min_confidence` *and* names a plate
+the pipeline. If it is above `voting.fast_path_confidence` *and* names a plate
 `PlateRepository.authorization` clears at that instant, the remaining views are
-never computed and the gate opens on that frame.
+never computed and the gate opens on that frame. The finished read is offered
+one last time after the ladder has run, so a crop that only became legible on
+its final view still opens the gate on that frame rather than waiting for a
+second one.
 
 ```yaml
-fast_path:
-  enabled: true
-  min_confidence: 0.9
+voting:
+  fast_path_enabled: true
+  fast_path_confidence: 0.82
 ```
+
+These two used to be a top-level `fast_path:` section with the keys `enabled`
+and `min_confidence`. That section is still read — an in-place upgrade keeps
+its old `config.yaml` and its old decision — but it is only consulted when the
+newer keys are absent, so there is exactly one value in play at runtime.
 
 What is skipped, and what that costs:
 
 | | Slow path | Fast path |
 |---|---|---|
 | Enhanced views (gamma, unsharp, rectify, Otsu) | computed as needed | never computed |
-| Frames before the gate moves | `voting.min_votes` (default 3) | 1 |
+| Frames before the gate moves | `voting.min_votes` (default 2) | 1 |
 | Applies to | every read | reads that clear the whitelist *now* |
 
 The escalation saving is free: those views exist to rescue a crop that did not
 read, and this one did. **The multi-frame saving is not free**, and it is worth
 being explicit about the trade. A single confident misread that happens to
 spell a *registered* plate now opens the barrier, where before it would have
-needed `voting.min_votes` frames to agree on the same wrong string. Two things
-bound that: the threshold defaults to 0.9, and the misread has to land on a
-plate actually registered at this site rather than merely on something
-plate-shaped. A site that would rather keep the confirmation sets
-`fast_path.enabled: false`, which also gives up the escalation saving — they
-are the same early exit.
+needed `voting.min_votes` frames to agree on the same wrong string. The bound
+that carries the weight is the second one: the misread has to land on a plate
+actually registered at this site, not merely on something plate-shaped. The
+threshold is the softer bound, and at 0.82 it is deliberately softer than the
+0.90 this shipped with — a clean, well-lit plate reads in the 0.82–0.90 band
+often enough that the higher bar sent most registered cars round the full
+voting path anyway, which is the latency the fast path exists to remove. A site
+that would rather keep the confirmation sets `voting.fast_path_enabled: false`,
+which also gives up the escalation saving — they are the same early exit.
 
 Everything that is not a live permit keeps the full path: an unknown plate, a
 blocked one, and an expired permit are exactly the cases the enhanced views and
-the multi-frame vote were built for. `fast_path.min_confidence` is floored at
+the multi-frame vote were built for. `voting.fast_path_confidence` is floored at
 `ocr.min_confidence`, so it can never admit a read the ordinary path would have
 discarded.
 
@@ -489,9 +503,12 @@ discarded.
 rate — if it stays near zero, the threshold is above what your cameras
 actually produce.
 
-Recognisers are not required to support it: the orchestrator probes for the
-`accept` parameter once at construction and stays on the ordinary path for
-anything implementing only the one-argument `Recognizer` protocol.
+Recognisers are not required to support it. The orchestrator probes for the
+`accept` parameter once at construction; a recogniser implementing only the
+one-argument `Recognizer` protocol loses the *ladder* half of the early exit —
+there is no predicate to stop the escalation — but keeps the half that matters
+at the barrier, because the finished read is checked against the whitelist
+either way.
 
 ### Ensemble OCR voting
 
@@ -656,10 +673,16 @@ lower `GATE_BUSY_MS`; the endpoint itself is not rate-limited.
 
 The temporal layer is tuned by `voting.window` (how many reads are retained),
 `voting.min_votes` (how many must agree) and `voting.ttl_s` (how long a vote survives).
-Shipped defaults are 5 / 3 / 4.0s. **Shortening `ttl_s` makes confirmation stricter, not
-better** — three reads must then land within a narrower window, so a car crossing slowly
-or a plate briefly occluded confirms less often. Raise `min_votes` if you want fewer false
-opens; shorten `ttl_s` only if you want the gate to forget a car faster.
+Shipped defaults are 5 / 2 / 4.0s. **Shortening `ttl_s` makes confirmation stricter, not
+better** — the agreeing reads must then land within a narrower window, so a car crossing
+slowly or a plate briefly occluded confirms less often. Raise `min_votes` if you want
+fewer false opens; shorten `ttl_s` only if you want the gate to forget a car faster.
+
+`min_votes` was lowered from 3 to 2. Past two agreeing reads inside `ttl_s` — after the
+positional repair in `lpr.ocr.normalize` and the Levenshtein merge below — a third read
+almost never changes the answer; it just costs another `detection.frame_stride` with a
+car waiting at a closed gate. What actually guards the barrier is that the plate has to
+be registered, and agreement between frames is the cheaper, secondary check.
 
 ### ONNX (optional)
 
@@ -1352,11 +1375,29 @@ specific message rather than a traceback — *"… bir git deposu değil"* or
    with `Komut bulunamadı: docker-compose`, leaving new code on disk and the
    old image running — worse than not updating at all.
 
-2. **The right socket.** `/var/run/docker.sock` is not universal: rootless
-   Podman listens on `/run/user/<uid>/podman/podman.sock`, and mounting the
-   wrong one hands the container an engine that is not running this service.
-   Check `echo $DOCKER_HOST` on the host and set `LPR_DOCKER_SOCK` in `.env`
-   to match.
+2. **The right socket.** `/var/run/docker.sock` is not universal, and the
+   compose file therefore defaults to the rootless-Podman path
+   (`/run/user/1000/podman/podman.sock`), mounted read-write onto
+   `/var/run/docker.sock` inside the container with
+   `DOCKER_HOST=unix:///var/run/docker.sock` set alongside it.
+
+   Get this wrong and it fails in one of two ways, which need opposite fixes
+   and are reported separately:
+
+   | Symptom | Meaning |
+   |---|---|
+   | `permission denied while trying to connect to the Docker API` | The socket is there and the container may not open it — on a rootless Podman host, `/var/run/docker.sock` is a *different*, root-owned engine |
+   | `Cannot connect to the Docker daemon` | Nothing is listening at that path — the bind mount is absent or points somewhere the engine is not |
+
+   Set `LPR_DOCKER_SOCK` in `.env` to whatever `echo $DOCKER_HOST` prints on
+   the host — `/var/run/docker.sock` on Docker Engine, a different uid's path
+   on another rootless box. Verify it from inside a container before trusting
+   it, because a mount that *looks* right can still be unopenable:
+
+   ```bash
+   docker run --rm -v ${LPR_DOCKER_SOCK}:/var/run/docker.sock:rw curlimages/curl \
+     -s --unix-socket /var/run/docker.sock http://localhost/_ping    # -> OK
+   ```
 
 3. **Every compose file you normally pass.** This module is what brings the
    service back up, so an overlay named only on your command line is dropped
@@ -1625,44 +1666,55 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 132 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
-| `test_web_ui.py` | 85 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
-| `test_detect.py` | 83 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
-| `test_normalize.py` | 69 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
+| `test_api.py` | 181 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_web_ui.py` | 121 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
+| `test_detect.py` | 109 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
+| `test_normalize.py` | 93 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
+| `test_pipeline.py` | 65 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
+| `test_updater.py` | 61 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
+| `test_db.py` | 57 | Repositories, migrations, retention, system-event trail, partial plate updates |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
-| `test_pipeline.py` | 50 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
-| `test_db.py` | 42 | Repositories, migrations, retention, system-event trail, partial plate updates |
+| `test_notify.py` | 40 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
-| `test_updater.py` | 37 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
+| `test_preprocess_pipeline.py` | 28 | Preprocessing wiring: escalation staging, frame-hook injection |
 | `test_user_license.py` | 28 | Key issue/verify, binding, expiry, revocation precedence |
-| `test_notify.py` | 27 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
 | `test_secrets.py` | 20 | No credentials in tracked templates; `.env*` ignore rules |
+| `test_config.py` | 19 | Shipped defaults: sliding-gate cooldown, pulse width, voting threshold, fast-path key migration |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_parking.py` | 18 | Occupancy accounting |
 | `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
 | `test_auth_sessions.py` | 14 | Role-scoped session lengths, token revocation on delete/demote |
 | `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
-| `test_preprocess_pipeline.py` | 11 | Preprocessing wiring: escalation staging, frame-hook injection |
-| `test_config.py` | 10 | Shipped defaults: sliding-gate cooldown and pulse width |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 220 of the 864 collected tests. Every
+`test_preprocess_pipeline.py` together account for 287 of the 1144 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
-
-> **Known failure:** `test_license.py::test_an_hs256_token_signed_with_the_public_key_is_rejected`
-> currently fails against recent `pyjwt` releases. The test forges an HS256 token using an
-> RSA public key; newer `pyjwt` refuses that at *signing* time, so the failure occurs in
-> the test's own setup rather than in the code under test. The licence check itself is
-> unaffected. The test needs rewriting to construct the forged token directly.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Dual-licensed: **AGPL-3.0-or-later** ([LICENSE](LICENSE)) **or** a commercial
+licence ([COMMERCIAL.md](COMMERCIAL.md)).
+
+Running it on your own site for your own vehicles asks nothing of you. The AGPL
+bites when you distribute it, host it for other people, or want to keep your
+modifications closed — those are the cases the commercial licence exists for.
+The table in `COMMERCIAL.md` says which side of the line a given deployment
+falls on.
+
+Two things worth knowing:
+
+- **`ultralytics` is itself AGPL-3.0.** A commercial licence for this project
+  does not relicense it, so a commercial deployment that ships YOLO needs an
+  arrangement with Ultralytics too.
+- **Revisions up to `8da39ec` were released under MIT.** That grant cannot be
+  withdrawn — anyone who took those revisions under MIT keeps those rights to
+  *those* revisions. The relicensing applies from the commit that changed
+  `LICENSE` onward. See [NOTICE](NOTICE).

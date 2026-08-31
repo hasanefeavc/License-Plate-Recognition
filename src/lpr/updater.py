@@ -53,11 +53,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -187,10 +188,47 @@ class UpdateStatus:
         }
 
 
+#: Signature of the command runner. The fourth argument is the child's
+#: environment, and it is optional so the git steps -- which want this
+#: process's own -- can leave it out.
+RunnerFn = Callable[..., CommandResult]
+
+
+#: Where the docker CLI inside the container finds the engine.
+#:
+#: Always the *container-side* path of the socket bind, whatever the host
+#: socket is called: docker-compose.yml mounts the host's engine socket --
+#: /run/user/<uid>/podman/podman.sock on a rootless Podman host, and
+#: /var/run/docker.sock on Docker Engine -- onto this one path, so the CLI
+#: never has to know which engine it is talking to.
+CONTAINER_DOCKER_HOST = "unix:///var/run/docker.sock"
+
+
+def _compose_env() -> dict[str, str]:
+    """The environment the compose commands run under.
+
+    ``DOCKER_HOST`` is a **default, not an override**: an operator who set it
+    deliberately -- a remote engine, a differently-mounted socket, a
+    DOCKER_HOST already exported into the container by compose -- keeps it.
+    Forcing our value would break exactly the site that had gone to the
+    trouble of configuring the thing properly.
+
+    It is set at all because an update that inherits an empty environment
+    silently falls back to the CLI's own default. On this deployment that
+    default is the wrong engine rather than no engine, which fails in the
+    confusing direction: a rebuild that appears to succeed and replaces an
+    image nothing is running.
+    """
+    env = dict(os.environ)
+    env.setdefault("DOCKER_HOST", CONTAINER_DOCKER_HOST)
+    return env
+
+
 def _run_command(
     command: Sequence[str],
     cwd: Path,
     timeout: float,
+    env: "Mapping[str, str] | None" = None,
 ) -> CommandResult:
     """Run one command with no shell, capturing both streams.
 
@@ -198,6 +236,11 @@ def _run_command(
     as a :class:`CommandResult` with a non-zero ``returncode``, because the
     caller's job is to report *which step failed and why*, not to unwind a
     traceback into an HTTP 500.
+
+    ``env`` replaces the child's whole environment when given, so a caller that
+    passes one must pass a *complete* one -- see :func:`_compose_env`, which
+    starts from ``os.environ`` for that reason. ``None`` inherits this
+    process's environment, which is what the git steps want.
     """
     argv = [str(part) for part in command]
     try:
@@ -208,6 +251,7 @@ def _run_command(
             text=True,
             timeout=timeout,
             check=False,
+            env=dict(env) if env is not None else None,
         )
         return CommandResult(
             command=tuple(argv),
@@ -242,7 +286,7 @@ class SystemUpdater:
     def __init__(
         self,
         settings: "Settings | None" = None,
-        runner: Callable[[Sequence[str], Path, float], CommandResult] | None = None,
+        runner: RunnerFn | None = None,
     ) -> None:
         if settings is None:
             from lpr.config import get_settings
@@ -593,7 +637,11 @@ class SystemUpdater:
         )
         self._persist()
 
-        build = self._run(self._compose_command(), self.repo_dir, self.build_timeout)
+        # The only step that talks to the engine, and the only one that needs
+        # DOCKER_HOST pointed at the mounted socket.
+        build = self._run(
+            self._compose_command(), self.repo_dir, self.build_timeout, _compose_env()
+        )
         self._append_log(f"$ {' '.join(build.command)}")
         if build.output:
             self._append_log(build.output)
@@ -730,14 +778,57 @@ class SystemUpdater:
         text = result.output.lower()
         if result.returncode == 127:
             return "docker bulunamadı. Güncelleme için Docker kurulu olmalı."
-        if "permission denied" in text and "docker.sock" in text:
-            return (
-                "Docker soketine erişim reddedildi. Güncellemeyi çalıştıran "
-                "sürecin docker grubunda olması veya /var/run/docker.sock "
-                "bağlanmış olması gerekir."
-            )
-        if "cannot connect to the docker daemon" in text:
-            return "Docker arka plan servisine bağlanılamadı. Docker çalışıyor mu?"
+        socket_detail = _explain_socket_failure(text)
+        if socket_detail is not None:
+            return socket_detail
         if result.returncode == 124:
             return "Yeniden derleme zaman aşımına uğradı."
         return f"docker compose başarısız (kod {result.returncode}): {result.output[:400]}"
+
+
+#: Socket failures worth naming separately. Both end the same update with the
+#: same exit code and both mention the socket, so the *reason* has to come from
+#: the wording -- and the two need opposite fixes.
+_SOCKET_PERMISSION_MARKERS = ("permission denied", "erişim reddedildi")
+_SOCKET_MISSING_MARKERS = (
+    "no such file or directory",
+    "connection refused",
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+)
+_SOCKET_SUBJECTS = ("docker.sock", "podman.sock", "docker api", "docker daemon")
+
+
+def _explain_socket_failure(text: str) -> str | None:
+    """Which socket problem this is, or ``None`` when it is not one.
+
+    The two failures look nearly identical in the output and need opposite
+    fixes, which is why they are told apart here rather than left to one
+    "socket problem" message:
+
+    * **Permission denied** -- the socket is there and the container may not
+      open it. Almost always the wrong socket: on a rootless Podman host
+      ``/var/run/docker.sock`` belongs to a root-owned engine, while the one
+      this service actually runs under lives at
+      ``/run/user/<uid>/podman/podman.sock``.
+    * **Missing** -- nothing is listening at the path, so the bind mount is
+      absent or points somewhere the engine is not.
+    """
+    if not any(subject in text for subject in _SOCKET_SUBJECTS):
+        return None
+    if any(marker in text for marker in _SOCKET_PERMISSION_MARKERS):
+        return (
+            "Docker soketine erişim reddedildi. Konteyner içindeki "
+            f"{CONTAINER_DOCKER_HOST} bağlantısı açılamıyor: büyük olasılıkla "
+            "yanlış soket bağlanmış. Rootless Podman'da motorun soketi "
+            "/run/user/<uid>/podman/podman.sock altındadır; .env dosyasında "
+            "LPR_DOCKER_SOCK değerini `echo $DOCKER_HOST` çıktısına göre ayarlayın."
+        )
+    if any(marker in text for marker in _SOCKET_MISSING_MARKERS):
+        return (
+            "Docker soketi bulunamadı. Konteynere "
+            f"{CONTAINER_DOCKER_HOST} bağlanmamış ya da bu yolda dinleyen bir "
+            "motor yok: docker-compose.yml içindeki soket bağlaması ve "
+            "LPR_DOCKER_SOCK değeri kontrol edilmeli."
+        )
+    return None

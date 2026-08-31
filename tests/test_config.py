@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from lpr.config import RelayConfig, VotingConfig
+from lpr.config import FastPathConfig, OcrConfig, RelayConfig, Settings, VotingConfig
 
 
 # ---------------------------------------------------------------------------
@@ -85,3 +85,88 @@ def test_the_pulse_is_shorter_than_the_cooldown() -> None:
 @pytest.mark.parametrize("pulse_ms", [500, 1000, 1500])
 def test_a_site_can_retune_the_pulse_for_its_controller(pulse_ms: int) -> None:
     assert RelayConfig(pulse_ms=pulse_ms).pulse_ms == pulse_ms
+
+
+# ---------------------------------------------------------------------------
+# Voting: consensus and the single-frame early exit
+# ---------------------------------------------------------------------------
+
+
+def test_two_agreeing_reads_are_enough() -> None:
+    """Lowered from three. See VotingConfig for why the third vote bought little."""
+    assert VotingConfig().min_votes == 2
+
+
+def test_min_votes_still_fits_inside_the_window() -> None:
+    """A threshold above the window can never be met; the voter would clamp it."""
+    config = VotingConfig()
+    assert 1 < config.min_votes <= config.window
+
+
+def test_the_fast_path_ships_armed() -> None:
+    assert VotingConfig().fast_path_enabled is True
+    assert VotingConfig().fast_path_confidence == 0.82
+
+
+def test_the_fast_path_threshold_is_above_the_ocr_floor() -> None:
+    """The orchestrator floors one at the other; shipping them inverted would
+    mean the shipped configuration relies on that floor to stay honest."""
+    assert VotingConfig().fast_path_confidence > OcrConfig().min_confidence
+
+
+# ---------------------------------------------------------------------------
+# The fast path moved from its own section onto `voting`
+# ---------------------------------------------------------------------------
+
+
+def _upgraded_in_place(**legacy: object) -> Settings:
+    """A ``Settings`` shaped like a deployment that has not migrated its YAML.
+
+    ``voting=VotingConfig()`` is the load-bearing half: passing the section
+    explicitly is what keeps this test off the developer's own ``config.yaml``,
+    whose ``voting:`` block *has* been migrated and would otherwise (correctly)
+    win. An empty ``model_fields_set`` is exactly the "nobody wrote the new
+    keys" state the merge exists for.
+    """
+    return Settings(voting=VotingConfig(), fast_path=FastPathConfig(**legacy))
+
+
+def test_a_legacy_fast_path_section_still_switches_the_early_exit_off() -> None:
+    """An in-place upgrade keeps its old config.yaml, and its old decision.
+
+    Ignoring the section an operator deliberately switched off would re-arm an
+    early exit at a live gate on the strength of a rename.
+    """
+    assert _upgraded_in_place(enabled=False).voting.fast_path_enabled is False
+
+
+def test_a_legacy_fast_path_section_still_carries_its_threshold() -> None:
+    assert _upgraded_in_place(min_confidence=0.97).voting.fast_path_confidence == 0.97
+
+
+def test_an_untouched_legacy_section_does_not_override_the_defaults() -> None:
+    """Only values the operator actually wrote carry over.
+
+    ``fast_path`` exists on every Settings whether or not the YAML mentions it,
+    so a merge that copied its *defaults* would pin every site to 0.90 forever
+    and quietly undo the new threshold.
+    """
+    settings = Settings(voting=VotingConfig())
+    assert settings.voting.fast_path_confidence == VotingConfig().fast_path_confidence
+
+
+def test_the_new_keys_beat_the_legacy_section() -> None:
+    """Both present means the operator has migrated; the stale one loses."""
+    settings = Settings(
+        fast_path=FastPathConfig(enabled=True, min_confidence=0.99),
+        voting=VotingConfig(fast_path_enabled=False, fast_path_confidence=0.75),
+    )
+    assert settings.voting.fast_path_enabled is False
+    assert settings.voting.fast_path_confidence == 0.75
+
+
+def test_nothing_is_copied_back_onto_the_legacy_section() -> None:
+    """One direction only, so `voting` is the single value the pipeline reads."""
+    settings = Settings(voting=VotingConfig(fast_path_confidence=0.7))
+    assert settings.voting.fast_path_confidence == 0.7
+    assert settings.fast_path.min_confidence == FastPathConfig().min_confidence

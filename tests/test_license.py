@@ -136,8 +136,14 @@ def test_an_hs256_token_signed_with_the_public_key_is_rejected(public_key: Path)
     If the verifier accepted HS256 as well as RS256, anyone holding
     ``public_key.pem`` -- which is every customer -- could sign their own
     licence with it. Pinning ``algorithms=["RS256"]`` is what stops that.
+
+    The token is assembled by hand rather than through ``jwt.encode``, which
+    refuses a PEM as an HMAC secret and would fail here in the *setup* instead
+    of at the assertion. That refusal is a second, welcome layer of defence --
+    but it lives in the attacker's library, not in ours, so it cannot be what
+    this test relies on. A real forger writes the three segments directly.
     """
-    forged = jwt.encode(
+    forged = _hs256_by_hand(
         {
             "iss": lic.ISSUER,
             "sub": "Forger",
@@ -145,10 +151,29 @@ def test_an_hs256_token_signed_with_the_public_key_is_rejected(public_key: Path)
             "iat": int(time.time()),
             "exp": int(time.time()) + 365 * 86400,
         },
-        VENDOR_PUBLIC.decode("ascii"),
-        algorithm="HS256",
+        VENDOR_PUBLIC,
     )
     assert lic.validate_token(forged).valid is False
+
+
+def _hs256_by_hand(payload: dict[str, object], secret: bytes) -> str:
+    """One HS256 JWT, built without asking PyJWT's opinion of the key."""
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    def segment(raw: bytes) -> bytes:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+    signing_input = b".".join(
+        (
+            segment(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()),
+            segment(json.dumps(payload).encode()),
+        )
+    )
+    signature = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    return b".".join((signing_input, segment(signature))).decode("ascii")
 
 
 def test_an_api_session_token_is_not_a_licence(public_key: Path) -> None:

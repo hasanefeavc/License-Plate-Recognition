@@ -215,27 +215,32 @@ class PipelineOrchestrator:
         if hasattr(voter, "on_vote"):
             voter.on_vote = self.publish_telemetry
 
-        # Fast path. Two things have to be true for it to arm: the operator
-        # left it on, and the recogniser understands the `accept` predicate --
-        # a test double or a third-party engine implementing only the
-        # `Recognizer` protocol does not, and must keep working unchanged.
-        fast_path = getattr(settings, "fast_path", None)
-        self._fast_path_enabled = bool(getattr(fast_path, "enabled", False)) and (
-            _accepts_predicate(recognizer)
-        )
+        # Fast path. Armed by `voting.fast_path_enabled`; a legacy top-level
+        # `fast_path:` section is folded onto `voting` by Settings, so there is
+        # one value to read here rather than two that can disagree.
+        voting = settings.voting
+        self._fast_path_enabled = bool(getattr(voting, "fast_path_enabled", False))
         # Floored at ocr.min_confidence: opening the gate on a read the
         # ordinary path would have thrown away is an accuracy regression, not
         # an optimisation, and the two thresholds are set in different files by
         # different people.
         self._fast_path_min_confidence = max(
-            float(getattr(fast_path, "min_confidence", 1.0)),
+            float(getattr(voting, "fast_path_confidence", 1.0)),
             float(settings.ocr.min_confidence),
         )
+        # Whether the early exit can also skip the *OCR ladder*, which needs
+        # the recogniser to understand the `accept` predicate. A test double or
+        # a third-party engine implementing only the bare `Recognizer` protocol
+        # does not, and must keep working unchanged -- it simply reads the crop
+        # to the end and gets the whitelist check afterwards instead, which is
+        # the half of the fast path that actually opens the gate early.
+        self._fast_path_probes = self._fast_path_enabled and _accepts_predicate(recognizer)
         if self._fast_path_enabled:
             logger.info(
                 "Fast-path enabled: a registered plate read at >= %.2f opens the "
-                "gate on its first frame",
+                "gate on its first frame (OCR ladder short-circuit: %s)",
                 self._fast_path_min_confidence,
+                "on" if self._fast_path_probes else "off",
             )
 
         self._plates = PlateRepository()
@@ -740,7 +745,7 @@ class PipelineOrchestrator:
             # views that exist to rescue crops this one did not need.
             probe = (
                 _FastPathProbe(self._fast_path_min_confidence, self._plates.authorization)
-                if self._fast_path_enabled
+                if self._fast_path_probes
                 else None
             )
             if probe is not None:
@@ -783,8 +788,19 @@ class PipelineOrchestrator:
                 }
             )
 
+            # The probe only gets a say while the ladder is still running, and
+            # a recogniser that takes no predicate never consults it at all.
+            # Re-asking on the finished read is what makes "registered plate,
+            # confident read, open on frame 1" hold for every recogniser
+            # rather than only for the one that was handed a predicate.
+            fast_plate = (
+                probe.plate
+                if probe is not None and probe.fired
+                else self._probe_fast_path(read)
+            )
+
             confirmed: str | None
-            if probe is not None and probe.fired:
+            if fast_plate:
                 # The multi-frame vote is skipped, not merely won early: this
                 # plate is on the list and was read cleanly, so the frames the
                 # voter would spend agreeing with itself are latency at a
@@ -799,10 +815,10 @@ class PipelineOrchestrator:
                 logger.debug(
                     "Camera %s: %s cleared the fast path at %.2f",
                     camera,
-                    probe.plate,
+                    fast_plate,
                     read.confidence,
                 )
-                confirmed = probe.plate
+                confirmed = fast_plate
             else:
                 confirmed = self._submit(camera, read, track_id)
             if not confirmed:
@@ -816,6 +832,25 @@ class PipelineOrchestrator:
                     self._track_voter.note_decision(camera, track_id, confirmed)
 
         return events
+
+    def _probe_fast_path(self, read: PlateRead) -> str:
+        """The plate in ``read`` if it clears the early exit, else ``""``.
+
+        Runs the same :class:`_FastPathProbe` the recogniser would have been
+        handed, so a hit recorded here is indistinguishable from one recorded
+        mid-ladder: same confidence floor, same ``authorization`` call, same
+        failure policy when the database wobbles.
+
+        Cheap by construction -- the probe returns on the confidence check
+        before it touches the database, so an ordinary sub-threshold read
+        costs one float comparison.
+        """
+        if not self._fast_path_enabled:
+            return ""
+        probe = _FastPathProbe(
+            self._fast_path_min_confidence, self._plates.authorization
+        )
+        return probe.plate if probe(read) else ""
 
     def _capture_snapshot(self, camera: str, event: LprEvent, frame: Frame) -> None:
         """Queue the frame behind one decision as evidence.

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +29,20 @@ class ScriptedRunner:
     def __init__(self, responses: dict[str, CommandResult] | None = None) -> None:
         self.responses = responses or {}
         self.calls: list[tuple[tuple[str, ...], Path, float]] = []
+        #: The environment each command was given, by command string. Only the
+        #: compose step gets one; the git steps inherit the process's own.
+        self.envs: dict[str, Mapping[str, str] | None] = {}
 
-    def __call__(self, command: Sequence[str], cwd: Path, timeout: float) -> CommandResult:
+    def __call__(
+        self,
+        command: Sequence[str],
+        cwd: Path,
+        timeout: float,
+        env: "Mapping[str, str] | None" = None,
+    ) -> CommandResult:
         argv = tuple(str(part) for part in command)
         self.calls.append((argv, cwd, timeout))
+        self.envs[" ".join(argv)] = env
         for key, result in self.responses.items():
             if key in " ".join(argv):
                 return result
@@ -93,14 +103,20 @@ class AdvancingRunner(ScriptedRunner):
         self._revisions = list(revisions)
         self._index = 0
 
-    def __call__(self, command: Sequence[str], cwd: Path, timeout: float) -> CommandResult:
+    def __call__(
+        self,
+        command: Sequence[str],
+        cwd: Path,
+        timeout: float,
+        env: "Mapping[str, str] | None" = None,
+    ) -> CommandResult:
         argv = tuple(str(part) for part in command)
         if " ".join(argv) == "git rev-parse HEAD":
             self.calls.append((argv, cwd, timeout))
             value = self._revisions[min(self._index, len(self._revisions) - 1)]
             self._index += 1
             return ok(value)
-        return super().__call__(command, cwd, timeout)
+        return super().__call__(command, cwd, timeout, env)
 
 
 def run_to_completion(updater: SystemUpdater, force: bool = False) -> Any:
@@ -156,10 +172,10 @@ def test_a_second_concurrent_update_is_refused(tmp_settings: Any, repo: Path) ->
     release = threading.Event()
 
     class BlockingRunner(ScriptedRunner):
-        def __call__(self, command, cwd, timeout):  # type: ignore[no-untyped-def]
+        def __call__(self, command, cwd, timeout, env=None):  # type: ignore[no-untyped-def]
             if "pull" in " ".join(str(p) for p in command):
                 release.wait(timeout=5)
-            return super().__call__(command, cwd, timeout)
+            return super().__call__(command, cwd, timeout, env)
 
     updater = build(tmp_settings, repo, BlockingRunner())
     updater.start()
@@ -393,10 +409,10 @@ def test_a_forced_run_cannot_bypass_the_single_flight_guard(
     gate = threading.Event()
 
     class BlockingRunner(ScriptedRunner):
-        def __call__(self, command, cwd, timeout):  # type: ignore[no-untyped-def]
+        def __call__(self, command, cwd, timeout, env=None):  # type: ignore[no-untyped-def]
             if "up -d --build" in " ".join(str(p) for p in command):
                 gate.wait(timeout=10)
-            return super().__call__(command, cwd, timeout)
+            return super().__call__(command, cwd, timeout, env)
 
     updater = build(tmp_settings, repo, BlockingRunner({"rev-parse HEAD": ok("same")}))
     updater.start(force=True)
@@ -520,6 +536,10 @@ def test_a_denied_docker_socket_is_explained(tmp_settings: Any, repo: Path) -> N
     assert status.state == "failed"
     assert status.step == "build"
     assert "docker soketine erişim reddedildi" in status.detail.lower()
+    # Actionable, not just accurate: the fix is a different socket, and the
+    # message has to say which one and where to set it.
+    assert "LPR_DOCKER_SOCK" in status.detail
+    assert "podman" in status.detail.lower()
 
 
 def test_a_missing_binary_is_explained(tmp_settings: Any, repo: Path) -> None:
@@ -547,11 +567,11 @@ def test_the_outcome_is_written_before_the_rebuild_starts(tmp_settings: Any, rep
     seen: dict[str, Any] = {}
 
     class Runner(AdvancingRunner):
-        def __call__(self, command, cwd, timeout):  # type: ignore[no-untyped-def]
+        def __call__(self, command, cwd, timeout, env=None):  # type: ignore[no-untyped-def]
             if "up -d --build" in " ".join(str(p) for p in command):
                 # Snapshot what a container killed mid-rebuild would leave behind.
                 seen["state"] = json.loads(state_file.read_text())["state"]
-            return super().__call__(command, cwd, timeout)
+            return super().__call__(command, cwd, timeout, env)
 
     run_to_completion(build(tmp_settings, repo, Runner()))
     assert seen["state"] == "restarting"
@@ -817,4 +837,119 @@ def test_the_engine_socket_is_parameterised() -> None:
     compose = (
         Path(__file__).resolve().parents[1] / "docker" / "docker-compose.yml"
     ).read_text(encoding="utf-8")
-    assert "${LPR_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock" in compose
+    assert (
+        "${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}"
+        ":/var/run/docker.sock:rw" in compose
+    )
+    # The CLI's end of the same bind. It is the container-side path, so it does
+    # not vary with the host socket -- and saying so in the environment is what
+    # keeps `docker inspect` honest when an update fails.
+    assert "DOCKER_HOST: unix:///var/run/docker.sock" in compose
+
+
+# ---------------------------------------------------------------------------
+# The engine socket: which one, and what to say when it cannot be opened
+# ---------------------------------------------------------------------------
+
+
+def test_the_rebuild_runs_with_docker_host_pointed_at_the_mounted_socket(
+    tmp_settings: Any, repo: Path, monkeypatch: Any
+) -> None:
+    """An update that inherits no DOCKER_HOST reaches the CLI's own default,
+    which on this deployment is a different engine rather than none."""
+    from lpr.updater import CONTAINER_DOCKER_HOST
+
+    # The developer's own shell exports DOCKER_HOST on a Podman box, and this
+    # test is about what happens when nothing has.
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    runner = AdvancingRunner()
+    run_to_completion(build(tmp_settings, repo, runner))
+
+    compose_call = next(cmd for cmd in runner.envs if "up -d --build" in cmd)
+    env = runner.envs[compose_call]
+    assert env is not None, "the compose step must be given an environment"
+    assert env["DOCKER_HOST"] == CONTAINER_DOCKER_HOST
+    # A complete environment, not just the one variable: `env=` replaces the
+    # child's whole environment, so PATH has to survive or nothing runs.
+    assert "PATH" in env
+
+
+def test_the_git_steps_are_left_on_the_inherited_environment(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """Only the step that talks to the engine needs the override."""
+    runner = AdvancingRunner()
+    run_to_completion(build(tmp_settings, repo, runner))
+
+    for command, env in runner.envs.items():
+        if command.startswith("git "):
+            assert env is None, f"{command} should inherit this process's environment"
+
+
+def test_an_operators_own_docker_host_is_not_overridden(monkeypatch: Any) -> None:
+    """A default, not an override.
+
+    A site pointing at a remote engine or a differently-mounted socket has
+    already solved this problem; forcing our value would break exactly the
+    deployment that configured it properly.
+    """
+    from lpr.updater import _compose_env
+
+    monkeypatch.setenv("DOCKER_HOST", "tcp://build-host:2375")
+    assert _compose_env()["DOCKER_HOST"] == "tcp://build-host:2375"
+
+
+def test_a_missing_socket_is_not_reported_as_a_permission_problem(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The two failures need opposite fixes, so one message cannot serve both.
+
+    "Permission denied" sends an operator looking at groups and ownership; the
+    socket not being mounted at all is a compose problem, and being told to
+    check permissions on a path that does not exist wastes the call-out.
+    """
+    runner = AdvancingRunner(
+        responses={
+            "up -d --build": fail(
+                1,
+                "Cannot connect to the Docker daemon at "
+                "unix:///var/run/docker.sock. Is the docker daemon running?",
+            )
+        }
+    )
+    status = run_to_completion(build(tmp_settings, repo, runner))
+
+    assert status.state == "failed" and status.step == "build"
+    assert "bulunamadı" in status.detail
+    assert "erişim reddedildi" not in status.detail.lower()
+
+
+def test_the_permission_message_names_the_socket_the_cli_actually_uses(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The real error text from a rootless Podman host, verbatim."""
+    runner = AdvancingRunner(
+        responses={
+            "up -d --build": fail(
+                1,
+                "permission denied while trying to connect to the Docker API "
+                "at unix:///var/run/docker.sock",
+            )
+        }
+    )
+    status = run_to_completion(build(tmp_settings, repo, runner))
+
+    assert "erişim reddedildi" in status.detail.lower()
+    assert "/var/run/docker.sock" in status.detail
+
+
+def test_an_ordinary_build_failure_is_still_an_ordinary_build_failure(
+    tmp_settings: Any, repo: Path
+) -> None:
+    """The socket wording must not swallow a compile error that mentions docker."""
+    runner = AdvancingRunner(
+        responses={"up -d --build": fail(1, "failed to solve: process did not complete")}
+    )
+    status = run_to_completion(build(tmp_settings, repo, runner))
+
+    assert "docker compose başarısız" in status.detail

@@ -6,6 +6,20 @@ password in ``config.yaml``. Both files are meant to be templates, both are
 tracked, and both were pushed. The fix for the leak itself is *rotation* --
 history keeps what it was given -- but the fix for the next one is a test.
 
+It happened a second time, and worse. The RSA key that signs every deployment
+licence was committed as ``keys/private_key.pem`` and pushed to a public
+repository -- while ``scripts/generate_keys.py`` carried a comment claiming the
+directory was gitignored. It was not: ``.gitignore`` had no ``keys/`` rule at
+all. A comment documented a protection nobody had written, and the first
+version of this file only ever looked inside three template files, so neither
+the comment nor the test noticed.
+
+Hence the two halves below. The template scan is unchanged. The tree scan is
+new: it walks *every tracked file* looking for key material by shape, checks
+that the ignore rules which should have caught it exist, and asserts that git
+history itself is clean -- because rotation fixes a leak, and only a test stops
+the next one.
+
 The checks are deliberately shape-based rather than a list of known-bad values.
 A denylist only catches the secret you already know about.
 """
@@ -60,6 +74,77 @@ PLACEHOLDER_HINTS = (
 )
 
 TEMPLATE_FILES = (".env.example", "config.yaml", "docker/docker-compose.yml")
+
+#: PEM headers that mean private key material, whatever the file is called.
+#:
+#: ``BEGIN PUBLIC KEY`` is deliberately absent: a public key is meant to be
+#: distributable, and ``tests/test_license.py`` writes one into a tmp_path
+#: fixture. The private forms below have no legitimate reason to appear in a
+#: tracked file -- not in a test, not in a doc, not as an example.
+PRIVATE_KEY_MARKERS = (
+    "BEGIN PRIVATE KEY",
+    "BEGIN RSA PRIVATE KEY",
+    "BEGIN EC PRIVATE KEY",
+    "BEGIN DSA PRIVATE KEY",
+    "BEGIN OPENSSH PRIVATE KEY",
+    "BEGIN PGP PRIVATE KEY BLOCK",
+    "BEGIN ENCRYPTED PRIVATE KEY",
+)
+
+#: Vendor-issued credentials, matched on their published prefixes. Each of
+#: these is self-identifying by design -- that is what makes the shape usable
+#: as a test rather than a guess.
+API_TOKEN_RES = (
+    ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("OpenAI key", re.compile(r"\bsk-[A-Za-z0-9]{32,}\b")),
+    ("Anthropic key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{32,}\b")),
+    ("Stripe secret key", re.compile(r"\bsk_live_[A-Za-z0-9]{16,}\b")),
+    ("private key in a URL", re.compile(r"://[^/\s:@]+:[^/\s:@]{6,}@")),
+)
+
+#: Extensions that are key material by convention. A tracked file with one of
+#: these names is a finding regardless of what is inside it.
+KEY_MATERIAL_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".jks", ".keystore")
+
+#: Model weights and databases. These are not secrets, but they are the other
+#: thing that must never be committed: ~98 MB of EasyOCR ``.pth`` weights got
+#: in through a ``models/*.pt`` rule that did not reach ``models/easyocr/``.
+BINARY_SUFFIXES = (".pt", ".pth", ".onnx", ".engine", ".tflite", ".db", ".bin", ".safetensors")
+
+#: Ignore rules this repository must carry. Each one is a leak that has either
+#: already happened here or is one directory rename away from happening.
+REQUIRED_IGNORE_RULES = (
+    "keys/",
+    "*.pem",
+    "*.key",
+    "data/",
+    "models/",
+    "*.pt",
+    "*.pth",
+    "*.onnx",
+    "*.db",
+)
+
+
+def _tracked_files() -> list[str]:
+    """Every path git is tracking, from git itself rather than a directory walk."""
+    result = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=False
+    )
+    if result.returncode != 0:  # pragma: no cover - not a git checkout
+        pytest.skip("not a git checkout")
+    return [name for name in result.stdout.decode().split("\0") if name]
+
+
+def _read_text(name: str) -> str:
+    """Tracked file as text, or "" when it is binary or unreadable."""
+    try:
+        return (ROOT / name).read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def _is_placeholder(value: str) -> bool:
@@ -187,3 +272,199 @@ def test_the_negation_follows_the_wildcard() -> None:
     lines = [line.strip() for line in (ROOT / ".gitignore").read_text().splitlines()]
     assert ".env.*" in lines and "!.env.example" in lines
     assert lines.index(".env.*") < lines.index("!.env.example")
+
+
+# ---------------------------------------------------------------------------
+# Tree scan: the whole repository, not three template files
+# ---------------------------------------------------------------------------
+
+
+def test_no_tracked_file_carries_private_key_material() -> None:
+    """The check that would have caught `keys/private_key.pem`.
+
+    Shape, not filename: renaming the key to `vendor.txt` still trips this,
+    which is the point -- the previous leak got in precisely because the
+    protection keyed on a path.
+    """
+    offenders: list[str] = []
+    for name in _tracked_files():
+        if any(marker in _read_text(name) for marker in PRIVATE_KEY_MARKERS):
+            offenders.append(name)
+    assert not offenders, (
+        "private key material in tracked files: "
+        + ", ".join(offenders)
+        + " -- rotate the key, then purge it from history"
+    )
+
+
+def test_no_tracked_file_is_named_like_key_material() -> None:
+    """`*.pem` and friends have no business being tracked, whatever they hold."""
+    offenders = [
+        name
+        for name in _tracked_files()
+        if Path(name).suffix.lower() in KEY_MATERIAL_SUFFIXES
+    ]
+    assert not offenders, f"key-material files are tracked: {offenders}"
+
+
+def test_no_tracked_file_carries_a_vendor_api_token() -> None:
+    """AWS, GitHub, Slack, Stripe and friends, matched on their own prefixes."""
+    offenders: list[str] = []
+    for name in _tracked_files():
+        # This file *contains* the patterns by definition.
+        if name == "tests/test_secrets.py":
+            continue
+        text = _read_text(name)
+        for label, pattern in API_TOKEN_RES:
+            if pattern.search(text):
+                offenders.append(f"{name} ({label})")
+    assert not offenders, f"credential-shaped strings in tracked files: {offenders}"
+
+
+def test_the_guard_recognises_the_private_key_that_actually_leaked() -> None:
+    """A negative test proves nothing unless the positive case is asserted too.
+
+    The header below is the literal first line of the key pair that was
+    committed and pushed. If a future refactor breaks the scan, this fails
+    rather than the scan silently passing everything.
+    """
+    leaked = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\n"
+    assert any(marker in leaked for marker in PRIVATE_KEY_MARKERS)
+
+
+def test_the_guard_recognises_a_credential_bearing_rtsp_url() -> None:
+    """Camera passwords arrive embedded in stream URLs, not in assignments."""
+    url = "rtsp://admin:Sup3rSecret@10.0.0.5:554/Streaming/Channels/101"
+    label, pattern = next(p for p in API_TOKEN_RES if p[0] == "private key in a URL")
+    assert pattern.search(url), label
+
+
+# ---------------------------------------------------------------------------
+# Large binaries: the other thing that must never be committed
+# ---------------------------------------------------------------------------
+
+
+def test_no_model_weights_or_databases_are_tracked() -> None:
+    """98 MB of EasyOCR weights reached git through a rule that stopped one
+    directory short. `models/` is now ignored wholesale; this asserts it."""
+    offenders = [
+        name
+        for name in _tracked_files()
+        if Path(name).suffix.lower() in BINARY_SUFFIXES
+    ]
+    assert not offenders, f"binary artefacts are tracked: {offenders}"
+
+
+def test_no_tracked_file_is_larger_than_a_megabyte() -> None:
+    """A blanket size ceiling, so the next big binary needs no new rule.
+
+    Everything this repository legitimately tracks is source, config or prose.
+    A megabyte is generous for all three and far below the point where git
+    starts to hurt.
+    """
+    oversized = []
+    for name in _tracked_files():
+        path = ROOT / name
+        try:
+            size = path.stat().st_size
+        except OSError:  # pragma: no cover - path removed mid-run
+            continue
+        if size > 1_048_576:
+            oversized.append(f"{name} ({size // 1024} KiB)")
+    assert not oversized, f"oversized tracked files: {oversized}"
+
+
+# ---------------------------------------------------------------------------
+# The ignore rules that should have existed
+# ---------------------------------------------------------------------------
+
+
+def _ignore_lines() -> list[str]:
+    return [line.strip() for line in (ROOT / ".gitignore").read_text().splitlines()]
+
+
+@pytest.mark.parametrize("rule", REQUIRED_IGNORE_RULES)
+def test_the_required_ignore_rule_is_present(rule: str) -> None:
+    """Asserting the rule text, not just its effect.
+
+    `git check-ignore` reports "not ignored" for a file that is already
+    tracked, so an effect-only test would pass on exactly the broken state
+    this repository was in -- key committed, rule missing.
+    """
+    assert rule in _ignore_lines(), f"missing .gitignore rule: {rule}"
+
+
+def _ignored_by_rule(path: str) -> bool:
+    """Whether the ignore rules would catch `path`, tracked or not."""
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", "-q", path],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "keys/private_key.pem",
+        "keys/public_key.pem",
+        "secrets/vendor.pem",
+        "data/plates.db",
+        "data/public_key.pem",
+        "models/plate_yolov8n.pt",
+        "models/easyocr/craft_mlt_25k.pth",
+        "models/easyocr/english_g2.pth",
+        "runs/train/weights/best.pt",
+    ],
+)
+def test_key_material_and_weights_are_ignored(path: str) -> None:
+    """`--no-index`, so this measures the rules rather than the index."""
+    assert _ignored_by_rule(path), f"{path} would not be ignored"
+
+
+def test_the_public_key_ships_by_installer_not_by_git() -> None:
+    """Ignoring the public half too is a deliberate choice, worth pinning.
+
+    Committing it would pin every customer to one key pair for the life of the
+    repository: rotating the signing key would then require every site to pull
+    a new commit. `lpr.license.public_key_candidates` looks in the data volume
+    first precisely so the installer can place it per-site.
+    """
+    assert _ignored_by_rule("keys/public_key.pem")
+    assert _ignored_by_rule("data/public_key.pem")
+
+
+# ---------------------------------------------------------------------------
+# History: rotation fixes the leak, this stops it coming back
+# ---------------------------------------------------------------------------
+
+
+def test_git_history_holds_no_key_material() -> None:
+    """Every path in every commit, not just the current tree.
+
+    Removing a file in a later commit does not remove it from the repository;
+    a clone still carries the blob. This is the assertion that the history
+    purge actually ran.
+    """
+    result = subprocess.run(
+        ["git", "log", "--all", "--pretty=format:", "--name-only", "--diff-filter=A"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:  # pragma: no cover - not a git checkout
+        pytest.skip("not a git checkout")
+
+    seen = {line.strip() for line in result.stdout.decode().splitlines() if line.strip()}
+    offenders = sorted(
+        name
+        for name in seen
+        if Path(name).suffix.lower() in KEY_MATERIAL_SUFFIXES + BINARY_SUFFIXES
+    )
+    assert not offenders, (
+        "key material or binaries remain in git history: "
+        + ", ".join(offenders)
+        + " -- rewrite history with git filter-repo"
+    )

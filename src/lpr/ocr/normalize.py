@@ -23,7 +23,7 @@ Why positional coercion matters
 -------------------------------
 OCR engines confuse whole classes of glyphs: ``0``/``O``/``D``/``Q``,
 ``1``/``I``/``L``, ``8``/``B``, ``5``/``S``, ``2``/``Z``, ``4``/``A``,
-``6``/``G``, ``7``/``T``. Applying a global substitution table is
+``6``/``G``, ``7``/``T``, ``3``/``E``. Applying a global substitution table is
 self-defeating -- fixing ``O`` -> ``0`` in the province block breaks the
 letter block. Because the plate grammar pins the *class* of every position
 (digits, letters, digits) the map can be applied **directionally**, which is
@@ -123,6 +123,7 @@ CONFUSION_MAP: dict[str, str] = {
     "I": "1",
     "L": "1",
     "Z": "2",
+    "E": "3",
     "A": "4",
     "S": "5",
     "G": "6",
@@ -132,12 +133,28 @@ CONFUSION_MAP: dict[str, str] = {
     "0": "O",
     "1": "I",
     "2": "Z",
+    "3": "E",
     "4": "A",
     "5": "S",
     "6": "G",
     "7": "T",
     "8": "B",
 }
+
+#: Case-sensitive glyph hints, applied *before* the text is upper-cased.
+#:
+#: Upper-casing is lossy in exactly one place that matters here: a lowercase
+#: ``b`` is the classic misread of ``6``, while an uppercase ``B`` is the
+#: classic misread of ``8``. Folding both to ``B`` first sends a ``6`` down the
+#: ``8`` repair and loses the plate. Every other lowercase confusion survives
+#: the fold intact (``l`` -> ``L`` -> ``1``, ``g`` -> ``G`` -> ``6``), which is
+#: why this table has one entry rather than a dozen.
+#:
+#: The variant it produces is *tried*, never preferred: :func:`normalize_plate`
+#: falls back to it only when the read exactly as written does not parse, so a
+#: recogniser that legitimately reported a lowercase ``b`` in the letter block
+#: keeps its ``B``.
+CASE_HINTS: dict[str, str] = {"b": "6"}
 
 #: Derived one-way views, handy for callers and for tests.
 TO_DIGIT: dict[str, str] = {k: v for k, v in CONFUSION_MAP.items() if v.isdigit()}
@@ -150,6 +167,7 @@ _COST_BAD = 4  # character cannot be repaired at all
 
 __all__ = [
     "ALLOWLIST",
+    "CASE_HINTS",
     "CONFUSION_MAP",
     "LOOSE_PLATE_RE",
     "PLATE_RE",
@@ -406,7 +424,9 @@ def normalize_plate(raw: str, confidence: float = 0.0) -> PlateRead:
 
     Pipeline: :func:`strip_noise` -> uppercase -> direct :func:`validate` ->
     :func:`coerce_positional` -> substring :func:`extract_candidates`. The
-    first stage that produces a grammatical plate wins.
+    first stage that produces a grammatical plate wins. The whole ladder then
+    runs a second time over the :data:`CASE_HINTS` rewrite of the read, which
+    is how a lowercase ``b`` gets its chance to be a ``6`` instead of an ``8``.
 
     Repairs are capped at :data:`_MAX_REPAIR_COST` edits. Without a cap the
     coercion is too powerful to be safe: every glyph has a mapping, so a long
@@ -422,30 +442,62 @@ def normalize_plate(raw: str, confidence: float = 0.0) -> PlateRead:
     raw_text = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
     conf = _clamp_confidence(confidence)
 
+    fallback: str = ""
+    for variant in _case_variants(raw_text):
+        text = _resolve(variant)
+        if text is not None:
+            return PlateRead(text=text, confidence=conf, raw_text=raw_text, valid=True)
+        if not fallback:
+            fallback = strip_noise(variant)
+
+    return PlateRead(text=fallback, confidence=conf, raw_text=raw_text, valid=False)
+
+
+def _case_variants(raw_text: str) -> list[str]:
+    """``raw_text`` first, then its :data:`CASE_HINTS` rewrite if that differs.
+
+    Order is the whole point: the string as the recogniser wrote it always gets
+    the first attempt, so the hint can only rescue a read that would otherwise
+    have failed -- it can never overrule one that parsed.
+    """
+    variants = [raw_text]
+    hinted = "".join(CASE_HINTS.get(ch, ch) for ch in raw_text)
+    if hinted != raw_text:
+        variants.append(hinted)
+    return variants
+
+
+def _resolve(raw_text: str) -> str | None:
+    """The plate hiding in ``raw_text``, or ``None`` if there is not one.
+
+    The three stages of the ladder, in increasing order of how much they are
+    willing to assume: the string is already a plate, the string is a plate
+    after positional repair, or a plate is embedded in a longer read.
+    """
     cleaned = strip_noise(raw_text)
     if not cleaned:
-        return PlateRead(text="", confidence=conf, raw_text=raw_text, valid=False)
+        return None
 
     # 1. already a plate
     if validate(cleaned):
-        return PlateRead(text=cleaned, confidence=conf, raw_text=raw_text, valid=True)
+        return cleaned
 
     # 2. positional confusion repair, within the repair budget
     coerced, cost = _best_coercion(cleaned)
     if cost <= _MAX_REPAIR_COST and validate(coerced):
         logger.debug("coerced %r -> %r (cost %d)", cleaned, coerced, cost)
-        return PlateRead(text=coerced, confidence=conf, raw_text=raw_text, valid=True)
+        return coerced
 
     # 3. plate hiding inside a longer / multi-line read
     for candidate in extract_candidates(raw_text):
         if validate(candidate):
-            return PlateRead(text=candidate, confidence=conf, raw_text=raw_text, valid=True)
+            return candidate
         repaired, repair_cost = _best_coercion(candidate)
         if repair_cost <= _MAX_REPAIR_COST and validate(repaired):
             logger.debug("extracted %r -> %r (cost %d)", candidate, repaired, repair_cost)
-            return PlateRead(text=repaired, confidence=conf, raw_text=raw_text, valid=True)
+            return repaired
 
-    return PlateRead(text=cleaned, confidence=conf, raw_text=raw_text, valid=False)
+    return None
 
 
 def _clamp_confidence(value: float) -> float:

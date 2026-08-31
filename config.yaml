@@ -137,20 +137,28 @@ ocr:
 
 voting:
   window: 5
-  min_votes: 3
+  # Two agreeing reads, not three. After the positional repair in
+  # lpr.ocr.normalize and the near-miss merge in lpr.ocr.voting, a third frame
+  # almost never changes the answer -- it just costs another detection stride
+  # with a car waiting at a closed gate. The check that actually guards the
+  # barrier is that the plate has to be registered.
+  min_votes: 2
   ttl_s: 4.0
   cooldown_s: 20.0
   max_track_attempts: 12
   track_ttl_s: 30.0
-
-# Open the gate on the first confident read of an already-registered plate,
-# instead of running the rest of the OCR ladder and waiting for
-# voting.min_votes frames to agree. Applies only to plates the whitelist
-# clears right now; a stranger, a blocked plate and an expired permit all keep
-# the full path. min_confidence is floored at ocr.min_confidence.
-fast_path:
-  enabled: true
-  min_confidence: 0.9
+  # Open the gate on the first confident read of an already-registered plate,
+  # instead of running the rest of the OCR ladder and waiting for min_votes
+  # frames to agree. Applies only to plates the whitelist clears right now; a
+  # stranger, a blocked plate and an expired permit all keep the full path.
+  fast_path_enabled: true
+  # Floored at ocr.min_confidence. 0.82 rather than the old 0.90: a clean,
+  # well-lit plate on a registered car reads in the 0.82-0.90 band often
+  # enough that the higher bar sent most of them round the full voting path
+  # anyway, which is the latency this setting exists to remove. The misread
+  # risk stays bounded by the whitelist check -- a wrong string has to spell a
+  # plate that is actually registered at this site before anything moves.
+  fast_path_confidence: 0.82
 
 relay:
   enabled: true
@@ -198,7 +206,17 @@ api:
   secret_key: change-me
 
 system_update:
-  enabled: true
+  # Off by default, and it must stay that way in the shipped file. Turning this
+  # on exposes an authenticated endpoint that runs `git pull` and
+  # `docker compose up --build` -- remote code execution by design. It also
+  # requires the Docker/Podman socket to be mounted into the container, which
+  # is host-root access.
+  #
+  # A site that wants OTA turns it on deliberately AND adds the socket mount
+  # from docker/docker-compose.ota.yml. Shipping it enabled meant every
+  # customer who installed this file as-is got the endpoint live without ever
+  # having decided to.
+  enabled: false
   repo_dir: "."
   git_remote: origin
   git_branch: main

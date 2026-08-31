@@ -40,14 +40,42 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# --- Runtime data / models / secrets ----------------------------------------
-# data/ and models/ are Docker volumes and local working directories, not
-# repo content: camera captures, the sqlite DB, downloaded/fine-tuned model
-# weights. Fetch models via scripts/fetch_models.py, not git.
+# --- Licensing key material -------------------------------------------------
+# The RSA signing key lives here. Whoever holds private_key.pem can mint
+# themselves an unlimited licence, so the whole directory is ignored -- not
+# just the private half. The *public* key is ignored too, deliberately: it is
+# shipped to each site by the installer (into the data/ volume, which
+# lpr.license.public_key_candidates checks first), not distributed through a
+# public git repository where it would pin every customer to one key pair
+# forever.
+#
+# This section is the fix for the leak that made it into history: the old
+# key pair was committed because generate_keys.py documented a protection
+# that did not exist here. It exists now, and tests/test_secrets.py asserts
+# both this rule and the absence of any PEM in the tree.
+keys/
+*.pem
+*.key
+*.pfx
+*.p12
+
+# --- Runtime data / models --------------------------------------------------
+# data/ and models/ are Docker volumes and local working directories, not repo
+# content: camera captures, the sqlite DB, downloaded and fine-tuned weights.
+#
+# models/ is ignored wholesale rather than by extension. The narrow patterns
+# that used to live here (models/*.pt, models/*.onnx) missed the ~98 MB of
+# EasyOCR .pth weights sitting one directory down in models/easyocr/, which is
+# how they ended up in git without LFS. Fetch every weight with
+# scripts/fetch_models.py; nothing in models/ belongs in a commit.
 data/
-models/*.pt
-models/*.pt.bak
-models/*.onnx
+models/
+*.pt
+*.pt.bak
+*.pth
+*.onnx
+*.engine
+*.tflite
 
 # Training artefacts: ultralytics run directories (weights, plots, metrics)
 # and downloaded datasets. Produced by scripts/train_plate_detector.py; only
