@@ -39,6 +39,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import socket
 import sys
 import urllib.error
@@ -49,6 +50,17 @@ BASELINE_NAME = "yolov8n.pt"
 PLATE_MODEL_NAME = "plate_yolov8n.pt"
 # Same release Ultralytics itself pulls weights from when auto-downloading.
 DOWNLOAD_URL = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{BASELINE_NAME}"
+
+#: SHA-256 of the official v8.3.0 yolov8n.pt, verified against the release URL
+#: above. A .pt is a pickle: torch.load executes what is inside it, so an
+#: unverified download from a redirected or poisoned mirror is arbitrary code
+#: on the gate box. Checked on every download; a mismatch deletes the file
+#: rather than leaving something plausible-looking on disk.
+#:
+#: Only pinned for the default URL. A --url override is somebody's own mirror
+#: or air-gapped copy, and refusing to fetch it because it does not match the
+#: upstream hash would break the case the flag exists for.
+BASELINE_SHA256 = "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36"
 
 DATASET_LAYOUT_NOTE = """
 Fine-tuning dataset layout (YOLO format, single class "plate")
@@ -92,7 +104,25 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def download(url: str, dest: Path, timeout: float = 30.0) -> None:
+def sha256_of(path: Path) -> str:
+    """Hex digest of a file, read in chunks so a 100 MB weight file is cheap."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 256), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download(
+    url: str, dest: Path, timeout: float = 30.0, expected_sha256: str | None = None
+) -> None:
+    """Fetch ``url`` to ``dest``, verifying the digest before it lands.
+
+    The download goes to a ``.part`` file and is renamed into place only after
+    the hash matches, so an interrupted or tampered fetch can never leave
+    something the loader would happily execute. A ``.pt`` is a pickle:
+    ``torch.load`` runs what is inside it.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_dest = dest.with_suffix(dest.suffix + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": "lpr-fetch-models/1"})
@@ -102,7 +132,33 @@ def download(url: str, dest: Path, timeout: float = 30.0) -> None:
             if not chunk:
                 break
             out.write(chunk)
+
+    if expected_sha256:
+        actual = sha256_of(tmp_dest)
+        if actual != expected_sha256:
+            tmp_dest.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"checksum mismatch for {url}\n"
+                f"  expected {expected_sha256}\n"
+                f"  got      {actual}\n"
+                "The download was discarded. This is either a corrupted transfer or "
+                "a substituted file; a .pt is executed by torch.load, so it is not "
+                "being kept either way."
+            )
     tmp_dest.replace(dest)
+
+
+def is_stock_baseline(path: Path) -> bool:
+    """True when ``path`` is the stock COCO baseline wearing another name.
+
+    Hash comparison rather than class-name inspection, so it answers without
+    importing torch -- this script has to work on a box that has not installed
+    the ML wheels yet, which is exactly when somebody is running it.
+    """
+    try:
+        return path.is_file() and sha256_of(path) == BASELINE_SHA256
+    except OSError:
+        return False
 
 
 #: Weight files a default ``easyocr.Reader(["en"])`` needs on disk. Used to
@@ -231,6 +287,31 @@ def main(argv: list[str] | None = None) -> int:
     # yolov8n.pt. Downloading it here would only be a 6 MB decoy.
     if plate_path.exists() and not args.force:
         size_mb = plate_path.stat().st_size / (1024 * 1024)
+        if is_stock_baseline(plate_path):
+            # The exact state this repository shipped in: the COCO baseline
+            # renamed to satisfy detection.model_path. It loads, it detects
+            # people and chairs, the runtime rejects it as unusable weights and
+            # falls back to contour detection -- and the old version of this
+            # message called it a "custom plate model", which is how the state
+            # survived as long as it did.
+            print(
+                f"[fetch_models] WARNING: {plate_path} is byte-for-byte the stock "
+                f"COCO {BASELINE_NAME}, not a plate detector.",
+                file=sys.stderr,
+            )
+            print(
+                "[fetch_models] The pipeline will reject it at startup and fall back "
+                "to contour detection, which reads far fewer plates.",
+                file=sys.stderr,
+            )
+            print("[fetch_models] Train a real one:")
+            print("[fetch_models]   python scripts/fetch_dataset.py --scaffold datasets/plates")
+            print(
+                "[fetch_models]   python scripts/train_plate_detector.py "
+                "--data datasets/plates/data.yaml"
+            )
+            return fetch_easyocr(models_dir, args.easyocr_timeout) if args.easyocr else 1
+
         print(f"[fetch_models] Custom plate model found: {plate_path} ({size_mb:.1f} MB)")
         print("[fetch_models] This is what the pipeline loads (detection.model_path).")
         print(f"[fetch_models] Skipping the generic {BASELINE_NAME} download -- nothing to do.")
@@ -241,8 +322,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[fetch_models] {baseline_path} already exists, skipping download (use --force to redo).")
     else:
         print(f"[fetch_models] Downloading {args.url} -> {baseline_path}")
+        # Only the default URL has a pinned digest; see BASELINE_SHA256.
+        expected = BASELINE_SHA256 if args.url == DOWNLOAD_URL else None
+        if expected is None:
+            print("[fetch_models] NOTE: --url overridden, so the checksum is not pinned.")
         try:
-            download(args.url, baseline_path)
+            download(args.url, baseline_path, expected_sha256=expected)
+        except RuntimeError as exc:
+            print(f"[fetch_models] ERROR: {exc}", file=sys.stderr)
+            return 1
         except urllib.error.HTTPError as exc:
             print(f"[fetch_models] ERROR: server returned HTTP {exc.code} for {args.url}", file=sys.stderr)
             return 1

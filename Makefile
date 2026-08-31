@@ -1,4 +1,6 @@
-.PHONY: install install-gui dev lint fmt test run-api run-gui docker-build docker-up docker-down clean
+.PHONY: install install-gui dev lint fmt test test-fast secrets dataset-scaffold \
+        dataset-check evaluate train export-onnx run-api run-gui docker-build \
+        docker-up docker-down clean
 
 PYTHON ?= python3
 COMPOSE = docker compose -f docker/docker-compose.yml
@@ -30,6 +32,46 @@ fmt:
 
 test:
 	pytest
+
+# The subset that needs no ML wheels. Same set the CI "lint-and-unit" job runs,
+# so a failure here is a failure there.
+test-fast:
+	pytest tests/test_dataset.py tests/test_evaluation.py tests/test_normalize.py \
+	       tests/test_voting.py tests/test_config.py -q
+
+# Credential scan over the working tree AND git history. Run it before any push.
+secrets:
+	pytest tests/test_secrets.py -q
+
+# --- Detection model pipeline ------------------------------------------------
+# DATASET points at the YOLO dataset; override it for a set living elsewhere:
+#   make dataset-check DATASET=/srv/plates
+DATASET ?= datasets/plates
+EVAL_IMAGES ?= $(DATASET)/images/test
+
+dataset-scaffold:
+	$(PYTHON) scripts/fetch_dataset.py --scaffold $(DATASET)
+
+# Always run this before booking GPU time. It catches an empty val split, a
+# train/val leak and pixel-coordinate labels -- each of which produces a
+# training run that completes and a model that detects nothing.
+dataset-check:
+	$(PYTHON) scripts/fetch_dataset.py --check $(DATASET)/data.yaml
+
+# --min-map refuses to install weights that did not clear the bar, so a bad run
+# cannot quietly replace a good model.
+train:
+	$(PYTHON) scripts/train_plate_detector.py --data $(DATASET)/data.yaml --min-map 0.85
+
+export-onnx:
+	$(PYTHON) scripts/export_onnx.py
+
+# End-to-end accuracy and latency. Needs a labelled evaluation set including
+# negatives -- images with no plate -- or the false-positive rate cannot be
+# measured and its gate fails rather than passing vacuously.
+evaluate:
+	$(PYTHON) scripts/evaluate.py --images $(EVAL_IMAGES) --device both \
+	       --json accuracy-report.json
 
 run-api:
 	uvicorn lpr.api.main:app --reload --host 0.0.0.0 --port 8000

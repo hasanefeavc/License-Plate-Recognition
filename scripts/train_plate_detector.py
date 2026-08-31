@@ -43,6 +43,12 @@ import shutil
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from lpr.dataset import validate_dataset  # noqa: E402  (after the path bootstrap)
+
 # Hyperparameters. The defaults below are tuned for plates specifically:
 # small, high-aspect-ratio objects that occupy a fraction of a percent of a
 # 720p frame, photographed at an angle, at night, and through motion blur.
@@ -149,14 +155,35 @@ def download_roboflow_dataset(destination: Path) -> Path:
 
 
 def resolve_dataset(args: argparse.Namespace) -> Path:
-    """The ``data.yaml`` to train against: explicit ``--data`` or Roboflow."""
+    """The ``data.yaml`` to train against: explicit ``--data`` or Roboflow.
+
+    Whichever it came from, it is validated before a GPU is touched. The
+    failure this guards against is the expensive-and-silent one: a run that
+    completes against an empty or leaked validation split, reports a
+    respectable mAP, and installs a model that detects nothing.
+    """
     if args.data:
         data_yaml = Path(args.data).expanduser().resolve()
         if not data_yaml.exists():
             raise SystemExit(f"[train] ERROR: dataset config not found: {data_yaml}")
         print(f"[train] Using local dataset {data_yaml}")
+    else:
+        data_yaml = download_roboflow_dataset(Path(args.dataset_dir).expanduser().resolve())
+
+    if args.skip_dataset_check:
+        print("[train] --skip-dataset-check given; training on an unverified dataset.")
         return data_yaml
-    return download_roboflow_dataset(Path(args.dataset_dir).expanduser().resolve())
+
+    report = validate_dataset(data_yaml)
+    print(f"[train] Dataset check: {data_yaml}")
+    print(report.summary())
+    if not report.ok:
+        raise SystemExit(
+            "[train] ERROR: this dataset would not produce a usable model. Fix the "
+            "errors above, or re-run with --skip-dataset-check to train anyway.\n"
+            f"[train]   python scripts/fetch_dataset.py --check {data_yaml}"
+        )
+    return data_yaml
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +191,8 @@ def resolve_dataset(args: argparse.Namespace) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def train(args: argparse.Namespace, data_yaml: Path) -> Path:
-    """Run the fine-tune and return the path to ``best.pt``."""
+def train(args: argparse.Namespace, data_yaml: Path) -> tuple[Path, dict[str, float]]:
+    """Run the fine-tune. Returns ``(best.pt, validation metrics)``."""
     try:
         from ultralytics import YOLO
     except ImportError:
@@ -207,7 +234,7 @@ def train(args: argparse.Namespace, data_yaml: Path) -> Path:
             "[train] ERROR: training finished but no best.pt was produced. "
             f"Look in {Path(args.project) / args.name} for what happened."
         )
-    return best
+    return best, read_metrics(getattr(model, "metrics", None) or results)
 
 
 def find_best_weights(results: object, fallback_run_dir: Path) -> Path | None:
@@ -228,6 +255,129 @@ def find_best_weights(results: object, fallback_run_dir: Path) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def read_metrics(results: object) -> dict[str, float]:
+    """Validation metrics from a finished run, as a plain dict.
+
+    ultralytics has moved these around between versions (``results_dict`` on
+    the metrics object, ``box.map50`` on newer ones), so every access is
+    defensive and a missing metric is absent rather than zero -- reporting a
+    real 0.0 mAP and "we could not read the mAP" as the same number would turn
+    the acceptance gate below into a coin toss.
+    """
+    metrics: dict[str, float] = {}
+    source = getattr(results, "results_dict", None)
+    if isinstance(source, dict):
+        for key, value in source.items():
+            try:
+                metrics[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+    box = getattr(results, "box", None)
+    for attribute, name in (
+        ("map50", "mAP50"),
+        ("map", "mAP50-95"),
+        ("mp", "precision"),
+        ("mr", "recall"),
+    ):
+        value = getattr(box, attribute, None)
+        if value is None:
+            continue
+        try:
+            metrics.setdefault(name, float(value))
+        except (TypeError, ValueError):
+            continue
+    return metrics
+
+
+def _metric(metrics: dict[str, float], *names: str) -> float | None:
+    """First metric matching any of ``names``, tolerating ultralytics' spellings."""
+    for name in names:
+        for key, value in metrics.items():
+            if key == name or key.endswith(f"/{name}") or key.endswith(f"({name})"):
+                return value
+    return None
+
+
+def report_metrics(metrics: dict[str, float], min_map50: float) -> bool:
+    """Print the run's validation numbers and say whether they clear the gate.
+
+    The gate exists because "training finished" and "training produced
+    something worth putting on a gate" are different statements, and only the
+    first one is obvious from the console output.
+    """
+    map50 = _metric(metrics, "mAP50", "metrics/mAP50(B)")
+    map5095 = _metric(metrics, "mAP50-95", "metrics/mAP50-95(B)")
+    precision = _metric(metrics, "precision", "metrics/precision(B)")
+    recall = _metric(metrics, "recall", "metrics/recall(B)")
+
+    print("[train] Validation metrics:")
+    for label, value in (
+        ("mAP@0.5     ", map50),
+        ("mAP@0.5:0.95", map5095),
+        ("precision   ", precision),
+        ("recall      ", recall),
+    ):
+        rendered = f"{value:.4f}" if value is not None else "(unavailable)"
+        print(f"[train]   {label} {rendered}")
+
+    if min_map50 <= 0:
+        return True
+    if map50 is None:
+        print(
+            "[train] WARNING: --min-map was given but no mAP@0.5 could be read from "
+            "this ultralytics version; the gate is being skipped rather than guessed.",
+            file=sys.stderr,
+        )
+        return True
+    if map50 < min_map50:
+        print(
+            f"[train] REJECTED: mAP@0.5 {map50:.4f} is below the --min-map floor "
+            f"{min_map50:.4f}. The weights were NOT installed; they are still in the "
+            "run directory if you want to inspect them.",
+            file=sys.stderr,
+        )
+        return False
+    print(f"[train] mAP@0.5 {map50:.4f} clears the --min-map floor {min_map50:.4f}.")
+    return True
+
+
+def verify_plate_model(weights: Path) -> None:
+    """Refuse to install weights the runtime loader would reject.
+
+    Exactly the check ``YoloPlateDetector`` runs at startup, run here instead
+    so a bad model is caught at training time rather than discovered as a gate
+    that silently fell back to contour detection. A model whose classes are
+    person/car/chair is the stock COCO baseline, which is what a collapsed
+    Roboflow download leaves behind.
+    """
+    try:
+        from ultralytics import YOLO
+
+        from lpr.detect.yolo import UnusablePlateWeights, YoloPlateDetector
+    except ImportError as exc:  # pragma: no cover - ultralytics checked in train()
+        print(f"[train] WARNING: cannot verify the weights ({exc}); installing anyway.")
+        return
+
+    try:
+        model = YOLO(str(weights))
+        YoloPlateDetector._resolve_plate_classes(model)
+    except UnusablePlateWeights as exc:
+        raise SystemExit(
+            f"[train] ERROR: refusing to install {weights} -- {exc}\n"
+            "[train] The pipeline would reject these weights at startup and fall back "
+            "to contour detection, so installing them would look like success and "
+            "behave like failure."
+        ) from None
+    except Exception as exc:
+        print(f"[train] WARNING: could not inspect {weights} ({exc}); installing anyway.")
+        return
+
+    names = getattr(model, "names", None) or {}
+    listed = list(names.values()) if isinstance(names, dict) else list(names)
+    print(f"[train] Weights verified: {len(listed)} class(es) -- {', '.join(map(str, listed))}")
 
 
 def install_model(best: Path, models_dir: Path) -> Path:
@@ -306,6 +456,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Train, but leave best.pt where it is instead of copying it into models/.",
     )
+    parser.add_argument(
+        "--min-map",
+        type=float,
+        default=0.0,
+        help="Refuse to install the weights unless validation mAP@0.5 reaches this. "
+        "0 disables the gate. 0.85 is a reasonable floor for a single-class "
+        "plate detector before it goes anywhere near a barrier.",
+    )
+    parser.add_argument(
+        "--skip-dataset-check",
+        action="store_true",
+        help="Train without validating the dataset first. You almost never want "
+        "this: the check costs seconds and catches the mistakes that cost a "
+        "whole training run.",
+    )
     return parser
 
 
@@ -316,10 +481,17 @@ def main(argv: list[str] | None = None) -> int:
         print("[train] ERROR: --epochs and --batch must be >= 1, --imgsz >= 32.", file=sys.stderr)
         return 1
 
+    if args.min_map < 0 or args.min_map > 1:
+        print("[train] ERROR: --min-map must be between 0 and 1.", file=sys.stderr)
+        return 1
+
     data_yaml = resolve_dataset(args)
-    best = train(args, data_yaml)
+    best, metrics = train(args, data_yaml)
 
     print(f"[train] Best weights: {best}")
+    if not report_metrics(metrics, args.min_map):
+        return 1
+
     if args.no_install_model:
         print(
             f"[train] --no-install-model given; copy it yourself with:\n"
@@ -327,12 +499,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    verify_plate_model(best)
     destination = install_model(best, args.models_dir)
     print()
     print("[train] Done. The pipeline will use this model on its next start:")
     print(f"[train]   detection.model_path -> {destination}")
     print("[train] Validate it before putting it on a gate:")
     print(f"[train]   yolo detect val model={destination} data={data_yaml}")
+    print("[train] Then measure the whole pipeline, not just the detector:")
+    print(f"[train]   python scripts/evaluate.py --data {data_yaml} --split test")
     return 0
 
 
