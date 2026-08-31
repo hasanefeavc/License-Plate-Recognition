@@ -139,6 +139,14 @@ def _tracked_files() -> list[str]:
     return [name for name in result.stdout.decode().split("\0") if name]
 
 
+#: The scanner cannot scan itself. This file necessarily contains every marker
+#: and prefix it looks for, so a scan that included it would always fail. The
+#: exemption is one named path rather than a pattern, so nothing else can drift
+#: into it -- and the positive-control tests below assert that the patterns
+#: still match, which is what an exempted file would otherwise stop proving.
+SCANNER_SELF = "tests/test_secrets.py"
+
+
 def _read_text(name: str) -> str:
     """Tracked file as text, or "" when it is binary or unreadable."""
     try:
@@ -288,6 +296,8 @@ def test_no_tracked_file_carries_private_key_material() -> None:
     """
     offenders: list[str] = []
     for name in _tracked_files():
+        if name == SCANNER_SELF:
+            continue
         if any(marker in _read_text(name) for marker in PRIVATE_KEY_MARKERS):
             offenders.append(name)
     assert not offenders, (
@@ -311,8 +321,7 @@ def test_no_tracked_file_carries_a_vendor_api_token() -> None:
     """AWS, GitHub, Slack, Stripe and friends, matched on their own prefixes."""
     offenders: list[str] = []
     for name in _tracked_files():
-        # This file *contains* the patterns by definition.
-        if name == "tests/test_secrets.py":
+        if name == SCANNER_SELF:
             continue
         text = _read_text(name)
         for label, pattern in API_TOKEN_RES:
@@ -324,12 +333,13 @@ def test_no_tracked_file_carries_a_vendor_api_token() -> None:
 def test_the_guard_recognises_the_private_key_that_actually_leaked() -> None:
     """A negative test proves nothing unless the positive case is asserted too.
 
-    The header below is the literal first line of the key pair that was
-    committed and pushed. If a future refactor breaks the scan, this fails
-    rather than the scan silently passing everything.
+    The body is synthetic -- the header is what the scan keys on, and pasting
+    even a fragment of the real key back in would defeat the purge this test
+    exists to protect. If a future refactor breaks the scan, this fails rather
+    than the scan silently passing everything.
     """
-    leaked = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\n"
-    assert any(marker in leaked for marker in PRIVATE_KEY_MARKERS)
+    shaped_like_the_leak = "-----BEGIN PRIVATE KEY-----\nAAAA...redacted...AAAA\n"
+    assert any(marker in shaped_like_the_leak for marker in PRIVATE_KEY_MARKERS)
 
 
 def test_the_guard_recognises_a_credential_bearing_rtsp_url() -> None:
