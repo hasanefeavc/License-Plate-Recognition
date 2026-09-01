@@ -158,6 +158,7 @@ SCANNER_SELF = "tests/test_secrets.py"
 URL_CREDENTIAL_EXEMPT = frozenset(
     {
         "src/lpr/masking.py",  # documents the shape it redacts
+        "docs/DEPLOYMENT.md",  # shows an installer what an RTSP URL looks like
         "tests/test_camera.py",  # RTSP masking
         "tests/test_relay.py",  # IP-relay URL masking
     }
@@ -515,10 +516,22 @@ def test_the_url_exemption_does_not_cover_vendor_tokens() -> None:
 
 
 def test_the_exemption_names_files_rather_than_a_directory() -> None:
-    """A `tests/` glob would let a real key into any new test file."""
+    """A `tests/` glob would let a real key into any new file under it.
+
+    The rule is "one named file at a time", not "only Python": the deployment
+    guide legitimately shows an installer what an RTSP URL looks like. What
+    must not appear here is a pattern, a bare directory, or enough entries that
+    the scan stops meaning anything -- hence the ceiling.
+    """
     for name in URL_CREDENTIAL_EXEMPT:
-        assert name.endswith(".py")
-        assert "*" not in name
+        assert "*" not in name and "?" not in name, f"{name} is a pattern"
+        assert not name.endswith("/"), f"{name} is a directory"
+        assert (ROOT / name).is_file(), f"{name} does not exist; stale exemption"
+
+    assert len(URL_CREDENTIAL_EXEMPT) <= 6, (
+        "the exemption list is growing. Each entry is a file the credential "
+        "heuristic no longer covers, so it is a budget rather than a bucket."
+    )
 
 
 def test_exempt_files_are_still_scanned_for_private_keys() -> None:

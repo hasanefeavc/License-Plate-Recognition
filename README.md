@@ -6,6 +6,20 @@ talks to it over HTTP + WebSocket.
 
 Targets **Ubuntu 24.04 LTS** and **Windows 11**.
 
+| | |
+|---|---|
+| **Installing this at a site?** | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — the field guide, start to finish |
+| **Training the detector?** | [`README_TRAINING.md`](README_TRAINING.md) |
+| **Reporting a vulnerability?** | [`SECURITY.md`](SECURITY.md) |
+| **Licensing / commercial use?** | [`COMMERCIAL.md`](COMMERCIAL.md) |
+| **What changed?** | [`CHANGELOG.md`](CHANGELOG.md) |
+
+> **Before commissioning a gate:** run `python scripts/fetch_models.py` and read
+> its output. The repository ships **no trained plate detector** — `models/`
+> holds the stock COCO baseline, and the pipeline falls back to contour
+> detection, which misses angled, blurred and night plates entirely. See
+> [`README_TRAINING.md`](README_TRAINING.md).
+
 ---
 
 ## Architecture
@@ -1666,33 +1680,40 @@ fakes, so the suite is fully collectable in a CI job with no ML wheels installed
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 181 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
+| `test_api.py` | 203 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
 | `test_web_ui.py` | 121 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_detect.py` | 109 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
 | `test_normalize.py` | 93 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
-| `test_pipeline.py` | 65 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
-| `test_updater.py` | 61 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
+| `test_pipeline.py` | 80 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
+| `test_updater.py` | 71 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
 | `test_db.py` | 57 | Repositories, migrations, retention, system-event trail, partial plate updates |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
+| `test_secrets.py` | 50 | No credentials in tracked templates; `.env*` ignore rules |
+| `test_evaluation.py` | 47 | Plate accuracy, CER, wrong-plate and false-positive rates |
 | `test_notify.py` | 40 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
+| `test_camera.py` | 32 | RTSP hardening: FFmpeg options, stall watchdog, backoff, credential masking |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
+| `test_relay.py` | 30 | Serial pulse queue, MockRelay fallback |
 | `test_preprocess_pipeline.py` | 28 | Preprocessing wiring: escalation staging, frame-hook injection |
+| `test_snapshots.py` | 28 | Evidence writer, retention, off-hot-path encoding |
 | `test_user_license.py` | 28 | Key issue/verify, binding, expiry, revocation precedence |
+| `test_dataset.py` | 27 | YOLO dataset validation: empty splits, train/val leaks, pixel labels |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
-| `test_secrets.py` | 20 | No credentials in tracked templates; `.env*` ignore rules |
+| `test_machine.py` | 22 | Machine fingerprinting, tolerant matching, hardware-bound licences |
+| `test_ratelimit.py` | 21 | Login rate limiting, progressive lockout, eviction safety |
+| `test_backup.py` | 19 | SQLite backup consistency, restore, pre-migration safety net |
 | `test_config.py` | 19 | Shipped defaults: sliding-gate cooldown, pulse width, voting threshold, fast-path key migration |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_parking.py` | 18 | Occupancy accounting |
-| `test_snapshots.py` | 17 | Evidence writer, retention, off-hot-path encoding |
 | `test_auth_sessions.py` | 14 | Role-scoped session lengths, token revocation on delete/demote |
-| `test_relay.py` | 14 | Serial pulse queue, MockRelay fallback |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
-`test_normalize.py`, `test_voting.py`, `test_ensemble.py` and
-`test_preprocess_pipeline.py` together account for 287 of the 1144 collected tests. Every
+`test_normalize.py`, `test_voting.py`, `test_ensemble.py`,
+`test_preprocess_pipeline.py`, `test_evaluation.py` and `test_dataset.py`
+together account for 361 of the 1416 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 
