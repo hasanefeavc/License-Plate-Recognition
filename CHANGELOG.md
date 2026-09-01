@@ -57,6 +57,29 @@ are currently driving through.
 - **README told you to put `.env` in `docker/`.** Compose reads a file there
   for `${...}` substitution only, and nothing substitutes `LPR_API__SECRET_KEY`
   — a secret placed there reached neither the container nor the application.
+- **E-mail alerts were silently off on any host run**, for the same reason: the
+  password arrives through `LPR_SMTP__PASSWORD` in `.env`, so `smtp.usable` was
+  false, `notify()` refused every alert and the counters read
+  `sent=0 failed=0 suppressed=n`. No exception was raised because nothing was
+  attempted — which is why it did not look like a failure.
+
+### Added
+
+- **`scripts/test_email.py`** — sends one real alert end to end and reports
+  `sent` / `failed` / `dropped` / `suppressed`. `tests/test_notify.py` drives
+  every branch of the notifier with an injected sender and deliberately opens
+  no socket, so this covers the one link those tests cannot: whether this
+  site's credentials, port and TLS settings actually deliver. It prints which
+  source supplied each SMTP value first, because "I set it in config.yaml and
+  nothing happened" is usually answered by something further up the chain.
+  `--dry-run` exercises the whole path without a socket.
+- **Unrecognised `LPR_*` variables are named in a warning at startup.**
+  `Settings` is `extra="ignore"`, so a plausible near-miss — `LPR_SMTP__TO_ADDRS`
+  for `to_emails`, `LPR_SMTP__USERNAME` for `user` — was discarded in silence
+  and the setting stayed at whatever `config.yaml` said, with the operator
+  looking at a `.env` that claimed otherwise. Reported, not rejected: a stale
+  line in an old `.env` must not stop a gate from starting. `.env.example` now
+  spells out the SMTP names that are easiest to guess wrong.
 
 ---
 

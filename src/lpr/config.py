@@ -29,6 +29,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from functools import lru_cache
@@ -45,6 +46,8 @@ from pydantic_settings import (
 )
 
 from lpr.platform_compat import default_serial_port
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Section models
@@ -1166,6 +1169,96 @@ class ResolvedPaths:
 # ---------------------------------------------------------------------------
 
 
+#: ``LPR_`` variables that are deliberately not settings fields.
+#:
+#: Some are read straight from the environment by a module that runs before, or
+#: independently of, ``Settings`` (``LPR_ENV`` gates production checks in two
+#: places; ``LPR_LICENSE_PUBLIC_KEY`` is read by :mod:`lpr.license`). The rest
+#: are consumed by Compose itself and never reach Python at all. Both kinds
+#: have to be listed, or :func:`unknown_env_names` reports the whole deployment
+#: as misconfigured and the warning becomes something people learn to ignore.
+_NON_FIELD_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        # read directly from os.environ by application code
+        "LPR_ENV",
+        "LPR_CONFIG_FILE",
+        "LPR_ENV_FILE",
+        "LPR_API_DOCS",
+        "LPR_LICENSE_PUBLIC_KEY",
+        # consumed by docker compose, never by the application
+        "LPR_BIND",
+        "LPR_PORT",
+        "LPR_VIDEO_GID",
+        "LPR_DOCKER_GID",
+        "LPR_DOCKER_SOCK",
+        "LPR_MEM_LIMIT",
+        "LPR_DOMAIN",
+        "LPR_ACME_EMAIL",
+    }
+)
+
+
+def _field_env_names(model: type[BaseModel], prefix: str = "LPR_") -> set[str]:
+    """Every ``LPR_``-prefixed variable name this model would accept."""
+    names: set[str] = set()
+    for field_name, field in model.model_fields.items():
+        env_name = f"{prefix}{field_name.upper()}"
+        names.add(env_name)
+        annotation = field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            names |= _field_env_names(annotation, f"{env_name}__")
+    return names
+
+
+def unknown_env_names() -> list[str]:
+    """``LPR_`` names, from the environment or ``.env``, that configure nothing.
+
+    ``Settings`` is declared ``extra="ignore"``, which is the right behaviour
+    for a process whose environment it does not own -- but it means a typo, or
+    a plausible-looking name that is not the field's actual name, is discarded
+    in silence. ``LPR_SMTP__TO_ADDRS`` is the shape this takes in practice: it
+    reads like the setting it is meant to be, the field is called ``to_emails``,
+    and the alerts keep going to whatever address ``config.yaml`` last named.
+
+    Reported rather than rejected. An unknown name is far more often a stale
+    line in an old ``.env`` than an emergency, and refusing to start a gate
+    over one would be the more expensive mistake.
+    """
+    known = _field_env_names(Settings) | _NON_FIELD_ENV_NAMES
+
+    candidates: set[str] = {name for name in os.environ if name.startswith("LPR_")}
+
+    env_file = _default_env_file_path()
+    if env_file.is_file():
+        try:
+            text = env_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:  # pragma: no cover - unreadable .env is its own problem
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name = line.split("=", 1)[0].strip().removeprefix("export ").strip()
+            if name.startswith("LPR_"):
+                candidates.add(name)
+
+    return sorted(name for name in candidates if name not in known)
+
+
+def warn_about_unknown_env_names() -> list[str]:
+    """Log one warning naming every ``LPR_`` variable that configures nothing."""
+    unknown = unknown_env_names()
+    if unknown:
+        logger.warning(
+            "Bu ortam değişkenleri hiçbir ayara karşılık gelmiyor ve yok sayıldı: "
+            "%s. Ad birebir eşleşmelidir (örn. smtp.to_emails -> "
+            "LPR_SMTP__TO_EMAILS); yakın bir yazım sessizce göz ardı edilir ve "
+            "ayar config.yaml'daki değerinde kalır.",
+            ", ".join(unknown),
+        )
+    return unknown
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return the process-wide ``Settings`` singleton, building it on first call.
@@ -1173,7 +1266,9 @@ def get_settings() -> Settings:
     Use ``reload_settings()`` (not a second ``get_settings()`` call) to pick
     up changed environment variables or a rewritten ``config.yaml``.
     """
-    return Settings()
+    settings = Settings()
+    warn_about_unknown_env_names()
+    return settings
 
 
 def reload_settings() -> Settings:

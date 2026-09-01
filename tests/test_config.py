@@ -29,6 +29,8 @@ from lpr.config import (
     VotingConfig,
     _default_config_yaml_path,
     _default_env_file_path,
+    unknown_env_names,
+    warn_about_unknown_env_names,
 )
 
 # ---------------------------------------------------------------------------
@@ -310,3 +312,88 @@ def test_both_config_files_are_looked_for_in_the_same_place(
 
     assert _default_env_file_path().parent == _default_config_yaml_path().parent
     assert _default_env_file_path().name == ".env"
+
+
+# ---------------------------------------------------------------------------
+# Variables that configure nothing
+# ---------------------------------------------------------------------------
+
+
+def test_a_correctly_named_variable_is_not_reported(isolated_sources: Any) -> None:
+    isolated_sources.env_file.write_text(
+        "LPR_SMTP__TO_EMAILS=['a@example.com']\n", encoding="utf-8"
+    )
+    assert unknown_env_names() == []
+
+
+def test_a_plausible_misspelling_is_reported(isolated_sources: Any) -> None:
+    """`to_addrs` reads like the setting; the field is called `to_emails`.
+
+    Silently discarded by ``extra="ignore"``, which leaves the alerts going to
+    whatever address ``config.yaml`` last named -- with the operator looking at
+    a ``.env`` that says otherwise.
+    """
+    isolated_sources.env_file.write_text(
+        "LPR_SMTP__TO_ADDRS=['a@example.com']\n"
+        "LPR_SMTP__USERNAME=a@example.com\n",
+        encoding="utf-8",
+    )
+    assert unknown_env_names() == ["LPR_SMTP__TO_ADDRS", "LPR_SMTP__USERNAME"]
+
+
+def test_a_real_environment_variable_is_checked_too(isolated_sources: Any) -> None:
+    isolated_sources.monkeypatch.setenv("LPR_DETECTION__CONFIDENZE", "0.4")
+    assert "LPR_DETECTION__CONFIDENZE" in unknown_env_names()
+
+
+def test_deeply_nested_names_are_accepted(isolated_sources: Any) -> None:
+    """`cameras.entry.source` is three levels deep and documented in .env.example."""
+    isolated_sources.env_file.write_text(
+        "LPR_CAMERAS__ENTRY__SOURCE=rtsp://cam/1\n", encoding="utf-8"
+    )
+    assert unknown_env_names() == []
+
+
+def test_infrastructure_variables_are_not_reported(isolated_sources: Any) -> None:
+    """Compose reads these; they are not settings and never will be.
+
+    Reporting them would make the warning fire on every correct deployment,
+    which is how a warning stops being read.
+    """
+    isolated_sources.env_file.write_text(
+        "LPR_ENV=production\n"
+        "LPR_BIND=0.0.0.0\n"
+        "LPR_PORT=8000\n"
+        "LPR_VIDEO_GID=44\n"
+        "LPR_DOCKER_SOCK=/var/run/docker.sock\n"
+        "LPR_DOMAIN=gate.example.com\n"
+        "LPR_ACME_EMAIL=ops@example.com\n"
+        "LPR_MEM_LIMIT=6g\n"
+        "LPR_LICENSE_PUBLIC_KEY=/etc/lpr/public.pem\n"
+        "LPR_API_DOCS=1\n",
+        encoding="utf-8",
+    )
+    assert unknown_env_names() == []
+
+
+def test_comments_and_blank_lines_are_not_variables(isolated_sources: Any) -> None:
+    isolated_sources.env_file.write_text(
+        "# LPR_SMTP__NONSENSE=1\n\n   \nLPR_SMTP__HOST=smtp.example.com\n",
+        encoding="utf-8",
+    )
+    assert unknown_env_names() == []
+
+
+def test_a_non_lpr_variable_is_none_of_our_business(isolated_sources: Any) -> None:
+    isolated_sources.env_file.write_text(
+        "PATH=/usr/bin\nTORCH_INDEX_URL=https://example.com\n", encoding="utf-8"
+    )
+    assert unknown_env_names() == []
+
+
+def test_the_report_is_a_warning_and_not_a_refusal(isolated_sources: Any) -> None:
+    """A stale line in an old `.env` must not stop a gate from starting."""
+    isolated_sources.env_file.write_text("LPR_SMTP__TO_ADDRS=x\n", encoding="utf-8")
+    settings = Settings()  # must not raise
+    assert settings.smtp.enabled is False
+    assert warn_about_unknown_env_names() == ["LPR_SMTP__TO_ADDRS"]
