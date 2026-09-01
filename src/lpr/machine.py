@@ -127,9 +127,7 @@ _SKIP_INTERFACES = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg", 
 
 def _digest(value: str) -> str:
     """Salted truncated SHA-256 of one component value."""
-    return hashlib.sha256(_SALT + value.strip().lower().encode("utf-8")).hexdigest()[
-        :_DIGEST_CHARS
-    ]
+    return hashlib.sha256(_SALT + value.strip().lower().encode("utf-8")).hexdigest()[:_DIGEST_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -245,9 +243,9 @@ def _read_board() -> str | None:
         return None
 
     if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
-        output = _run(
-            ["wmic", "csproduct", "get", "UUID"]
-        ) or _run(["wmic", "baseboard", "get", "SerialNumber"])
+        output = _run(["wmic", "csproduct", "get", "UUID"]) or _run(
+            ["wmic", "baseboard", "get", "SerialNumber"]
+        )
         if not output:
             return None
         for line in output.splitlines()[1:]:

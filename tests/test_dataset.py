@@ -87,9 +87,7 @@ def test_the_test_split_is_optional(tmp_path: Path) -> None:
 
 def test_names_may_be_a_list_or_a_mapping(tmp_path: Path) -> None:
     """Roboflow writes one spelling, hand-written configs the other."""
-    as_list = validate_dataset(
-        write_dataset(tmp_path / "a", names=f"  - {DEFAULT_CLASS_NAME}\n")
-    )
+    as_list = validate_dataset(write_dataset(tmp_path / "a", names=f"  - {DEFAULT_CLASS_NAME}\n"))
     as_map = validate_dataset(write_dataset(tmp_path / "b"))
     assert as_list.class_names == as_map.class_names == [DEFAULT_CLASS_NAME]
 
@@ -139,9 +137,7 @@ def test_pixel_coordinates_are_rejected(tmp_path: Path) -> None:
     Ultralytics accepts the file and trains on boxes that are nonsense, which
     surfaces as a model that detects nothing rather than as an error.
     """
-    report = validate_dataset(
-        write_dataset(tmp_path, label_body="0 640 360 128 64\n")
-    )
+    report = validate_dataset(write_dataset(tmp_path, label_body="0 640 360 128 64\n"))
     assert not report.ok
     assert any("normalised" in message for message in report.splits["train"].errors)
 
@@ -199,9 +195,7 @@ def test_a_multi_class_dataset_with_no_plate_class_is_rejected(tmp_path: Path) -
     A detector built from this hands the recogniser a crop of every object it
     knows, which is both useless and the largest source of wasted OCR time.
     """
-    report = validate_dataset(
-        write_dataset(tmp_path, names="  0: car\n  1: person\n  2: truck\n")
-    )
+    report = validate_dataset(write_dataset(tmp_path, names="  0: car\n  1: person\n  2: truck\n"))
     assert not report.ok
     assert any("none is named like a plate" in message for message in report.errors)
 

@@ -301,9 +301,7 @@ def stored_schema_version(conn: Any = None) -> int:
     """
     try:
         connection = conn if conn is not None else get_connection()
-        row = connection.execute(
-            schema.SELECT_SCHEMA_META, (schema.SCHEMA_VERSION_KEY,)
-        ).fetchone()
+        row = connection.execute(schema.SELECT_SCHEMA_META, (schema.SCHEMA_VERSION_KEY,)).fetchone()
     except Exception:
         return 0
     if row is None:

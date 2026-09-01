@@ -93,7 +93,7 @@ def in_container() -> bool:
     if os.path.exists("/.dockerenv"):
         return True
     try:
-        with open("/proc/1/cgroup", "rt", encoding="utf-8", errors="ignore") as f:
+        with open("/proc/1/cgroup", encoding="utf-8", errors="ignore") as f:
             content = f.read()
         return "docker" in content or "kubepods" in content
     except OSError:

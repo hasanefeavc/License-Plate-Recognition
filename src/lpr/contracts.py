@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -26,7 +26,7 @@ else:
 
 def utc_now_iso() -> str:
     """Timestamp format used everywhere: ISO-8601, UTC, second precision."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 class CameraRole(StrEnum):
@@ -180,7 +180,7 @@ class PredicateRecognizer(Protocol):
     """
 
     def recognize(
-        self, crop: Frame, accept: "Callable[[PlateRead], bool] | None" = None
+        self, crop: Frame, accept: Callable[[PlateRead], bool] | None = None
     ) -> PlateRead: ...
 
     def warmup(self) -> None: ...
@@ -208,9 +208,7 @@ class TrackAwareVoter(Protocol):
     implementation must then fall back to text-based behaviour.
     """
 
-    def submit(
-        self, camera: str, read: PlateRead, track_id: int | None = None
-    ) -> str | None: ...
+    def submit(self, camera: str, read: PlateRead, track_id: int | None = None) -> str | None: ...
 
     def should_recognize(self, camera: str, track_id: int | None) -> bool: ...
 

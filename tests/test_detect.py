@@ -36,11 +36,11 @@ from lpr.detect.yolo import plausible_box  # noqa: E402
 FRAME_H, FRAME_W = 720, 1280
 
 
-def make_frame(height: int = FRAME_H, width: int = FRAME_W) -> "np.ndarray":
+def make_frame(height: int = FRAME_H, width: int = FRAME_W) -> np.ndarray:
     return np.zeros((height, width, 3), dtype=np.uint8)
 
 
-def make_plate_crop(height: int = 40, width: int = 160) -> "np.ndarray":
+def make_plate_crop(height: int = 40, width: int = 160) -> np.ndarray:
     """A synthetic plate: white background with dark bars standing in for glyphs."""
     crop = np.full((height, width, 3), 235, dtype=np.uint8)
     for index in range(6):
@@ -255,7 +255,7 @@ def test_deskew_returns_the_input_when_it_cannot_estimate() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_soft_plate(height: int = 60, width: int = 240) -> "np.ndarray":
+def make_soft_plate(height: int = 60, width: int = 240) -> np.ndarray:
     """A plate crop whose glyph edges have been blurred, as a soft optic would."""
     return cv2.GaussianBlur(make_plate_crop(height, width), (5, 5), 0)
 
@@ -309,7 +309,7 @@ def test_unsharp_mask_never_raises_on_junk() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_dark_frame(height: int = 240, width: int = 320) -> "np.ndarray":
+def make_dark_frame(height: int = 240, width: int = 320) -> np.ndarray:
     """A low-contrast night frame: everything squeezed into a narrow band."""
     rng = np.random.default_rng(1)
     return rng.integers(40, 90, (height, width, 3), dtype=np.uint8)
@@ -362,7 +362,7 @@ def test_enhance_frame_never_raises_on_junk() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_lit_plate(scale: float = 1.0, offset: int = 0) -> "np.ndarray":
+def make_lit_plate(scale: float = 1.0, offset: int = 0) -> np.ndarray:
     """A plate crop re-exposed: ``scale`` for shadow, ``offset`` for glare."""
     base = cv2.cvtColor(make_plate_crop(60, 240), cv2.COLOR_BGR2GRAY).astype(np.float32)
     return np.clip(base * scale + offset, 0, 255).astype(np.uint8)
@@ -508,7 +508,7 @@ def test_enhance_plate_recovers_a_night_crop_better_with_normalisation() -> None
 # ---------------------------------------------------------------------------
 
 
-def make_plate_scene(height: int = 60, width: int = 240) -> "np.ndarray":
+def make_plate_scene(height: int = 60, width: int = 240) -> np.ndarray:
     """A bordered plate sitting on a dark bumper, i.e. with an outline to find."""
     scene = np.full((height + 40, width + 80, 3), 40, dtype=np.uint8)
     plate = np.full((height, width, 3), 240, dtype=np.uint8)
@@ -520,7 +520,7 @@ def make_plate_scene(height: int = 60, width: int = 240) -> "np.ndarray":
     return scene
 
 
-def skew(scene: "np.ndarray", pinch: int = 10) -> "np.ndarray":
+def skew(scene: np.ndarray, pinch: int = 10) -> np.ndarray:
     """Squash the left edge vertically, as a plate seen from the side would be."""
     height, width = scene.shape[:2]
     source = np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]])

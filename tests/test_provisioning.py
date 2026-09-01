@@ -89,9 +89,7 @@ def test_the_minted_licence_actually_validates(
     assert status.client == "local-development"
 
 
-def test_an_existing_licence_is_never_overwritten(
-    tmp_settings: Any, key_dir: Path
-) -> None:
+def test_an_existing_licence_is_never_overwritten(tmp_settings: Any, key_dir: Path) -> None:
     """It may be a real key somebody installed for testing."""
     ensure_keypair(key_dir)
     installed = tmp_settings.paths.data_dir / LICENSE_FILE_NAME

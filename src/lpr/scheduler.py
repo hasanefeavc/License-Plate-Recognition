@@ -99,7 +99,7 @@ class NightlyUpdateJob:
     no event loop in it.
     """
 
-    updater: "SystemUpdater"
+    updater: SystemUpdater
     events: EventSink | None = None
     auto_update: bool = False
 

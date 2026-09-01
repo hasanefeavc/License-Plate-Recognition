@@ -77,9 +77,7 @@ def _ignore_the_developers_dotenv() -> Iterator[None]:
     import os
 
     previous = os.environ.get("LPR_ENV_FILE")
-    os.environ["LPR_ENV_FILE"] = str(
-        Path(__file__).resolve().parent / "_no_such_dotenv_for_tests"
-    )
+    os.environ["LPR_ENV_FILE"] = str(Path(__file__).resolve().parent / "_no_such_dotenv_for_tests")
     try:
         yield
     finally:
@@ -204,22 +202,16 @@ class FakeTrackingDetector(FakeDetector):
     the two cameras are kept on separate tracker states.
     """
 
-    def __init__(
-        self, track_ids: list[int | None] | None = None, **kwargs: Any
-    ) -> None:
+    def __init__(self, track_ids: list[int | None] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._track_ids = list(track_ids) if track_ids else [1]
         self.streams: list[str] = []
 
-    def detect_tracked(
-        self, frame: Any, stream_id: str = "default"
-    ) -> list[PlateDetection]:
+    def detect_tracked(self, frame: Any, stream_id: str = "default") -> list[PlateDetection]:
         self.streams.append(stream_id)
         track_id = self._track_ids[min(self.calls, len(self._track_ids) - 1)]
         return [
-            PlateDetection(
-                bbox=d.bbox, confidence=d.confidence, crop=d.crop, track_id=track_id
-            )
+            PlateDetection(bbox=d.bbox, confidence=d.confidence, crop=d.crop, track_id=track_id)
             for d in self.detect(frame)
         ]
 
@@ -234,9 +226,7 @@ class FakeRecognizer:
         valid: bool = True,
         reads: list[PlateRead] | None = None,
     ) -> None:
-        self._read = PlateRead(
-            text=text, confidence=confidence, raw_text=text, valid=valid
-        )
+        self._read = PlateRead(text=text, confidence=confidence, raw_text=text, valid=valid)
         self._reads = list(reads) if reads else None
         self.calls = 0
         self.warmed_up = False

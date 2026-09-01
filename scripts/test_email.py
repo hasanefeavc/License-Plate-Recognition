@@ -167,9 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--plate", default="34ABC123")
     parser.add_argument("--camera", default="entry")
-    parser.add_argument(
-        "--no-snapshot", action="store_true", help="Send a text-only alert."
-    )
+    parser.add_argument("--no-snapshot", action="store_true", help="Send a text-only alert.")
     parser.add_argument(
         "--timeout", type=float, default=DELIVERY_TIMEOUT_S, help="Seconds to wait."
     )
@@ -185,9 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     describe(settings.smtp)
 
     sent_messages: list[object] = []
-    notifier = build_notifier(
-        settings, sender=(sent_messages.append if args.dry_run else None)
-    )
+    notifier = build_notifier(settings, sender=(sent_messages.append if args.dry_run else None))
 
     if not notifier.enabled:
         print("The notifier is not in a position to send anything.")
@@ -232,9 +228,11 @@ def main(argv: list[str] | None = None) -> int:
 
     ok = notifier.sent == 1 and notifier.failed == 0
     print()
-    print(f"sent={notifier.sent} failed={notifier.failed} "
-          f"dropped={notifier.dropped} suppressed={notifier.suppressed} "
-          f"({elapsed:.1f}s)")
+    print(
+        f"sent={notifier.sent} failed={notifier.failed} "
+        f"dropped={notifier.dropped} suppressed={notifier.suppressed} "
+        f"({elapsed:.1f}s)"
+    )
 
     if ok:
         where = "captured in-process" if args.dry_run else ", ".join(settings.smtp.recipients)

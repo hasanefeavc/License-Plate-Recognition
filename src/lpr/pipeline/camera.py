@@ -107,6 +107,7 @@ def ffmpeg_capture_options(config: CameraConfig) -> str | None:
         options.append(f"stimeout;{int(timeout_s * 1_000_000)}")
     return "|".join(options) if options else None
 
+
 # --- motion gating ---------------------------------------------------------
 
 #: Target width of the image the difference is computed on. The frame is
@@ -498,9 +499,7 @@ class CameraWorker(threading.Thread):
         delay = max(0.1, delay + random.uniform(-spread, spread))
 
         if delay > self._reconnect_delay * 1.5:
-            logger.info(
-                "Camera %s reconnecting in %.1fs (backed off)", self.role, delay
-            )
+            logger.info("Camera %s reconnecting in %.1fs (backed off)", self.role, delay)
         stopping = self._stop_event.wait(delay)
         self._backoff = min(self._backoff * _BACKOFF_FACTOR, self._reconnect_max_delay)
         return stopping

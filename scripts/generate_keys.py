@@ -110,9 +110,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = Path(args.out_dir)
     existing = [
-        path
-        for path in (out_dir / PRIVATE_KEY_NAME, out_dir / PUBLIC_KEY_NAME)
-        if path.exists()
+        path for path in (out_dir / PRIVATE_KEY_NAME, out_dir / PUBLIC_KEY_NAME) if path.exists()
     ]
     if existing and not args.force:
         for path in existing:

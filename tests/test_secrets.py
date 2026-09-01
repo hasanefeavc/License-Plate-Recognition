@@ -141,9 +141,7 @@ REQUIRED_IGNORE_RULES = (
 
 def _tracked_files() -> list[str]:
     """Every path git is tracking, from git itself rather than a directory walk."""
-    result = subprocess.run(
-        ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=False
-    )
+    result = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=False)
     if result.returncode != 0:  # pragma: no cover - not a git checkout
         pytest.skip("not a git checkout")
     return [name for name in result.stdout.decode().split("\0") if name]
@@ -338,9 +336,7 @@ def test_no_tracked_file_carries_private_key_material() -> None:
 def test_no_tracked_file_is_named_like_key_material() -> None:
     """`*.pem` and friends have no business being tracked, whatever they hold."""
     offenders = [
-        name
-        for name in _tracked_files()
-        if Path(name).suffix.lower() in KEY_MATERIAL_SUFFIXES
+        name for name in _tracked_files() if Path(name).suffix.lower() in KEY_MATERIAL_SUFFIXES
     ]
     assert not offenders, f"key-material files are tracked: {offenders}"
 
@@ -387,11 +383,7 @@ def test_the_guard_recognises_a_credential_bearing_rtsp_url() -> None:
 def test_no_model_weights_or_databases_are_tracked() -> None:
     """98 MB of EasyOCR weights reached git through a rule that stopped one
     directory short. `models/` is now ignored wholesale; this asserts it."""
-    offenders = [
-        name
-        for name in _tracked_files()
-        if Path(name).suffix.lower() in BINARY_SUFFIXES
-    ]
+    offenders = [name for name in _tracked_files() if Path(name).suffix.lower() in BINARY_SUFFIXES]
     assert not offenders, f"binary artefacts are tracked: {offenders}"
 
 

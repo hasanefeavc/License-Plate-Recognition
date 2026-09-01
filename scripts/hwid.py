@@ -41,9 +41,7 @@ from lpr.machine import (  # noqa: E402  (after the path bootstrap)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="hwid.py", description=__doc__.split("\n\n")[0]
-    )
+    parser = argparse.ArgumentParser(prog="hwid.py", description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--json",
         action="store_true",

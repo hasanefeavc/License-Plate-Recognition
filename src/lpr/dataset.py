@@ -259,9 +259,7 @@ def _check_label_file(path: Path, class_count: int) -> tuple[int, list[str]]:
             continue
 
         if class_count and not (0 <= class_id < class_count):
-            errors.append(
-                f"{path.name}:{number}: class id {class_id} outside 0..{class_count - 1}"
-            )
+            errors.append(f"{path.name}:{number}: class id {class_id} outside 0..{class_count - 1}")
         low, high = -_COORD_TOLERANCE, 1.0 + _COORD_TOLERANCE
         if any(not (low <= value <= high) for value in coords):
             errors.append(
@@ -312,8 +310,7 @@ def _check_split(name: str, images_dir: Path | None, max_reported: int) -> Split
 
     if report.labels == 0:
         report.errors.append(
-            f"no label file matches any image in {images_dir} -- "
-            f"expected them under {label_root}"
+            f"no label file matches any image in {images_dir} -- expected them under {label_root}"
         )
     return report
 

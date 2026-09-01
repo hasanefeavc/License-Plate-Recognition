@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import jwt
@@ -161,7 +161,7 @@ def create_token(username: str, role: str = OPERATOR_ROLE, ttl_minutes: int | No
     from :func:`token_ttl_seconds`, so an admin gets a long session and an
     operator a shift-length one without the caller having to know the policy.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     lifetime = token_ttl_seconds(role, ttl_minutes)
     payload: dict[str, Any] = {
         "sub": username,
@@ -298,9 +298,7 @@ UserRepo = Annotated[Any, Depends(get_user_repository)]
 
 async def current_user(
     user_repo: UserRepo,
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)
-    ] = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)] = None,
 ) -> AuthUser:
     """FastAPI dependency: the authenticated caller, or HTTP 401."""
     if credentials is None or not credentials.credentials:
@@ -410,9 +408,7 @@ async def license_refusal(user: AuthUser, user_repo: Any) -> str | None:
         # Off the event loop, for the same reason as the revocation check.
         row = await asyncio.to_thread(user_repo.get, user.username)
     except Exception:
-        logger.warning(
-            "Lisans okunamadı, istek kabul ediliyor: %s", user.username, exc_info=True
-        )
+        logger.warning("Lisans okunamadı, istek kabul ediliyor: %s", user.username, exc_info=True)
         return None
 
     state = license_for(user.role, row)

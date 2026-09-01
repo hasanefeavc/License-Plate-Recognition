@@ -328,8 +328,13 @@ def _align_items(m: re.Match[str]) -> Decls:
 @rule(r"justify-(start|end|center|between|around|evenly)")
 def _justify(m: re.Match[str]) -> Decls:
     token = m.group(1)
-    mapped = {"start": "flex-start", "end": "flex-end", "between": "space-between",
-              "around": "space-around", "evenly": "space-evenly"}.get(token, token)
+    mapped = {
+        "start": "flex-start",
+        "end": "flex-end",
+        "between": "space-between",
+        "around": "space-around",
+        "evenly": "space-evenly",
+    }.get(token, token)
     return f"justify-content: {mapped}"
 
 
@@ -544,8 +549,10 @@ def _rounded(m: re.Match[str]) -> Decls:
         "r": ("top-right", "bottom-right"),
         "b": ("bottom-right", "bottom-left"),
         "l": ("top-left", "bottom-left"),
-        "tl": ("top-left",), "tr": ("top-right",),
-        "br": ("bottom-right",), "bl": ("bottom-left",),
+        "tl": ("top-left",),
+        "tr": ("top-right",),
+        "br": ("bottom-right",),
+        "bl": ("bottom-left",),
     }[side]
     return "; ".join(f"border-{corner}-radius: {radius}" for corner in corners)
 
@@ -601,15 +608,18 @@ def _outline_none(_: re.Match[str]) -> Decls:
 
 @rule(r"shadow-(sm|md|lg|xl|2xl|none)?")
 def _shadow(m: re.Match[str]) -> Decls:
-    return "box-shadow: " + {
-        None: "0 1px 3px 0 rgb(0 0 0 / 0.5)",
-        "sm": "0 1px 2px 0 rgb(0 0 0 / 0.4)",
-        "md": "0 4px 6px -1px rgb(0 0 0 / 0.5)",
-        "lg": "0 10px 15px -3px rgb(0 0 0 / 0.5)",
-        "xl": "0 20px 25px -5px rgb(0 0 0 / 0.55)",
-        "2xl": "0 25px 50px -12px rgb(0 0 0 / 0.7)",
-        "none": "none",
-    }[m.group(1)]
+    return (
+        "box-shadow: "
+        + {
+            None: "0 1px 3px 0 rgb(0 0 0 / 0.5)",
+            "sm": "0 1px 2px 0 rgb(0 0 0 / 0.4)",
+            "md": "0 4px 6px -1px rgb(0 0 0 / 0.5)",
+            "lg": "0 10px 15px -3px rgb(0 0 0 / 0.5)",
+            "xl": "0 20px 25px -5px rgb(0 0 0 / 0.55)",
+            "2xl": "0 25px 50px -12px rgb(0 0 0 / 0.7)",
+            "none": "none",
+        }[m.group(1)]
+    )
 
 
 @rule(r"opacity-(\d+)")
@@ -753,11 +763,11 @@ def split_variants(name: str) -> tuple[list[str], str]:
 #: ones capture an expression, whose class names are only the string literals
 #: inside it -- ``el.className = TEXT_CLASSES.muted;`` names no class at all.
 _CLASS_CONTEXTS: tuple[tuple[re.Pattern[str], bool], ...] = (
-    (re.compile(r'\bclass\s*=\s*"([^"]*)"'), True),          # HTML attribute
+    (re.compile(r'\bclass\s*=\s*"([^"]*)"'), True),  # HTML attribute
     (re.compile(r"\bclass\s*=\s*'([^']*)'"), True),
-    (re.compile(r"\bclassName\s*=\s*([^;]*);"), False),      # el.className = ...
+    (re.compile(r"\bclassName\s*=\s*([^;]*);"), False),  # el.className = ...
     (re.compile(r"\bclassList\.(?:add|remove|toggle)\(([^)]*)\)"), False),
-    (re.compile(r"\bclasses:\s*([^,}\n]*)"), False),         # { classes: "..." }
+    (re.compile(r"\bclasses:\s*([^,}\n]*)"), False),  # { classes: "..." }
 )
 
 #: ``${...}`` inside a template literal is a value, not a class name.

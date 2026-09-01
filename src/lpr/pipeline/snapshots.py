@@ -36,7 +36,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -73,10 +73,10 @@ def snapshot_filename(plate: str, when: datetime | None = None) -> str:
     the history table are the same instant, with no timezone arithmetic in
     between.
     """
-    moment = when or datetime.now(timezone.utc)
+    moment = when or datetime.now(UTC)
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    stamp = moment.astimezone(timezone.utc).strftime(_STAMP_FORMAT)
+        moment = moment.replace(tzinfo=UTC)
+    stamp = moment.astimezone(UTC).strftime(_STAMP_FORMAT)
     safe_plate = _UNSAFE.sub("", str(plate).upper()) or "UNKNOWN"
     return f"{stamp}_{safe_plate}{SNAPSHOT_SUFFIX}"
 
@@ -143,9 +143,7 @@ class SnapshotWriter:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_event.clear()
-            self._thread = threading.Thread(
-                target=self._run, name="snapshot-writer", daemon=True
-            )
+            self._thread = threading.Thread(target=self._run, name="snapshot-writer", daemon=True)
             self._thread.start()
         logger.info("Snapshot writer started: %s", self.directory)
 
@@ -327,9 +325,7 @@ class SnapshotWriter:
             return None
 
         self._written += 1
-        logger.info(
-            "Snapshot saved: %s%s", path.name, f" (camera {camera})" if camera else ""
-        )
+        logger.info("Snapshot saved: %s%s", path.name, f" (camera {camera})" if camera else "")
         return path
 
     def _unique_path(self, name: str) -> Path:
@@ -454,9 +450,7 @@ class SnapshotWriter:
         free = self.free_bytes()
 
         over_size = self.max_total_bytes > 0 and total > self.max_total_bytes
-        under_free = (
-            self.min_free_bytes > 0 and free is not None and free < self.min_free_bytes
-        )
+        under_free = self.min_free_bytes > 0 and free is not None and free < self.min_free_bytes
         if not (over_size or under_free):
             return 0
 

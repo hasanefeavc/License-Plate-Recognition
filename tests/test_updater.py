@@ -13,8 +13,8 @@ command, and that the commands are argument lists rather than shell strings.
 from __future__ import annotations
 
 import json
-import time
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,7 @@ class ScriptedRunner:
         command: Sequence[str],
         cwd: Path,
         timeout: float,
-        env: "Mapping[str, str] | None" = None,
+        env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         argv = tuple(str(part) for part in command)
         self.calls.append((argv, cwd, timeout))
@@ -109,7 +109,7 @@ class AdvancingRunner(ScriptedRunner):
         command: Sequence[str],
         cwd: Path,
         timeout: float,
-        env: "Mapping[str, str] | None" = None,
+        env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         argv = tuple(str(part) for part in command)
         if " ".join(argv) == "git rev-parse HEAD":
@@ -277,9 +277,7 @@ def test_an_already_current_checkout_skips_the_rebuild(tmp_settings: Any, repo: 
 # ---------------------------------------------------------------------------
 
 
-def test_a_forced_run_rebuilds_even_with_nothing_new_to_pull(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_forced_run_rebuilds_even_with_nothing_new_to_pull(tmp_settings: Any, repo: Path) -> None:
     """The whole point of the flag: the same commit must still reach compose."""
     runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
     status = run_to_completion(build(tmp_settings, repo, runner), force=True)
@@ -289,9 +287,7 @@ def test_a_forced_run_rebuilds_even_with_nothing_new_to_pull(
     assert "zaten güncel" not in status.detail.lower()
 
 
-def test_the_same_run_without_force_stops_before_the_build(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_the_same_run_without_force_stops_before_the_build(tmp_settings: Any, repo: Path) -> None:
     """The control for the test above -- only the flag differs."""
     runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
     status = run_to_completion(build(tmp_settings, repo, runner), force=False)
@@ -301,9 +297,7 @@ def test_the_same_run_without_force_stops_before_the_build(
     assert "zaten güncel" in status.detail.lower()
 
 
-def test_a_forced_run_says_it_rebuilt_rather_than_updated(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_forced_run_says_it_rebuilt_rather_than_updated(tmp_settings: Any, repo: Path) -> None:
     """Reporting an upgrade that did not happen is how support calls start."""
     runner = ScriptedRunner({"rev-parse HEAD": ok("samecommit")})
     status = run_to_completion(build(tmp_settings, repo, runner), force=True)
@@ -367,9 +361,7 @@ def test_a_failed_pull_still_aborts_an_unforced_run(tmp_settings: Any, repo: Pat
     assert not runner.ran("up -d --build")
 
 
-def test_a_forced_run_rebuilds_outside_a_git_checkout(
-    tmp_settings: Any, tmp_path: Path
-) -> None:
+def test_a_forced_run_rebuilds_outside_a_git_checkout(tmp_settings: Any, tmp_path: Path) -> None:
     """Rebuilding needs a compose file, not a repository."""
     plain = tmp_path / "plain"
     plain.mkdir()
@@ -394,18 +386,14 @@ def test_a_forced_build_failure_is_still_a_failure(tmp_settings: Any, repo: Path
     assert status.step == "build"
 
 
-def test_a_forced_run_cannot_bypass_the_disabled_switch(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_forced_run_cannot_bypass_the_disabled_switch(tmp_settings: Any, repo: Path) -> None:
     """`force` reorders the update's own gates, not the deployment's consent."""
     updater = build(tmp_settings, repo, ScriptedRunner(), enabled=False)
     with pytest.raises(RuntimeError, match="devre dışı"):
         updater.start(force=True)
 
 
-def test_a_forced_run_cannot_bypass_the_single_flight_guard(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_forced_run_cannot_bypass_the_single_flight_guard(tmp_settings: Any, repo: Path) -> None:
     """Two rebuilds at once would race a compose against a compose."""
     gate = threading.Event()
 
@@ -442,9 +430,7 @@ def test_a_forced_run_never_reaches_a_command_line(tmp_settings: Any, repo: Path
     assert runner.ran("git pull --ff-only origin main"), "the pull is unchanged by force"
 
 
-def test_a_forced_rebuild_survives_the_restart_as_a_rebuild(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_forced_rebuild_survives_the_restart_as_a_rebuild(tmp_settings: Any, repo: Path) -> None:
     """The container that comes back must not claim it upgraded anything."""
     state_file = repo / "last_update.json"
     state_file.write_text(
@@ -835,12 +821,11 @@ def test_the_engine_socket_is_parameterised() -> None:
     Hard-coding it hands the container a different engine from the one running
     the service, so the rebuild would replace an image nothing is using.
     """
-    compose = (
-        Path(__file__).resolve().parents[1] / "docker" / "docker-compose.ota.yml"
-    ).read_text(encoding="utf-8")
+    compose = (Path(__file__).resolve().parents[1] / "docker" / "docker-compose.ota.yml").read_text(
+        encoding="utf-8"
+    )
     assert (
-        "${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}"
-        ":/var/run/docker.sock:rw" in compose
+        "${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}:/var/run/docker.sock:rw" in compose
     )
     # The CLI's end of the same bind. It is the container-side path, so it does
     # not vary with the host socket -- and saying so in the environment is what
@@ -875,9 +860,7 @@ def test_the_rebuild_runs_with_docker_host_pointed_at_the_mounted_socket(
     assert "PATH" in env
 
 
-def test_the_git_steps_are_left_on_the_inherited_environment(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_the_git_steps_are_left_on_the_inherited_environment(tmp_settings: Any, repo: Path) -> None:
     """Only the step that talks to the engine needs the override."""
     runner = AdvancingRunner()
     run_to_completion(build(tmp_settings, repo, runner))
@@ -1055,9 +1038,7 @@ def test_confirming_health_disarms_the_rollback(tmp_settings: Any, repo: Path) -
     assert stored["rollback_commit"] is None, "the disarm was persisted"
 
 
-def test_a_second_boot_with_the_rollback_still_armed_reverts(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_second_boot_with_the_rollback_still_armed_reverts(tmp_settings: Any, repo: Path) -> None:
     """The core of the health gate.
 
     A first boot got far enough to run the gate and then never reached
@@ -1078,9 +1059,7 @@ def test_a_second_boot_with_the_rollback_still_armed_reverts(
     assert updater.status.rollback_commit is None
 
 
-def test_a_failed_automatic_rollback_says_what_to_do_by_hand(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_a_failed_automatic_rollback_says_what_to_do_by_hand(tmp_settings: Any, repo: Path) -> None:
     (repo / "last_update.json").write_text(
         json.dumps({"state": "restarting", "rollback_commit": "aaaaaaa", "boot_attempts": 1}),
         encoding="utf-8",
@@ -1093,9 +1072,7 @@ def test_a_failed_automatic_rollback_says_what_to_do_by_hand(
     assert "git reset --hard aaaaaaa" in updater.status.detail
 
 
-def test_confirm_healthy_is_a_no_op_when_nothing_is_armed(
-    tmp_settings: Any, repo: Path
-) -> None:
+def test_confirm_healthy_is_a_no_op_when_nothing_is_armed(tmp_settings: Any, repo: Path) -> None:
     updater = build(tmp_settings, repo, ScriptedRunner())
     assert updater.confirm_healthy() is False
 

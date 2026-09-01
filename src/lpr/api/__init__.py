@@ -17,7 +17,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["create_app", "get_app", "run"]
 
 
-def get_app() -> "FastAPI":
+def get_app() -> FastAPI:
     """Return the module-level application instance."""
     from lpr.api.main import app
 

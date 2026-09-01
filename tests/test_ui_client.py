@@ -62,9 +62,7 @@ class FakeStreamResponse:
     def __init__(self, chunks: list[bytes], boundary: str = "lprframe") -> None:
         self.status_code = 200
         self._chunks = chunks
-        self.headers = {
-            "Content-Type": f"multipart/x-mixed-replace; boundary={boundary}"
-        }
+        self.headers = {"Content-Type": f"multipart/x-mixed-replace; boundary={boundary}"}
         self.closed = False
 
     def iter_content(self, chunk_size: int = 8192) -> Any:
@@ -264,8 +262,10 @@ def test_add_and_remove_plate() -> None:
 
 def test_pause_and_resume_report_state() -> None:
     client, _session = make_client(
-        [FakeResponse(200, {"paused": True, "running": True}),
-         FakeResponse(200, {"paused": False, "running": True})]
+        [
+            FakeResponse(200, {"paused": True, "running": True}),
+            FakeResponse(200, {"paused": False, "running": True}),
+        ]
     )
     client.set_token("tok")
 
@@ -519,8 +519,11 @@ def test_event_stream_consumes_an_async_connection() -> None:
         return socket
 
     stream = EventStream(
-        BASE_URL, lambda: "tok", connect_factory=factory,
-        initial_backoff=0.01, max_backoff=0.02,
+        BASE_URL,
+        lambda: "tok",
+        connect_factory=factory,
+        initial_backoff=0.01,
+        max_backoff=0.02,
     )
     stream.start()
     try:
@@ -538,9 +541,11 @@ def test_event_stream_enters_an_async_context_manager() -> None:
     socket = FakeAsyncWebSocket([json.dumps({"type": "event", "data": {"n": 1}})])
 
     stream = EventStream(
-        BASE_URL, lambda: None,
+        BASE_URL,
+        lambda: None,
         connect_factory=lambda url: FakeAsyncContextConnect(socket),
-        initial_backoff=0.01, max_backoff=0.02,
+        initial_backoff=0.01,
+        max_backoff=0.02,
     )
     stream.start()
     try:
@@ -559,8 +564,11 @@ def test_stop_interrupts_the_backoff_promptly() -> None:
         raise OSError("bağlanılamadı")
 
     stream = EventStream(
-        BASE_URL, lambda: None, connect_factory=factory,
-        initial_backoff=30.0, max_backoff=30.0,
+        BASE_URL,
+        lambda: None,
+        connect_factory=factory,
+        initial_backoff=30.0,
+        max_backoff=30.0,
     )
     stream.start()
     assert wait_for(lambda: stream.reconnects >= 1)
@@ -578,9 +586,11 @@ def test_event_stream_defaults_to_the_api_path() -> None:
 
 def test_event_stream_can_be_restarted() -> None:
     stream = EventStream(
-        BASE_URL, lambda: None,
+        BASE_URL,
+        lambda: None,
         connect_factory=lambda url: FakeAsyncWebSocket([], hold_open=True),
-        initial_backoff=0.01, max_backoff=0.02,
+        initial_backoff=0.01,
+        max_backoff=0.02,
     )
     stream.start()
     assert wait_for(lambda: stream.connected)

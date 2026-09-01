@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,7 @@ def make_token(
     issuer: str | None = lic.ISSUER,
     issued_at: datetime | None = None,
 ) -> str:
-    now = issued_at or datetime.now(timezone.utc)
+    now = issued_at or datetime.now(UTC)
     claims: dict[str, Any] = {
         "sub": client,
         "client": client,
@@ -92,7 +92,7 @@ def test_a_fresh_key_is_valid(public_key: Path) -> None:
 
 def test_an_expired_key_is_rejected_but_still_readable(public_key: Path) -> None:
     """The operator on the phone is asked *when* it expired, so say so."""
-    issued = datetime.now(timezone.utc) - timedelta(days=40)
+    issued = datetime.now(UTC) - timedelta(days=40)
     status = lic.validate_token(make_token(days=30, issued_at=issued))
 
     assert status.valid is False
@@ -110,7 +110,7 @@ def test_a_key_signed_with_another_private_key_is_rejected(public_key: Path) -> 
 
 def test_an_edited_expiry_is_rejected(public_key: Path) -> None:
     """Re-signing is the only way to move ``exp``, and that needs the private key."""
-    issued = datetime.now(timezone.utc) - timedelta(days=40)
+    issued = datetime.now(UTC) - timedelta(days=40)
     header, _payload, signature = make_token(days=30, issued_at=issued).split(".")
     forged_payload = jwt.encode(
         {
@@ -118,7 +118,7 @@ def test_an_edited_expiry_is_rejected(public_key: Path) -> None:
             "sub": "Site A",
             "client": "Site A",
             "iat": int(issued.timestamp()),
-            "exp": int((datetime.now(timezone.utc) + timedelta(days=365)).timestamp()),
+            "exp": int((datetime.now(UTC) + timedelta(days=365)).timestamp()),
         },
         IMPOSTOR_PRIVATE,
         algorithm=lic.ALGORITHM,
@@ -323,9 +323,7 @@ def test_a_small_backwards_correction_is_tolerated(db: Any, public_key: Path) ->
     assert lic.check_license(now=now - 60).valid is True
 
 
-def test_activation_is_refused_while_the_clock_is_rolled_back(
-    db: Any, public_key: Path
-) -> None:
+def test_activation_is_refused_while_the_clock_is_rolled_back(db: Any, public_key: Path) -> None:
     lic.check_license(now=time.time() + 7 * 86400)
 
     with pytest.raises(lic.LicenseError) as excinfo:
@@ -396,10 +394,14 @@ def test_the_history_log_never_holds_a_whole_token(
 
     code = generator.main(
         [
-            "--days", "30",
-            "--client", "Site A",
-            "--private-key", str(private_key_file),
-            "--history", str(history),
+            "--days",
+            "30",
+            "--client",
+            "Site A",
+            "--private-key",
+            str(private_key_file),
+            "--history",
+            str(history),
             "--quiet",
         ]
     )
@@ -435,9 +437,7 @@ def test_the_history_record_still_identifies_the_key(
         assert "created=" in line and "expires=" in line and "jti=" in line
 
 
-def test_the_generator_needs_a_private_key(
-    public_key: Path, tmp_path: Path
-) -> None:
+def test_the_generator_needs_a_private_key(public_key: Path, tmp_path: Path) -> None:
     generator = _load_generator()
     missing = tmp_path / "nope.pem"
     with pytest.raises(SystemExit):
@@ -454,9 +454,12 @@ def test_the_generator_refuses_to_sign_with_the_public_key(
     with pytest.raises(SystemExit) as excinfo:
         generator.main(
             [
-                "--days", "30",
-                "--client", "X",
-                "--private-key", str(public_key),
+                "--days",
+                "30",
+                "--client",
+                "X",
+                "--private-key",
+                str(public_key),
                 "--no-history",
             ]
         )

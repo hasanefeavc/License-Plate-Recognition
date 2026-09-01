@@ -78,7 +78,7 @@ def test_the_dashboard_requests_nothing_from_a_remote_host(name: str) -> None:
 def test_the_tailwind_cdn_script_is_gone() -> None:
     """The specific regression: a <script> tag that silently no-ops offline."""
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    assert "<script src=\"https://cdn.tailwindcss.com\">" not in html
+    assert '<script src="https://cdn.tailwindcss.com">' not in html
     assert 'href="static/css/app.css"' in html, "the local bundle must be linked"
 
 
@@ -126,8 +126,17 @@ def test_the_runtime_colours_app_js_builds_are_compiled() -> None:
     of these, and the feed would render its event stripes with no colour.
     """
     css = STYLESHEET.read_text(encoding="utf-8")
-    for name in (".text-ok", ".text-bad", ".text-warn", ".text-accent", ".text-muted",
-                 ".border-ok", ".border-bad", ".border-warn", ".border-accent"):
+    for name in (
+        ".text-ok",
+        ".text-bad",
+        ".text-warn",
+        ".text-accent",
+        ".text-muted",
+        ".border-ok",
+        ".border-bad",
+        ".border-warn",
+        ".border-accent",
+    ):
         assert f"{name} {{" in css, f"{name} is applied by app.js but has no rule"
 
 

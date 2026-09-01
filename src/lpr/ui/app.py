@@ -721,9 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--theme", default="darkly", help="ttkbootstrap teması")
     parser.add_argument("--log-level", default="INFO", help="Günlük seviyesi")
-    parser.add_argument(
-        "--fullscreen", action="store_true", help="Tam ekran olarak başlat"
-    )
+    parser.add_argument("--fullscreen", action="store_true", help="Tam ekran olarak başlat")
     return parser
 
 

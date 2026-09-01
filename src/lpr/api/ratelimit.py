@@ -215,9 +215,7 @@ class LoginLimiter:
             self.lockout_after,
             address or "unknown",
         )
-        return RateLimitDecision(
-            allowed=False, retry_after_s=duration, reason="account_locked"
-        )
+        return RateLimitDecision(allowed=False, retry_after_s=duration, reason="account_locked")
 
     def record_success(self, address: str, username: str) -> None:
         """Clear the failure state for a username after a good password."""

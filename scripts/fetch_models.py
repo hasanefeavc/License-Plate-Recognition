@@ -260,7 +260,9 @@ def main(argv: list[str] | None = None) -> int:
         return fetch_easyocr(models_dir, args.easyocr_timeout) if args.easyocr else 0
 
     if baseline_path.exists() and not args.force:
-        print(f"[fetch_models] {baseline_path} already exists, skipping download (use --force to redo).")
+        print(
+            f"[fetch_models] {baseline_path} already exists, skipping download (use --force to redo)."
+        )
     else:
         print(f"[fetch_models] Downloading {args.url} -> {baseline_path}")
         # Only the default URL has a pinned digest; see BASELINE_SHA256.
@@ -273,7 +275,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[fetch_models] ERROR: {exc}", file=sys.stderr)
             return 1
         except urllib.error.HTTPError as exc:
-            print(f"[fetch_models] ERROR: server returned HTTP {exc.code} for {args.url}", file=sys.stderr)
+            print(
+                f"[fetch_models] ERROR: server returned HTTP {exc.code} for {args.url}",
+                file=sys.stderr,
+            )
             return 1
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             print(
@@ -297,7 +302,9 @@ def main(argv: list[str] | None = None) -> int:
             return status
 
     print()
-    print(f"[fetch_models] NOTE: {baseline_path.name} is a generic COCO model, not a plate detector.")
+    print(
+        f"[fetch_models] NOTE: {baseline_path.name} is a generic COCO model, not a plate detector."
+    )
     print(
         f"[fetch_models] Replace it with a plate-specific fine-tune saved at "
         f"{plate_path} before relying on detection accuracy."

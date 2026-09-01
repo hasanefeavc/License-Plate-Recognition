@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -279,8 +279,8 @@ def append_history(path: Path, token: str, claims: dict[str, object]) -> None:
     Append-only and line-oriented so it stays greppable:
     ``grep 'Site A' license_history.log``.
     """
-    created = datetime.fromtimestamp(float(claims["iat"]), tz=timezone.utc).isoformat()
-    expires = datetime.fromtimestamp(float(claims["exp"]), tz=timezone.utc).isoformat()
+    created = datetime.fromtimestamp(float(claims["iat"]), tz=UTC).isoformat()
+    expires = datetime.fromtimestamp(float(claims["exp"]), tz=UTC).isoformat()
     record = "\t".join(
         (
             f"created={created}",
@@ -364,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
         print(token)
         return 0
 
-    expires = datetime.fromtimestamp(float(claims["exp"]), tz=timezone.utc)
+    expires = datetime.fromtimestamp(float(claims["exp"]), tz=UTC)
     print(f"[license] client : {claims['client']}")
     print(f"[license] days   : {args.days}")
     print(f"[license] expires: {expires.isoformat()}")

@@ -87,8 +87,14 @@ def test_no_variable_is_listed_twice() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["LPR_SMTP__TIMEOUT_S", "LPR_SMTP__QUEUE_SIZE", "LPR_SNAPSHOTS__MAX_TOTAL_MB",
-     "LPR_SNAPSHOTS__MIN_FREE_MB", "LPR_CAMERAS__ENTRY__SOURCE", "LPR_CAMERAS__EXIT__SOURCE"],
+    [
+        "LPR_SMTP__TIMEOUT_S",
+        "LPR_SMTP__QUEUE_SIZE",
+        "LPR_SNAPSHOTS__MAX_TOTAL_MB",
+        "LPR_SNAPSHOTS__MIN_FREE_MB",
+        "LPR_CAMERAS__ENTRY__SOURCE",
+        "LPR_CAMERAS__EXIT__SOURCE",
+    ],
 )
 def test_the_settings_that_went_missing_are_present(name: str) -> None:
     """Regression: the SMTP and snapshot keys the example had fallen behind on.

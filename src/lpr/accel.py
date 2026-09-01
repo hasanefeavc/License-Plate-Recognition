@@ -85,7 +85,7 @@ def cuda_available() -> bool:
         logger.warning(
             "a CUDA device is visible but unusable (%s); falling back to CPU. This is "
             "normally a CPU-only torch wheel or a driver older than the wheel's CUDA "
-            "runtime -- check `nvidia-smi` against `python -c \"import torch; "
+            'runtime -- check `nvidia-smi` against `python -c "import torch; '
             'print(torch.version.cuda)"`.',
             exc,
         )
@@ -132,8 +132,7 @@ def resolve_torch_device(spec: str | None) -> str:
             return f"cuda:{wanted}"
         return wanted
     logger.warning(
-        "detection.device is %r but no usable CUDA device was found; running the "
-        "detector on CPU",
+        "detection.device is %r but no usable CUDA device was found; running the detector on CPU",
         spec,
     )
     return "cpu"

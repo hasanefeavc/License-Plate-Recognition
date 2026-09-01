@@ -203,7 +203,7 @@ class YoloPlateDetector:
 
     def __init__(
         self,
-        settings: "Settings | None" = None,
+        settings: Settings | None = None,
         min_sharpness: float = MIN_SHARPNESS,
     ) -> None:
         if settings is None:
@@ -388,7 +388,7 @@ class YoloPlateDetector:
     # -- setup helpers -------------------------------------------------
 
     @staticmethod
-    def _resolve_weights(model_path: str, settings: "Settings") -> Path:
+    def _resolve_weights(model_path: str, settings: Settings) -> Path:
         """Absolute path to the weights, relative paths resolved under models_dir.
 
         A blank ``model_path`` means "the default weights file". Without this
@@ -441,9 +441,7 @@ class YoloPlateDetector:
             if not names:
                 return None
             items = names.items() if isinstance(names, dict) else enumerate(names)
-            plate_ids = {
-                int(idx) for idx, name in items if "plate" in str(name).lower()
-            }
+            plate_ids = {int(idx) for idx, name in items if "plate" in str(name).lower()}
             if plate_ids:
                 return plate_ids
             if len(list(names)) == 1:
@@ -699,9 +697,7 @@ class YoloPlateDetector:
         """
         try:
             self._verify(self._model)
-            logger.info(
-                "detector warmup complete (%s on %s)", self.loaded_path.name, self.device
-            )
+            logger.info("detector warmup complete (%s on %s)", self.loaded_path.name, self.device)
         except Exception:
             logger.warning("detector warmup failed; first frame may be slow", exc_info=True)
 
@@ -720,7 +716,7 @@ class ContourPlateDetector:
 
     def __init__(
         self,
-        settings: "Settings | None" = None,
+        settings: Settings | None = None,
         max_candidates: int = 10,
         min_sharpness: float = MIN_SHARPNESS,
     ) -> None:
@@ -780,9 +776,7 @@ class ContourPlateDetector:
                 # for a confident detection.
                 area_ratio = float(w * h) / frame_area if frame_area else 0.0
                 confidence = float(min(0.60, 0.25 + area_ratio * 8.0))
-                detections.append(
-                    PlateDetection(bbox=bbox, confidence=confidence, crop=crop)
-                )
+                detections.append(PlateDetection(bbox=bbox, confidence=confidence, crop=crop))
             except Exception:
                 logger.debug("skipping a malformed contour", exc_info=True)
                 continue

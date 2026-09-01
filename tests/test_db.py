@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -20,7 +20,6 @@ from lpr.db import (
     PlateRepository,
     UserRepository,
     get_connection,
-    init_db,
     normalise_plate,
     schema_version,
 )
@@ -28,7 +27,7 @@ from lpr.db.repository import LEGACY_PREFIX, _legacy_digest, iso_bound
 
 
 def _iso(days_ago: float = 0.0) -> str:
-    moment = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    moment = datetime.now(UTC) - timedelta(days=days_ago)
     return moment.replace(microsecond=0).isoformat()
 
 
@@ -39,10 +38,7 @@ def _iso(days_ago: float = 0.0) -> str:
 
 def test_schema_is_created_and_versioned(db) -> None:
     conn = get_connection()
-    tables = {
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"plates", "users", "logs", "schema_meta"} <= tables
     assert schema_version() >= 1
 
@@ -53,10 +49,7 @@ def test_no_per_day_log_tables_exist(db) -> None:
         LprEvent(ts=utc_now_iso(), camera="entry", plate="34ABC123", action="granted")
     )
     conn = get_connection()
-    names = [
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    ]
+    names = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     assert not [name for name in names if name.startswith("logs_")]
 
 
@@ -73,10 +66,7 @@ def test_wal_pragma_is_actually_set(db) -> None:
 
 def test_indexes_exist(db) -> None:
     conn = get_connection()
-    names = {
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
-    }
+    names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert {"idx_logs_ts", "idx_logs_plate", "idx_logs_camera_ts"} <= names
 
 
@@ -141,13 +131,12 @@ def test_transaction_rolls_back_on_error(db) -> None:
     plates = PlateRepository()
     plates.add("34AAA111")
 
-    with pytest.raises(RuntimeError):
-        with transaction() as conn:
-            conn.execute(
-                "INSERT INTO plates (plate, added_at, note) VALUES (?, ?, ?)",
-                ("34BBB222", utc_now_iso(), None),
-            )
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), transaction() as conn:
+        conn.execute(
+            "INSERT INTO plates (plate, added_at, note) VALUES (?, ?, ?)",
+            ("34BBB222", utc_now_iso(), None),
+        )
+        raise RuntimeError("boom")
 
     assert plates.all() == ["34AAA111"]
 
@@ -214,9 +203,7 @@ def _seed_logs(logs: LogRepository) -> None:
     ]
     for ts, camera, plate, action, confidence in rows:
         logs.write(
-            LprEvent(
-                ts=ts, camera=camera, plate=plate, action=str(action), confidence=confidence
-            )
+            LprEvent(ts=ts, camera=camera, plate=plate, action=str(action), confidence=confidence)
         )
 
 
@@ -327,7 +314,7 @@ def test_an_unparseable_bound_narrows_the_search_rather_than_raising() -> None:
 def test_a_day_filter_selects_exactly_that_day(db) -> None:
     """End to end through real SQLite, including both inclusive edges."""
     logs = LogRepository()
-    day = datetime(2026, 5, 2, tzinfo=timezone.utc)
+    day = datetime(2026, 5, 2, tzinfo=UTC)
     for moment, plate in (
         (day - timedelta(seconds=1), "34BEFORE"),
         (day, "34FIRST1"),
@@ -375,9 +362,7 @@ def test_the_day_list_can_be_bucketed_in_another_timezone(db) -> None:
 
 def test_log_plate_is_normalised_on_write(db) -> None:
     logs = LogRepository()
-    logs.write(
-        LprEvent(ts=utc_now_iso(), camera="entry", plate=" 34 abc 123 ", action="granted")
-    )
+    logs.write(LprEvent(ts=utc_now_iso(), camera="entry", plate=" 34 abc 123 ", action="granted"))
     assert logs.query(plate="34ABC123")[0].plate == "34ABC123"
 
 
@@ -432,9 +417,11 @@ def test_argon2_round_trip(db) -> None:
     users = UserRepository()
     users.register("operator", "s3cret-passphrase")
 
-    stored = get_connection().execute(
-        "SELECT password_hash FROM users WHERE username = ?", ("operator",)
-    ).fetchone()["password_hash"]
+    stored = (
+        get_connection()
+        .execute("SELECT password_hash FROM users WHERE username = ?", ("operator",))
+        .fetchone()["password_hash"]
+    )
     assert stored.startswith("$argon2"), "passwords must be Argon2, never plain sha256"
     assert "s3cret-passphrase" not in stored
 
@@ -472,9 +459,11 @@ def test_legacy_sha256_verify_then_rehash(db) -> None:
 
     assert users.verify("olduser", password) is True
 
-    stored = get_connection().execute(
-        "SELECT password_hash FROM users WHERE username = ?", ("olduser",)
-    ).fetchone()["password_hash"]
+    stored = (
+        get_connection()
+        .execute("SELECT password_hash FROM users WHERE username = ?", ("olduser",))
+        .fetchone()["password_hash"]
+    )
     assert stored.startswith("$argon2")
     assert users.needs_rehash("olduser") is False
     # Still works after the upgrade.
@@ -511,9 +500,7 @@ def test_migrate_legacy_database(db, tmp_path) -> None:
         """
     )
     legacy.execute("INSERT INTO plates VALUES ('34 abc 123')")
-    legacy.execute(
-        "INSERT INTO users VALUES (?, ?)", ("olduser", _legacy_digest("legacy-pw"))
-    )
+    legacy.execute("INSERT INTO users VALUES (?, ?)", ("olduser", _legacy_digest("legacy-pw")))
     legacy.execute("INSERT INTO log_dates VALUES ('2024-05-01')")
     legacy.executemany(
         "INSERT INTO logs_2024_05_01 (timestamp, message) VALUES (?, ?)",
@@ -651,8 +638,13 @@ def test_update_writes_only_the_named_columns(db: Any) -> None:
     from lpr.db import PlateRepository
 
     repo = PlateRepository()
-    repo.upsert("34ABC123", owner="Ali", apartment="B-12", note="Kiracı",
-                expires_at="2027-01-01T00:00:00+00:00")
+    repo.upsert(
+        "34ABC123",
+        owner="Ali",
+        apartment="B-12",
+        note="Kiracı",
+        expires_at="2027-01-01T00:00:00+00:00",
+    )
     assert repo.update("34ABC123", blocked=True) is True
 
     row = repo.get("34ABC123")

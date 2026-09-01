@@ -327,7 +327,7 @@ def test_both_ota_buttons_are_present_and_named() -> None:
 
 
 def test_checking_for_updates_does_not_install_anything() -> None:
-    """"Kontrol Et" must not be a second "Güncelle" with a softer label."""
+    """ "Kontrol Et" must not be a second "Güncelle" with a softer label."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("async function checkForUpdates") :]
     body = body[: body.index("\n  }\n")]
@@ -393,7 +393,7 @@ def test_the_force_button_posts_the_flag() -> None:
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     body = script[script.index("async function runUpdate") :]
     body = body[: body.index("\n  }\n")]
-    assert 'JSON.stringify({ force: true })' in body
+    assert "JSON.stringify({ force: true })" in body
     assert '"/api/system/update"' in body
 
 
@@ -595,7 +595,7 @@ def test_detaching_a_stream_cancels_its_pending_retry() -> None:
     body = _fn(script, "function detachStream")
 
     assert "clearTimeout(stream.retry)" in body
-    assert "removeAttribute(\"src\")" in body
+    assert 'removeAttribute("src")' in body
     assert "stream.active = false" in body
 
 
@@ -731,7 +731,7 @@ def test_the_csv_export_uses_the_same_range_as_the_table() -> None:
 
 
 def test_the_gate_button_is_labelled_for_a_sliding_gate() -> None:
-    """"Kapı" (gate), not "Bariyer" (barrier) -- this drives a sliding gate."""
+    """ "Kapı" (gate), not "Bariyer" (barrier) -- this drives a sliding gate."""
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     start = html.index('id="btn-gate"')
     button = html[start : html.index("</button>", start)]
@@ -794,8 +794,12 @@ def test_the_busy_state_counts_down_rather_than_freezing() -> None:
 def test_the_add_form_carries_every_schema_v4_field() -> None:
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     for field_id in (
-        "plate-input", "owner-input", "apartment-input",
-        "note-input", "expires-input", "blocked-input",
+        "plate-input",
+        "owner-input",
+        "apartment-input",
+        "note-input",
+        "expires-input",
+        "blocked-input",
     ):
         assert f'id="{field_id}"' in html, field_id
 
@@ -1332,9 +1336,7 @@ def test_every_wired_element_exists_in_the_page() -> None:
 def test_optional_listeners_are_guarded() -> None:
     """Anything bound behind `if (el[...])` may legitimately be absent."""
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    guarded = re.findall(
-        r'if \(el\["([a-z0-9-]+)"\]\) el\["\1"\]\.addEventListener', script
-    )
+    guarded = re.findall(r'if \(el\["([a-z0-9-]+)"\]\) el\["\1"\]\.addEventListener', script)
     assert guarded, "the guarded-bind idiom should be in use for optional controls"
 
 
@@ -1387,11 +1389,7 @@ def _modal(html: str, modal_id: str) -> str:
     """
     start = html.index(f'<div id="{modal_id}"')
     rest = html[start + 1 :]
-    following = [
-        rest.index(marker)
-        for marker in ('<div id="modal-', "\n<!-- ")
-        if marker in rest
-    ]
+    following = [rest.index(marker) for marker in ('<div id="modal-', "\n<!-- ") if marker in rest]
     end = min(following) if following else len(rest)
     return rest[:end]
 

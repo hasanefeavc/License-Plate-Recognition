@@ -7,7 +7,7 @@ it should not is the whole failure mode of a licensing scheme.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import jwt
@@ -38,7 +38,7 @@ def licensed(tmp_settings: Any) -> Any:
 
 
 def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_the_validity_span_is_clamped(licensed: Any) -> None:
 
 def test_activation_computes_the_expiry_from_now(licensed: Any) -> None:
     key = issue_key("bekci", 30, licensed)
-    moment = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    moment = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
     state = activate(key, "bekci", licensed, now=moment)
 
     assert state.status == STATUS_ACTIVE

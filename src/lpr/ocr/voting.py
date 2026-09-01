@@ -201,7 +201,7 @@ class MultiFrameVoter:
     # -- construction --------------------------------------------------
 
     @classmethod
-    def from_settings(cls, settings: "Settings | None" = None) -> "MultiFrameVoter":
+    def from_settings(cls, settings: Settings | None = None) -> MultiFrameVoter:
         """Build from ``settings.voting`` (loads the singleton when omitted)."""
         if settings is None:
             from lpr.config import get_settings
@@ -214,17 +214,13 @@ class MultiFrameVoter:
             ttl_s=cfg.ttl_s,
             cooldown_s=cfg.cooldown_s,
             # getattr: an older config.yaml without the tracking keys still works.
-            max_track_attempts=getattr(
-                cfg, "max_track_attempts", DEFAULT_MAX_TRACK_ATTEMPTS
-            ),
+            max_track_attempts=getattr(cfg, "max_track_attempts", DEFAULT_MAX_TRACK_ATTEMPTS),
             track_ttl_s=getattr(cfg, "track_ttl_s", DEFAULT_TRACK_TTL_S),
         )
 
     # -- Voter protocol ------------------------------------------------
 
-    def submit(
-        self, camera: str, read: PlateRead, track_id: int | None = None
-    ) -> str | None:
+    def submit(self, camera: str, read: PlateRead, track_id: int | None = None) -> str | None:
         """Record one read; return a plate string only once it is confirmed.
 
         Unusable reads (invalid grammar or empty text) are dropped without
@@ -251,9 +247,7 @@ class MultiFrameVoter:
                 return None
 
             bucket = self._votes.setdefault(camera, deque(maxlen=self.window))
-            bucket.append(
-                _Vote(text=text, confidence=confidence, ts=now, track_id=track)
-            )
+            bucket.append(_Vote(text=text, confidence=confidence, ts=now, track_id=track))
             self._prune(bucket, now)
 
             winner = self._winner(bucket)
@@ -452,7 +446,7 @@ class MultiFrameVoter:
 
     # -- internals -----------------------------------------------------
 
-    def _prune(self, bucket: "deque[_Vote]", now: float) -> None:
+    def _prune(self, bucket: deque[_Vote], now: float) -> None:
         """Drop entries older than the TTL. Called with the lock held."""
         if self.ttl_s <= 0:
             return
@@ -475,7 +469,7 @@ class MultiFrameVoter:
         for key in stale:
             del self._tracks[key]
 
-    def _tally(self, bucket: "deque[_Vote]") -> list[_Candidate]:
+    def _tally(self, bucket: deque[_Vote]) -> list[_Candidate]:
         """Merge near-misses and rank candidates best-first.
 
         Grouping is seeded by total confidence, so the strongest spelling
@@ -541,7 +535,7 @@ class MultiFrameVoter:
         groups.sort(key=lambda c: (-c.weight, -c.votes, c.text))
         return groups
 
-    def _winner(self, bucket: "deque[_Vote]") -> _Candidate | None:
+    def _winner(self, bucket: deque[_Vote]) -> _Candidate | None:
         """Highest-weight candidate that has reached ``min_votes``, if any."""
         qualified = [c for c in self._tally(bucket) if c.votes >= self.min_votes]
         return qualified[0] if qualified else None
@@ -557,6 +551,6 @@ def _clamp(value: float) -> float:
     return max(0.0, min(1.0, num))
 
 
-def build_voter(settings: "Settings | None" = None) -> MultiFrameVoter:
+def build_voter(settings: Settings | None = None) -> MultiFrameVoter:
     """Construct the configured voter. See :meth:`MultiFrameVoter.from_settings`."""
     return MultiFrameVoter.from_settings(settings)

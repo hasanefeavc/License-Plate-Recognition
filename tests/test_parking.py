@@ -8,7 +8,7 @@ makes, and it is entirely a backend property -- no client is involved.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,7 @@ def _pipeline(settings: Any, relay: Any) -> PipelineOrchestrator:
 def _log(repo: LogRepository, plate: str, camera: str, action: str, when: datetime) -> None:
     repo.write(
         LprEvent(
-            ts=when.astimezone(timezone.utc).isoformat(),
+            ts=when.astimezone(UTC).isoformat(),
             camera=camera,
             plate=plate,
             action=action,
@@ -48,17 +48,11 @@ def _log(repo: LogRepository, plate: str, camera: str, action: str, when: dateti
 
 
 def _today(hour: int, minute: int = 0) -> datetime:
-    return datetime.now(timezone.utc).replace(
-        hour=hour, minute=minute, second=0, microsecond=0
-    )
+    return datetime.now(UTC).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
 def _midnight() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(hour=0, minute=0, second=0, microsecond=0)
-        .isoformat()
-    )
+    return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 # ---------------------------------------------------------------------------

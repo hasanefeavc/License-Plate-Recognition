@@ -29,10 +29,10 @@ Use Colab's **🔑 Secrets** panel for the key so it never lands in saved cell o
 import os
 from google.colab import userdata
 
-os.environ["ROBOFLOW_API_KEY"]  = userdata.get("ROBOFLOW_API_KEY")
+os.environ["ROBOFLOW_API_KEY"] = userdata.get("ROBOFLOW_API_KEY")
 os.environ["ROBOFLOW_WORKSPACE"] = "your-workspace"
-os.environ["ROBOFLOW_PROJECT"]   = "turkish-license-plates"
-os.environ["ROBOFLOW_VERSION"]   = "1"
+os.environ["ROBOFLOW_PROJECT"] = "turkish-license-plates"
+os.environ["ROBOFLOW_VERSION"] = "1"
 ```
 
 Already have a YOLO-format dataset? Skip this step and pass `--data path/to/data.yaml`
@@ -88,6 +88,7 @@ alongside as `.pt.bak`.
 
 ```python
 from google.colab import files
+
 files.download("models/plate_yolov8n.pt")
 ```
 

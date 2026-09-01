@@ -74,9 +74,7 @@ def _no_gpu_by_default(monkeypatch: pytest.MonkeyPatch) -> Any:
 def _settings(tmp_path: Path, **ocr_kwargs: Any) -> Any:
     config = pytest.importorskip("lpr.config")
     return config.Settings(
-        app=config.AppConfig(
-            data_dir=str(tmp_path / "data"), models_dir=str(tmp_path / "models")
-        ),
+        app=config.AppConfig(data_dir=str(tmp_path / "data"), models_dir=str(tmp_path / "models")),
         ocr=config.OcrConfig(**ocr_kwargs),
     )
 
@@ -132,9 +130,7 @@ def test_weights_are_stored_under_models_dir(tmp_path: Path, fake_easyocr: Any) 
     assert FakeReader.calls[-1]["user_network_directory"] == expected
 
 
-def test_a_complete_cache_disables_the_network_entirely(
-    tmp_path: Path, fake_easyocr: Any
-) -> None:
+def test_a_complete_cache_disables_the_network_entirely(tmp_path: Path, fake_easyocr: Any) -> None:
     """A provisioned gate box must start with the uplink down."""
     settings = _settings(tmp_path)
     _provision_cache(settings)
@@ -217,9 +213,7 @@ def test_a_failed_gpu_init_retries_on_cpu(
     assert [call["gpu"] for call in FakeReader.calls] == [True, False]
 
 
-def test_a_failure_on_cpu_names_the_cache_and_the_fix(
-    tmp_path: Path, fake_easyocr: Any
-) -> None:
+def test_a_failure_on_cpu_names_the_cache_and_the_fix(tmp_path: Path, fake_easyocr: Any) -> None:
     """There is nothing left to retry, so the message has to do the work."""
     FakeReader.failure_hook = lambda kwargs: OSError("timed out")
 

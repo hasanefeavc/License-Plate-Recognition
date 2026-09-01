@@ -119,9 +119,7 @@ def test_two_roles_on_one_device_disables_the_second() -> None:
     DirectShow locks the device, so the second VideoCapture takes the capture
     pipeline down with it rather than getting a second stream.
     """
-    cameras = CamerasConfig(
-        entry=CameraConfig(source="0"), exit=CameraConfig(source="0")
-    )
+    cameras = CamerasConfig(entry=CameraConfig(source="0"), exit=CameraConfig(source="0"))
     assert cameras.entry.source == "0", "the first role keeps the device"
     assert cameras.exit.source == "", "the second is disabled, not left to fail"
     assert not cameras.exit.enabled
@@ -134,18 +132,14 @@ def test_two_roles_on_one_device_disables_the_second() -> None:
 
 def test_the_collision_is_caught_across_spellings() -> None:
     """``entry: "0"`` and ``exit: "/dev/video0"`` are one webcam, not two."""
-    cameras = CamerasConfig(
-        entry=CameraConfig(source="0"), exit=CameraConfig(source="/dev/video0")
-    )
+    cameras = CamerasConfig(entry=CameraConfig(source="0"), exit=CameraConfig(source="/dev/video0"))
     assert cameras.exit.source == ""
     assert [issue.reason for issue in cameras.issues] == ["duplicate"]
 
 
 def test_an_unopenable_source_disables_only_its_own_role() -> None:
     """A typo on one camera must not cost the site the other one."""
-    cameras = CamerasConfig(
-        entry=CameraConfig(source="camera one"), exit=CameraConfig(source="1")
-    )
+    cameras = CamerasConfig(entry=CameraConfig(source="camera one"), exit=CameraConfig(source="1"))
     assert cameras.entry.source == ""
     assert cameras.exit.source == "1", "the good camera keeps working"
     (issue,) = cameras.issues
@@ -155,9 +149,7 @@ def test_an_unopenable_source_disables_only_its_own_role() -> None:
 
 
 def test_two_different_cameras_are_left_alone() -> None:
-    cameras = CamerasConfig(
-        entry=CameraConfig(source="0"), exit=CameraConfig(source="1")
-    )
+    cameras = CamerasConfig(entry=CameraConfig(source="0"), exit=CameraConfig(source="1"))
     assert cameras.issues == []
     assert cameras.entry.enabled and cameras.exit.enabled
 

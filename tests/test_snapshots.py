@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +47,7 @@ def _age(path: Path, days: float) -> None:
 
 
 def test_filename_is_timestamp_then_plate() -> None:
-    when = datetime(2026, 8, 27, 9, 14, 2, tzinfo=timezone.utc)
+    when = datetime(2026, 8, 27, 9, 14, 2, tzinfo=UTC)
     assert snapshot_filename("34ABC123", when) == "20260827_091402_34ABC123.jpg"
 
 
@@ -58,7 +58,7 @@ def test_filename_uses_utc_so_it_matches_the_log_row() -> None:
 
 
 def test_filename_strips_characters_a_filesystem_would_choke_on() -> None:
-    when = datetime(2026, 8, 27, 9, 14, 2, tzinfo=timezone.utc)
+    when = datetime(2026, 8, 27, 9, 14, 2, tzinfo=UTC)
     assert snapshot_filename("34 abc/123", when) == "20260827_091402_34ABC123.jpg"
     assert snapshot_filename("", when) == "20260827_091402_UNKNOWN.jpg"
 
@@ -101,7 +101,7 @@ def test_no_partial_files_are_left_behind(tmp_path, frame) -> None:
 def test_same_second_collision_does_not_overwrite_evidence(tmp_path, frame) -> None:
     """Entry and exit can confirm inside one second; neither image is lost."""
     writer = _writer(tmp_path)
-    when = datetime(2026, 8, 27, 9, 14, 2, tzinfo=timezone.utc)
+    when = datetime(2026, 8, 27, 9, 14, 2, tzinfo=UTC)
     writer.start()
     try:
         writer.submit("34ABC123", frame, camera="entry", when=when)

@@ -147,9 +147,9 @@ class LicenseDialog(tk.Toplevel):
         # -- masthead ---------------------------------------------------
         brand = tk_frame(body, bg=COL_CARD)
         brand.pack()
-        tk_label(
-            brand, text=ICON_BRAND, bg=COL_CARD, fg=COL_OK, font=ui_font(15, "bold")
-        ).pack(side="left")
+        tk_label(brand, text=ICON_BRAND, bg=COL_CARD, fg=COL_OK, font=ui_font(15, "bold")).pack(
+            side="left"
+        )
         tk_label(
             brand,
             text=TXT_LICENSE_TITLE.upper(),

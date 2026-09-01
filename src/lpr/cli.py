@@ -64,13 +64,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     print("[lpr init] Done. Next:")
     print("[lpr init]   1. Edit .env -- every secret in it is a placeholder.")
     print(
-        "[lpr init]   2. Set LPR_CAMERAS__ENTRY__SOURCE to your camera "
-        "(a number, or an RTSP URL)."
+        "[lpr init]   2. Set LPR_CAMERAS__ENTRY__SOURCE to your camera (a number, or an RTSP URL)."
     )
     print("[lpr init]   3. Train or install a plate model at models/plate_yolov8n.pt")
     print(
-        "[lpr init]      (README_TRAINING.md; `python scripts/fetch_models.py` "
-        "gets the baseline)."
+        "[lpr init]      (README_TRAINING.md; `python scripts/fetch_models.py` gets the baseline)."
     )
     print("[lpr init]   4. Start it:  uvicorn lpr.api.main:app --host 0.0.0.0 --port 8000")
     print("[lpr init]   5. Open http://localhost:8000/web/ and create the first admin account.")
@@ -137,9 +135,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         ),
     ]
     if assets.ocr_backend == "easyocr":
-        checks.append(
-            ("EasyOCR weights", not assets.ocr_missing, str(assets.ocr_models_dir))
-        )
+        checks.append(("EasyOCR weights", not assets.ocr_missing, str(assets.ocr_models_dir)))
 
     width = max(len(name) for name, _, _ in checks)
     for name, ok, where in checks:

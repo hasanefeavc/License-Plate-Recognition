@@ -23,7 +23,7 @@ import hashlib
 import hmac
 import logging
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from lpr.contracts import Action, CameraRole, LprEvent, utc_now_iso
@@ -88,9 +88,10 @@ def iso_bound(value: str | None, *, end_of_day: bool = False) -> str | None:
     # Naive input is taken as UTC: everything this project writes is UTC, so a
     # bound without an offset means the same clock as the stored rows.
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
 
-    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    return parsed.astimezone(UTC).replace(microsecond=0).isoformat()
+
 
 DEFAULT_ROLE = "operator"
 ADMIN_ROLE = "admin"
@@ -484,16 +485,20 @@ class LogRepository:
         if not name:
             return None
         try:
-            row = get_connection().execute(
-                """
+            row = (
+                get_connection()
+                .execute(
+                    """
                 SELECT camera
                 FROM logs
                 WHERE plate = ? AND action = ? AND ts >= ?
                 ORDER BY ts DESC, id DESC
                 LIMIT 1
                 """,
-                (name, str(Action.GRANTED), since),
-            ).fetchone()
+                    (name, str(Action.GRANTED), since),
+                )
+                .fetchone()
+            )
         except Exception:
             logger.warning("Son geçiş yönü okunamadı: %s", name, exc_info=True)
             return None
@@ -544,8 +549,7 @@ class LogRepository:
     def recent(self, limit: int = 50) -> list[LprEvent]:
         conn = get_connection()
         rows = conn.execute(
-            "SELECT id, ts, camera, plate, action, confidence FROM logs "
-            "ORDER BY id DESC LIMIT ?",
+            "SELECT id, ts, camera, plate, action, confidence FROM logs ORDER BY id DESC LIMIT ?",
             (max(0, int(limit)),),
         ).fetchall()
         return [_row_to_event(row) for row in rows]
@@ -589,11 +593,7 @@ class LogRepository:
         # Build the cutoff in Python so it is byte-for-byte the same format
         # as the stored ts (utc_now_iso), which makes the lexical comparison
         # exactly equivalent to a chronological one.
-        cutoff = (
-            (datetime.now(timezone.utc) - timedelta(days=int(days)))
-            .replace(microsecond=0)
-            .isoformat()
-        )
+        cutoff = (datetime.now(UTC) - timedelta(days=int(days))).replace(microsecond=0).isoformat()
         with transaction() as conn:
             cur = conn.execute("DELETE FROM logs WHERE ts < ?", (cutoff,))
             removed = int(cur.rowcount or 0)
@@ -754,9 +754,7 @@ class UserRepository:
             return False
 
         conn = get_connection()
-        row = conn.execute(
-            "SELECT password_hash FROM users WHERE username = ?", (name,)
-        ).fetchone()
+        row = conn.execute("SELECT password_hash FROM users WHERE username = ?", (name,)).fetchone()
         if row is None:
             # Still spend time hashing so a missing user is not obviously
             # faster than a wrong password.
@@ -906,9 +904,7 @@ class UserRepository:
         """True while the stored hash is still the legacy SHA-256 form."""
         name = (username or "").strip()
         conn = get_connection()
-        row = conn.execute(
-            "SELECT password_hash FROM users WHERE username = ?", (name,)
-        ).fetchone()
+        row = conn.execute("SELECT password_hash FROM users WHERE username = ?", (name,)).fetchone()
         if row is None:
             return False
         return str(row["password_hash"]).startswith(LEGACY_PREFIX)
@@ -1009,11 +1005,7 @@ class SystemEventRepository:
         """Delete events older than ``days``; ``days <= 0`` is a no-op."""
         if days <= 0:
             return 0
-        cutoff = (
-            (datetime.now(timezone.utc) - timedelta(days=int(days)))
-            .replace(microsecond=0)
-            .isoformat()
-        )
+        cutoff = (datetime.now(UTC) - timedelta(days=int(days))).replace(microsecond=0).isoformat()
         try:
             with transaction() as conn:
                 cur = conn.execute(schema.DELETE_SYSTEM_EVENTS_OLDER_THAN, (cutoff,))
@@ -1060,9 +1052,7 @@ class SystemMetaRepository:
             return
         self._ensure_table()
         with transaction() as conn:
-            conn.execute(
-                schema.UPSERT_SYSTEM_META, (name, str(value), utc_now_iso())
-            )
+            conn.execute(schema.UPSERT_SYSTEM_META, (name, str(value), utc_now_iso()))
 
     def delete(self, key: str) -> bool:
         name = (key or "").strip()

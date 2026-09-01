@@ -122,7 +122,7 @@ async def _safe_send(websocket: WebSocket, payload: dict[str, Any]) -> bool:
         return False
 
 
-def _drain(q: "queue.Queue[Any]") -> list[Any]:
+def _drain(q: queue.Queue[Any]) -> list[Any]:
     """Blocking read of one event plus whatever else is already queued.
 
     Always called inside ``run_in_executor`` -- never on the event loop.
@@ -267,7 +267,7 @@ async def events_socket(
 
     await manager.connect(websocket)
     pipeline = getattr(websocket.app.state, "pipeline", None)
-    event_queue: "queue.Queue[Any] | None" = None
+    event_queue: queue.Queue[Any] | None = None
     telemetry_queue: queue.Queue[Any] | None = None
     reader = asyncio.create_task(_watch_for_close(websocket))
     loop = asyncio.get_running_loop()

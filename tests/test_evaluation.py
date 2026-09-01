@@ -227,9 +227,7 @@ def test_a_perfect_run_keeps_no_failures() -> None:
 
 
 def test_latency_percentiles() -> None:
-    metrics = score(
-        [sample(f"{n}.jpg", latency_ms=float(n)) for n in range(1, 101)]
-    )
+    metrics = score([sample(f"{n}.jpg", latency_ms=float(n)) for n in range(1, 101)])
     assert metrics.latency_mean == pytest.approx(50.5)
     assert metrics.latency_p50 == pytest.approx(50.0)
     assert metrics.latency_p95 == pytest.approx(95.0)
@@ -237,9 +235,7 @@ def test_latency_percentiles() -> None:
 
 def test_untimed_samples_do_not_drag_the_mean_to_zero() -> None:
     """A frame that failed to load reports 0.0 ms, which is not a measurement."""
-    metrics = score(
-        [sample("a.jpg", latency_ms=100.0), sample("b.jpg", latency_ms=0.0)]
-    )
+    metrics = score([sample("a.jpg", latency_ms=100.0), sample("b.jpg", latency_ms=0.0)])
     assert metrics.latency_mean == pytest.approx(100.0)
     assert len(metrics.latencies_ms) == 1
 

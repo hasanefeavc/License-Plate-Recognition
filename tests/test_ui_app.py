@@ -230,9 +230,7 @@ def test_an_invalid_licence_freezes_the_view_and_asks_for_a_key() -> None:
     app, _root, view = make_app()
     opened = _watch_license_dialog(app)
 
-    app._apply_license(
-        {"valid": False, "reason": "expired", "detail": "Lisans süresi doldu."}
-    )
+    app._apply_license({"valid": False, "reason": "expired", "detail": "Lisans süresi doldu."})
 
     assert app._license_locked is True
     assert view.license_locks == [(True, "Lisans süresi doldu.")]

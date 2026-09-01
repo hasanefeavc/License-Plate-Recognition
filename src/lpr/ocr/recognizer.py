@@ -209,7 +209,7 @@ class _BaseRecognizer:
     _tight_font: bool = True
     _tight_font_kernel: tuple[int, int] = TIGHT_FONT_KERNEL
 
-    def _configure_preprocessing(self, settings: "Settings") -> None:
+    def _configure_preprocessing(self, settings: Settings) -> None:
         """Read the crop-preprocessing knobs off ``settings``.
 
         ``getattr`` throughout, so a Settings object predating the
@@ -416,7 +416,7 @@ class EasyOcrRecognizer(_BaseRecognizer):
     and never waits on a socket at all.
     """
 
-    def __init__(self, settings: "Settings | None" = None) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
         if settings is None:
             from lpr.config import get_settings
 
@@ -517,9 +517,7 @@ class EasyOcrRecognizer(_BaseRecognizer):
         except Exception as exc:
             if not kwargs["gpu"]:
                 raise RuntimeError(self._init_failure_message(exc)) from exc
-            logger.warning(
-                "EasyOCR failed to initialise on the GPU (%s); retrying on CPU", exc
-            )
+            logger.warning("EasyOCR failed to initialise on the GPU (%s); retrying on CPU", exc)
 
         self.gpu = False
         supported["gpu"] = False
@@ -589,7 +587,7 @@ class PaddleOcrRecognizer(_BaseRecognizer):
     decoder.
     """
 
-    def __init__(self, settings: "Settings | None" = None) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
         if settings is None:
             from lpr.config import get_settings
 

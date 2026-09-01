@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from datetime import UTC
 from typing import Any
 
 import pytest
@@ -28,7 +29,6 @@ from .conftest import (
     FakeTrackingDetector,
     FakeVoter,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test doubles for the capture layer
@@ -318,9 +318,7 @@ def test_frame_stride_is_honoured(db, monkeypatch, frame) -> None:
     pipeline._cameras["entry"] = camera
 
     # Drive the loop directly, then let it stop once the frames run out.
-    stopper = threading.Thread(
-        target=lambda: (time.sleep(0.4), pipeline._stop_event.set())
-    )
+    stopper = threading.Thread(target=lambda: (time.sleep(0.4), pipeline._stop_event.set()))
     stopper.start()
     pipeline._process_camera("entry")
     stopper.join()
@@ -336,9 +334,7 @@ def test_frame_stride_of_one_runs_every_frame(db, monkeypatch, frame) -> None:
     pipeline = _build_pipeline(settings, detector=detector, voter=FakeVoter(confirm=False))
     pipeline._cameras["entry"] = ScriptedCamera("entry", [frame] * 4)
 
-    stopper = threading.Thread(
-        target=lambda: (time.sleep(0.4), pipeline._stop_event.set())
-    )
+    stopper = threading.Thread(target=lambda: (time.sleep(0.4), pipeline._stop_event.set()))
     stopper.start()
     pipeline._process_camera("entry")
     stopper.join()
@@ -632,9 +628,7 @@ def test_a_new_track_is_recognised_again(db, frame) -> None:
 
 def test_each_camera_gets_its_own_tracker_stream(db, frame) -> None:
     detector = FakeTrackingDetector(track_ids=[7])
-    pipeline = _build_pipeline(
-        db, detector=detector, voter=_tracking_voter(db, cooldown_s=60.0)
-    )
+    pipeline = _build_pipeline(db, detector=detector, voter=_tracking_voter(db, cooldown_s=60.0))
 
     pipeline.process_frame("entry", frame)
     pipeline.process_frame("exit", frame)
@@ -1102,18 +1096,14 @@ def test_a_lapsed_user_licence_never_closes_the_barrier(db, frame, caplog) -> No
     assert "34ABC123 registered, gate opened" in caplog.text
 
 
-def test_the_plates_own_expiry_still_decides_for_a_lapsed_users_car(
-    db, frame
-) -> None:
+def test_the_plates_own_expiry_still_decides_for_a_lapsed_users_car(db, frame) -> None:
     """The other half: the *plate's* permit is the one that can refuse.
 
     Otherwise this pair would pass for the wrong reason -- a gate that opened
     for everything would satisfy the test above.
     """
     _expired_operator()
-    PlateRepository().upsert(
-        "34ABC123", username="bekci", expires_at=_days_from_now(-1)
-    )
+    PlateRepository().upsert("34ABC123", username="bekci", expires_at=_days_from_now(-1))
     relay = FakeRelay()
     pipeline = _build_pipeline(db, relay=relay)
 
@@ -1474,12 +1464,12 @@ def test_the_state_expires_so_a_missed_exit_cannot_strand_a_resident(db) -> None
     out even the shortest usable window would cost seconds of suite time for a
     property that is really about the query's cutoff.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     PlateRepository().upsert("34ABC123")
     pipeline = _passback_pipeline(db, window_s=3600.0)
 
-    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+    stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat(timespec="seconds")
     LogRepository().write(
         LprEvent(
             ts=stale,
@@ -1495,12 +1485,12 @@ def test_the_state_expires_so_a_missed_exit_cannot_strand_a_resident(db) -> None
 
 def test_an_entry_inside_the_window_is_still_refused(db) -> None:
     """The other half of the cutoff, so the test above cannot pass vacuously."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     PlateRepository().upsert("34ABC123")
     pipeline = _passback_pipeline(db, window_s=3600.0)
 
-    recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).isoformat(timespec="seconds")
     LogRepository().write(
         LprEvent(
             ts=recent,

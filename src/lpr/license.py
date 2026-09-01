@@ -59,7 +59,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -144,12 +144,8 @@ _DETAILS: Final[dict[str, str]] = {
     REASON_EXPIRED: "Lisans süresi doldu. Lütfen yeni bir lisans anahtarı girin.",
     REASON_INVALID: "Lisans anahtarı geçersiz.",
     REASON_NOT_YET_VALID: "Lisans anahtarı henüz geçerli değil (başlangıç tarihi ileride).",
-    REASON_CLOCK_ROLLBACK: (
-        "Sistem saati geriye alınmış. Lisans doğrulanamıyor; saati düzeltin."
-    ),
-    REASON_NO_KEY: (
-        "Lisans doğrulama anahtarı (public_key.pem) bulunamadı veya okunamadı."
-    ),
+    REASON_CLOCK_ROLLBACK: ("Sistem saati geriye alınmış. Lisans doğrulanamıyor; saati düzeltin."),
+    REASON_NO_KEY: ("Lisans doğrulama anahtarı (public_key.pem) bulunamadı veya okunamadı."),
     REASON_MACHINE_MISMATCH: (
         "Bu lisans anahtarı başka bir makine için verilmiş. Donanım değiştiyse "
         "yeni makine kimliğinizle (hwid) yeniden bağlama talep edin."
@@ -215,7 +211,7 @@ class LicenseStatus:
         }
 
     @classmethod
-    def failure(cls, reason: str, detail: str | None = None, **fields: Any) -> "LicenseStatus":
+    def failure(cls, reason: str, detail: str | None = None, **fields: Any) -> LicenseStatus:
         return cls(
             valid=False,
             reason=reason,
@@ -290,10 +286,7 @@ def load_public_key(source: str | bytes | Path | None = None) -> bytes | None:
     if isinstance(source, str) and "BEGIN" in source:
         return _validated_pem(source.encode("utf-8"), "<memory>")
 
-    if source is not None:
-        candidates = [Path(source).expanduser()]
-    else:
-        candidates = public_key_candidates()
+    candidates = [Path(source).expanduser()] if source is not None else public_key_candidates()
 
     for path in candidates:
         try:
@@ -352,7 +345,7 @@ def _validated_pem(pem: bytes, origin: str) -> bytes | None:
 
 def _iso(timestamp: Any) -> str | None:
     try:
-        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(float(timestamp), tz=UTC).isoformat()
     except (TypeError, ValueError, OSError, OverflowError):
         return None
 
@@ -512,9 +505,7 @@ def _machine_matches(claimed: dict[str, str], fingerprint: Any) -> tuple[bool, i
     if not claimed:
         return True, 0, []
     if fingerprint is None:
-        logger.warning(
-            "Lisans makineye bağlı ama parmak izi okunamadı; bağ denetimi atlanıyor."
-        )
+        logger.warning("Lisans makineye bağlı ama parmak izi okunamadı; bağ denetimi atlanıyor.")
         return True, 0, []
     try:
         from lpr.machine import fingerprint_matches
@@ -694,9 +685,7 @@ def check_license(
     return status
 
 
-def activate_license(
-    token: str, *, public_key: str | bytes | Path | None = None
-) -> LicenseStatus:
+def activate_license(token: str, *, public_key: str | bytes | Path | None = None) -> LicenseStatus:
     """Validate and persist a new licence key.
 
     Raises :class:`LicenseError` when the key is not usable, so nothing that
@@ -715,7 +704,7 @@ def activate_license(
 
     meta = _meta()
     meta.set(LICENSE_TOKEN_KEY, raw)
-    meta.set(LICENSE_ACTIVATED_KEY, datetime.now(timezone.utc).isoformat())
+    meta.set(LICENSE_ACTIVATED_KEY, datetime.now(UTC).isoformat())
     _write_license_file(raw)
     logger.info(
         "Yeni lisans etkinleştirildi (müşteri=%s, bitiş=%s)",

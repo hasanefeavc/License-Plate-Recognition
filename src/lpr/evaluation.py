@@ -297,15 +297,13 @@ class Metrics:
         lines = [
             f"  samples          {self.total}  ({self.positives} positive, "
             f"{self.negatives} negative)",
-            f"  plate accuracy  {pct(self.plate_accuracy)}   "
-            f"({self.hits}/{self.positives} exact)",
+            f"  plate accuracy  {pct(self.plate_accuracy)}   ({self.hits}/{self.positives} exact)",
             f"  CER             {pct(self.cer)}",
             f"  wrong-plate     {pct(self.wrong_plate_rate)}   "
             f"({self.wrong} of {self.hits + self.wrong} emitted)",
             f"  false positive  {pct(self.false_positive_rate)}   "
             f"({self.false_positives}/{self.negatives} negatives)",
-            f"  miss rate       {pct(self.miss_rate)}   "
-            f"({self.misses}/{self.positives})",
+            f"  miss rate       {pct(self.miss_rate)}   ({self.misses}/{self.positives})",
             f"  latency ms      mean {ms(self.latency_mean)}  "
             f"p50 {ms(self.latency_p50)}  p95 {ms(self.latency_p95)}",
         ]

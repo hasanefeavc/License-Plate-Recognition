@@ -21,7 +21,7 @@ these tests replace.
 from __future__ import annotations
 
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -212,10 +212,6 @@ class FakePipeline:
         for group in (self.subscribers, self.telemetry_subscribers):
             if q in group:
                 group.remove(q)
-
-    def unsubscribe(self, q: Any) -> None:
-        if q in self.subscribers:
-            self.subscribers.remove(q)
 
     def start(self) -> None:  # pragma: no cover - lifespan is not exercised
         self.running = True
@@ -425,9 +421,7 @@ def test_login_returns_token_that_authorises_calls(
 ) -> None:
     user_repo.register("mudur", "gizli123", "admin")
 
-    login = api_client.post(
-        "/api/auth/login", json={"username": "mudur", "password": "gizli123"}
-    )
+    login = api_client.post("/api/auth/login", json={"username": "mudur", "password": "gizli123"})
     assert login.status_code == 200
     token = login.json()["access_token"]
     assert login.json()["role"] == "admin"
@@ -446,9 +440,7 @@ def test_login_with_wrong_password_is_401(
 ) -> None:
     user_repo.register("mudur", "dogru", "admin")
 
-    response = api_client.post(
-        "/api/auth/login", json={"username": "mudur", "password": "yanlis"}
-    )
+    response = api_client.post("/api/auth/login", json={"username": "mudur", "password": "yanlis"})
 
     assert response.status_code == 401
     assert response.json()["error"]["status"] == 401
@@ -634,10 +626,10 @@ def _log_at(moment: datetime, plate: str, camera: str = "entry") -> None:
     from lpr.db import LogRepository
 
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.replace(tzinfo=UTC)
     LogRepository().write(
         LprEvent(
-            ts=moment.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+            ts=moment.astimezone(UTC).replace(microsecond=0).isoformat(),
             camera=camera,
             plate=plate,
             action="granted",
@@ -650,9 +642,7 @@ def _plates(response: Any) -> set[str]:
     return {row["plate"] for row in response.json()}
 
 
-def test_filtering_by_today_returns_todays_logs(
-    real_log_app: Any, operator_token: str
-) -> None:
+def test_filtering_by_today_returns_todays_logs(real_log_app: Any, operator_token: str) -> None:
     """The reported bug: picking a day returned nothing at all.
 
     ``until="2026-08-28"`` is *shorter* than the stored
@@ -661,7 +651,7 @@ def test_filtering_by_today_returns_todays_logs(
     which sends no dates, kept working. That asymmetry is the whole signature
     of the defect.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     today = now.strftime("%Y-%m-%d")
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -683,7 +673,7 @@ def test_filtering_by_today_returns_todays_logs(
 def test_filtering_by_yesterday_returns_only_yesterday(
     real_log_app: Any, operator_token: str
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     yesterday = now - timedelta(days=1)
 
     _log_at(now, "34TODAY1")
@@ -710,7 +700,7 @@ def test_a_day_filter_includes_the_very_last_second_of_the_day(
     23:59:59 is the row an off-by-one in the upper bound drops, and the one
     nobody notices is missing until a night-shift read goes unaccounted for.
     """
-    day = datetime(2026, 5, 2, tzinfo=timezone.utc)
+    day = datetime(2026, 5, 2, tzinfo=UTC)
     _log_at(day.replace(hour=0, minute=0, second=0), "34FIRST1")
     _log_at(day.replace(hour=23, minute=59, second=59), "34LAST01")
     _log_at(day + timedelta(days=1), "34NEXT01")
@@ -756,10 +746,8 @@ def test_an_older_single_day_returns_its_afternoon_rows(
 
     # Exactly what dayRange() sends: local midnight and 23:59:59.999 as UTC
     # instants with a trailing Z.
-    since = at(0).astimezone(timezone.utc)
-    until = datetime(
-        day.year, day.month, day.day, 23, 59, 59, 999_000, tzinfo=east
-    ).astimezone(timezone.utc)
+    since = at(0).astimezone(UTC)
+    until = datetime(day.year, day.month, day.day, 23, 59, 59, 999_000, tzinfo=east).astimezone(UTC)
 
     client = TestClient(real_log_app)
     response = client.get(
@@ -784,10 +772,10 @@ def test_an_older_single_day_works_from_the_bare_date_too(
     passes the bare date rather than recomputing instants, so both spellings
     have to select the same afternoon row.
     """
-    day = (datetime.now(timezone.utc) - timedelta(days=3)).date()
-    _log_at(datetime(day.year, day.month, day.day, 15, 0, tzinfo=timezone.utc), "34AFT001")
-    _log_at(datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc), "34LAST01")
-    _log_at(datetime.now(timezone.utc), "34TODAY1")
+    day = (datetime.now(UTC) - timedelta(days=3)).date()
+    _log_at(datetime(day.year, day.month, day.day, 15, 0, tzinfo=UTC), "34AFT001")
+    _log_at(datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=UTC), "34LAST01")
+    _log_at(datetime.now(UTC), "34TODAY1")
 
     client = TestClient(real_log_app)
     response = client.get(
@@ -814,9 +802,7 @@ def test_the_day_picker_and_the_day_filter_agree_east_of_greenwich(
     from lpr.db import LogRepository
 
     east = timezone(timedelta(hours=3))
-    base = (datetime.now(east) - timedelta(days=3)).replace(
-        minute=0, second=0, microsecond=0
-    )
+    base = (datetime.now(east) - timedelta(days=3)).replace(minute=0, second=0, microsecond=0)
     for hour in range(24):
         _log_at(base.replace(hour=hour), f"34H{hour:05d}")
 
@@ -827,10 +813,8 @@ def test_the_day_picker_and_the_day_filter_agree_east_of_greenwich(
     seen: set[str] = set()
     for day_text in offered:
         year, month, date = (int(part) for part in day_text.split("-"))
-        since = datetime(year, month, date, tzinfo=east).astimezone(timezone.utc)
-        until = datetime(
-            year, month, date, 23, 59, 59, 999_000, tzinfo=east
-        ).astimezone(timezone.utc)
+        since = datetime(year, month, date, tzinfo=east).astimezone(UTC)
+        until = datetime(year, month, date, 23, 59, 59, 999_000, tzinfo=east).astimezone(UTC)
         response = client.get(
             "/api/logs",
             params={
@@ -851,8 +835,8 @@ def test_the_day_picker_and_the_day_filter_agree_east_of_greenwich(
 def test_the_unfiltered_view_still_returns_everything(
     real_log_app: Any, operator_token: str
 ) -> None:
-    """"Tümü" was the one option that worked; it has to keep working."""
-    now = datetime.now(timezone.utc)
+    """ "Tümü" was the one option that worked; it has to keep working."""
+    now = datetime.now(UTC)
     _log_at(now, "34TODAY1")
     _log_at(now - timedelta(days=1), "34YEST01")
 
@@ -871,8 +855,8 @@ def test_full_iso_bounds_from_a_browser_are_accepted(
     which appears in the stored format. Comparing those two shapes as text is
     only accidentally correct, so the server normalises before comparing.
     """
-    _log_at(datetime(2026, 5, 2, 12, 0, 0, tzinfo=timezone.utc), "34MIDDAY")
-    _log_at(datetime(2026, 5, 3, 12, 0, 0, tzinfo=timezone.utc), "34NEXTDY")
+    _log_at(datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC), "34MIDDAY")
+    _log_at(datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC), "34NEXTDY")
 
     client = TestClient(real_log_app)
     response = client.get(
@@ -896,8 +880,8 @@ def test_an_offset_bearing_bound_is_converted_not_compared_as_text(
     "3 May" in Istanbul must get that read; a UTC-day filter would file it
     under 2 May and lose it.
     """
-    _log_at(datetime(2026, 5, 2, 22, 30, 0, tzinfo=timezone.utc), "34LATE01")
-    _log_at(datetime(2026, 5, 2, 20, 0, 0, tzinfo=timezone.utc), "34EARLY1")
+    _log_at(datetime(2026, 5, 2, 22, 30, 0, tzinfo=UTC), "34LATE01")
+    _log_at(datetime(2026, 5, 2, 20, 0, 0, tzinfo=UTC), "34EARLY1")
 
     client = TestClient(real_log_app)
     response = client.get(
@@ -920,7 +904,7 @@ def test_the_day_list_can_be_bucketed_in_the_operators_timezone(
     Without a matching offset the list and the filter disagree about where the
     day starts, and a day plainly holding rows comes back empty when chosen.
     """
-    _log_at(datetime(2026, 5, 2, 22, 30, 0, tzinfo=timezone.utc), "34LATE01")
+    _log_at(datetime(2026, 5, 2, 22, 30, 0, tzinfo=UTC), "34LATE01")
 
     client = TestClient(real_log_app)
     utc_days = client.get("/api/logs/dates", headers=auth(operator_token)).json()
@@ -932,9 +916,7 @@ def test_the_day_list_can_be_bucketed_in_the_operators_timezone(
     assert istanbul == ["2026-05-03"], "22:30 UTC is 01:30 the next day in Istanbul"
 
 
-def test_an_implausible_timezone_offset_is_refused(
-    real_log_app: Any, operator_token: str
-) -> None:
+def test_an_implausible_timezone_offset_is_refused(real_log_app: Any, operator_token: str) -> None:
     """Better a 422 than a silently skewed day list."""
     client = TestClient(real_log_app)
     response = client.get(
@@ -944,9 +926,7 @@ def test_an_implausible_timezone_offset_is_refused(
 
 
 def test_bad_log_camera_is_422(api_client: TestClient, operator_token: str) -> None:
-    response = api_client.get(
-        "/api/logs", params={"camera": "garaj"}, headers=auth(operator_token)
-    )
+    response = api_client.get("/api/logs", params={"camera": "garaj"}, headers=auth(operator_token))
 
     assert response.status_code == 422
     assert response.json()["error"]["status"] == 422
@@ -975,9 +955,7 @@ def test_cameras(api_client: TestClient, operator_token: str) -> None:
     assert by_role["exit"]["last_error"] == "kamera yok"
 
 
-def test_cameras_without_pipeline_still_answers(
-    api_app: Any, operator_token: str
-) -> None:
+def test_cameras_without_pipeline_still_answers(api_app: Any, operator_token: str) -> None:
     api_app.state.pipeline = None
     client = TestClient(api_app)
 
@@ -1007,13 +985,9 @@ def test_pause_and_resume(api_client: TestClient, admin_token: str, api_app: Any
     assert api_app.state.paused is False
 
 
-def test_an_operator_may_pause_the_pipeline(
-    api_client: TestClient, operator_token: str
-) -> None:
+def test_an_operator_may_pause_the_pipeline(api_client: TestClient, operator_token: str) -> None:
     """Pausing is shift-floor work, not administration."""
-    assert (
-        api_client.post("/api/pipeline/pause", headers=auth(operator_token)).status_code == 200
-    )
+    assert api_client.post("/api/pipeline/pause", headers=auth(operator_token)).status_code == 200
 
 
 def test_pausing_still_requires_authentication(api_client: TestClient) -> None:
@@ -1100,9 +1074,7 @@ def _pipeline_client(api_app: Any, pipeline: Any) -> TestClient:
     return TestClient(api_app)
 
 
-def test_a_disabled_camera_is_refused_immediately(
-    api_app: Any, operator_token: str
-) -> None:
+def test_a_disabled_camera_is_refused_immediately(api_app: Any, operator_token: str) -> None:
     """The hang this fixes.
 
     A camera with no worker never produces a frame, so the generator used to
@@ -1188,9 +1160,11 @@ def test_a_pipeline_that_cannot_report_its_cameras_is_given_the_benefit(
 
 
 def client_status(api_app: Any, pipeline: Any, token: str, camera: str = "entry") -> int:
-    return _pipeline_client(api_app, pipeline).get(
-        f"/api/stream/{camera}", headers=auth(token)
-    ).status_code
+    return (
+        _pipeline_client(api_app, pipeline)
+        .get(f"/api/stream/{camera}", headers=auth(token))
+        .status_code
+    )
 
 
 def test_the_camera_list_falls_back_to_stats_when_there_is_no_accessor() -> None:
@@ -1287,9 +1261,7 @@ def test_license_status_requires_auth(api_client: TestClient) -> None:
     assert api_client.get("/api/license").status_code == 401
 
 
-def test_an_expired_deployment_licence_no_longer_halts_the_pipeline(
-    expired_app: Any
-) -> None:
+def test_an_expired_deployment_licence_no_longer_halts_the_pipeline(expired_app: Any) -> None:
     """The installation-wide licence is reported, not enforced.
 
     Access control lives in the per-user model now. An expiry that stops a site
@@ -1300,9 +1272,7 @@ def test_an_expired_deployment_licence_no_longer_halts_the_pipeline(
     assert expired_app.state.pipeline.paused is False
 
 
-def test_an_expired_deployment_licence_no_longer_blocks_the_gate(
-    expired_app: Any
-) -> None:
+def test_an_expired_deployment_licence_no_longer_blocks_the_gate(expired_app: Any) -> None:
     client = TestClient(expired_app)
     response = client.post("/api/relay/trigger", headers=auth(create_token("admin", "admin")))
     assert response.status_code == 200
@@ -1335,9 +1305,7 @@ def test_submitting_a_key_releases_the_halt(expired_app: Any) -> None:
     assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
 
 
-def test_a_rejected_deployment_key_is_a_400_carrying_the_reason(
-    expired_app: Any
-) -> None:
+def test_a_rejected_deployment_key_is_a_400_carrying_the_reason(expired_app: Any) -> None:
     """The endpoint still validates keys; it just no longer gates anything."""
     client = TestClient(expired_app)
     response = client.post(
@@ -1360,12 +1328,8 @@ def test_pasted_key_whitespace_is_stripped(expired_app: Any) -> None:
     assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
 
 
-def test_submitting_a_key_requires_admin(
-    api_client: TestClient, operator_token: str
-) -> None:
-    response = api_client.post(
-        "/api/license", headers=auth(operator_token), json={"key": "a" * 40}
-    )
+def test_submitting_a_key_requires_admin(api_client: TestClient, operator_token: str) -> None:
+    response = api_client.post("/api/license", headers=auth(operator_token), json={"key": "a" * 40})
     assert response.status_code == 403
 
 
@@ -1406,9 +1370,7 @@ def test_ws_rejects_a_bad_token(api_client: TestClient) -> None:
         assert ws.receive_json()["type"] == "error"
 
 
-def test_ws_pushes_camera_status_on_connect(
-    api_client: TestClient, operator_token: str
-) -> None:
+def test_ws_pushes_camera_status_on_connect(api_client: TestClient, operator_token: str) -> None:
     with api_client.websocket_connect(f"/api/ws/events?token={operator_token}") as ws:
         ws.receive_json()  # hello
         status = ws.receive_json()
@@ -1427,9 +1389,7 @@ def test_ws_forwards_decisions_and_telemetry_separately(
         ws.receive_json()  # hello
         ws.receive_json()  # camera_status
 
-        event = LprEvent(
-            ts=utc_now_iso(), camera="entry", plate="34ABC123", action="granted"
-        )
+        event = LprEvent(ts=utc_now_iso(), camera="entry", plate="34ABC123", action="granted")
         for q in pipeline.subscribers:
             q.put(event)
         for q in pipeline.telemetry_subscribers:
@@ -1502,9 +1462,7 @@ class FakeUpdater:
                 "state": "running",
                 "step": "pull",
                 "detail": (
-                    "Zorla yeniden derleme başlatıldı."
-                    if force
-                    else "Güncelleme başlatıldı."
+                    "Zorla yeniden derleme başlatıldı." if force else "Güncelleme başlatıldı."
                 ),
                 "running": True,
                 "started_at": 1.0,
@@ -1536,9 +1494,7 @@ def test_version_requires_authentication(update_client: TestClient) -> None:
     assert update_client.get("/api/system/version").status_code == 401
 
 
-def test_version_is_readable_by_an_operator(
-    update_client: TestClient, operator_token: str
-) -> None:
+def test_version_is_readable_by_an_operator(update_client: TestClient, operator_token: str) -> None:
     """An operator who can see the running version can report it on the phone."""
     response = update_client.get("/api/system/version", headers=auth(operator_token))
     assert response.status_code == 200
@@ -1579,9 +1535,7 @@ def test_updating_still_requires_authentication(
 def test_an_operator_may_read_the_update_status(
     update_client: TestClient, operator_token: str
 ) -> None:
-    assert (
-        update_client.get("/api/system/update", headers=auth(operator_token)).status_code == 200
-    )
+    assert update_client.get("/api/system/update", headers=auth(operator_token)).status_code == 200
 
 
 def test_an_admin_can_start_an_update(
@@ -1595,9 +1549,7 @@ def test_an_admin_can_start_an_update(
     assert updater.starts == 1
 
 
-def test_a_disabled_updater_answers_503(
-    api_app: Any, admin_token: str
-) -> None:
+def test_a_disabled_updater_answers_503(api_app: Any, admin_token: str) -> None:
     disabled = FakeUpdater(enabled=False, error=RuntimeError("Sistem güncellemesi devre dışı."))
     api_app.state.system_updater = disabled
     api_app.dependency_overrides[deps.get_system_updater] = lambda: disabled
@@ -1613,9 +1565,7 @@ def test_a_concurrent_update_answers_409(api_app: Any, admin_token: str) -> None
     assert response.status_code == 409
 
 
-def test_update_status_is_readable_by_an_admin(
-    update_client: TestClient, admin_token: str
-) -> None:
+def test_update_status_is_readable_by_an_admin(update_client: TestClient, admin_token: str) -> None:
     response = update_client.get("/api/system/update", headers=auth(admin_token))
     assert response.status_code == 200
     assert response.json()["state"] == "idle"
@@ -1668,9 +1618,7 @@ def test_an_admin_can_ask_for_a_forced_rebuild(
     assert body["forced"] is True, "the client needs to know not to await a new commit"
 
 
-def test_a_forced_rebuild_is_refused_while_one_is_running(
-    api_app: Any, admin_token: str
-) -> None:
+def test_a_forced_rebuild_is_refused_while_one_is_running(api_app: Any, admin_token: str) -> None:
     """Forcing must not become a way around the single-flight guard."""
     busy = FakeUpdater(error=RuntimeError("Zaten devam eden bir güncelleme var."))
     api_app.state.system_updater = busy
@@ -1683,9 +1631,7 @@ def test_a_forced_rebuild_is_refused_while_one_is_running(
     assert response.status_code == 409
 
 
-def test_a_forced_rebuild_still_needs_the_feature_enabled(
-    api_app: Any, admin_token: str
-) -> None:
+def test_a_forced_rebuild_still_needs_the_feature_enabled(api_app: Any, admin_token: str) -> None:
     """``force`` overrides the no-op check, never the deployment's own switch."""
     disabled = FakeUpdater(enabled=False, error=RuntimeError("Sistem güncellemesi devre dışı."))
     api_app.state.system_updater = disabled
@@ -1752,9 +1698,7 @@ def test_system_events_require_authentication(
 ) -> None:
     """Readable by an operator, who is the one who finds the gate rebuilt."""
     assert events_client.get("/api/system/events").status_code == 401
-    assert (
-        events_client.get("/api/system/events", headers=auth(operator_token)).status_code == 200
-    )
+    assert events_client.get("/api/system/events", headers=auth(operator_token)).status_code == 200
 
 
 def test_an_admin_reads_the_audit_trail_newest_first(
@@ -1770,9 +1714,7 @@ def test_an_admin_reads_the_audit_trail_newest_first(
 def test_the_audit_trail_can_be_filtered_and_limited(
     events_client: TestClient, admin_token: str, events_repo: FakeSystemEventRepo
 ) -> None:
-    response = events_client.get(
-        "/api/system/events?limit=1&source=ota", headers=auth(admin_token)
-    )
+    response = events_client.get("/api/system/events?limit=1&source=ota", headers=auth(admin_token))
     assert response.status_code == 200
     assert len(response.json()) == 1
     assert events_repo.queries[-1] == (1, "ota")
@@ -1866,9 +1808,7 @@ def upload(client: TestClient, token: str, body: bytes, query: str = "") -> Any:
     )
 
 
-def test_an_operator_may_import_plates(
-    csv_client: TestClient, operator_token: str
-) -> None:
+def test_an_operator_may_import_plates(csv_client: TestClient, operator_token: str) -> None:
     assert upload(csv_client, operator_token, b"plate\n34ABC123\n").status_code == 200
 
 
@@ -1893,9 +1833,7 @@ def test_plate_import_reports_counts_per_row(
     assert csv_repo.details["34ABC123"]["owner"] == "Ali Şen"
 
 
-def test_plate_import_skips_existing_by_default(
-    csv_client: TestClient, admin_token: str
-) -> None:
+def test_plate_import_skips_existing_by_default(csv_client: TestClient, admin_token: str) -> None:
     body = b"plate,owner\r\n34ABC123,Ali\r\n"
     assert upload(csv_client, admin_token, body).json()["added"] == 1
 
@@ -1920,15 +1858,11 @@ def test_plate_import_rejects_a_file_without_a_plate_column(
     assert report["errors"]
 
 
-def test_an_operator_may_export_plates(
-    csv_client: TestClient, operator_token: str
-) -> None:
+def test_an_operator_may_export_plates(csv_client: TestClient, operator_token: str) -> None:
     assert csv_client.get("/api/plates/export", headers=auth(operator_token)).status_code == 200
 
 
-def test_plate_export_returns_a_downloadable_csv(
-    csv_client: TestClient, admin_token: str
-) -> None:
+def test_plate_export_returns_a_downloadable_csv(csv_client: TestClient, admin_token: str) -> None:
     upload(csv_client, admin_token, "plate,owner\r\n34ABC123,Ali Şen\r\n".encode())
     response = csv_client.get("/api/plates/export", headers=auth(admin_token))
 
@@ -1972,9 +1906,7 @@ def test_event_export_passes_the_filters_through(
     assert log_repo.last_query["plate"] == "34ABC123", "the plate filter must be normalised"
 
 
-def test_event_export_rejects_an_absurd_limit(
-    api_client: TestClient, operator_token: str
-) -> None:
+def test_event_export_rejects_an_absurd_limit(api_client: TestClient, operator_token: str) -> None:
     assert (
         api_client.get("/api/events/export?limit=999999", headers=auth(operator_token)).status_code
         == 422
@@ -2097,9 +2029,7 @@ def test_the_block_toggle_preserves_the_other_fields(
     assert body["note"] == "Kiracı"
 
 
-def test_unblocking_restores_the_active_status(
-    detail_client: TestClient, admin_token: str
-) -> None:
+def test_unblocking_restores_the_active_status(detail_client: TestClient, admin_token: str) -> None:
     detail_client.post(
         "/api/plates", headers=auth(admin_token), json={"plate": "34ABC123", "blocked": True}
     )
@@ -2121,9 +2051,7 @@ def test_an_operator_may_block_a_plate(
     assert response.json()["status"] == "blocked"
 
 
-def test_patching_an_unknown_plate_is_a_404(
-    detail_client: TestClient, admin_token: str
-) -> None:
+def test_patching_an_unknown_plate_is_a_404(detail_client: TestClient, admin_token: str) -> None:
     response = detail_client.patch(
         "/api/plates/99ZZZ99", headers=auth(admin_token), json={"blocked": True}
     )
@@ -2133,9 +2061,7 @@ def test_patching_an_unknown_plate_is_a_404(
 def test_an_empty_patch_is_rejected(detail_client: TestClient, admin_token: str) -> None:
     """A no-op write should say so rather than report success."""
     detail_client.post("/api/plates", headers=auth(admin_token), json={"plate": "34ABC123"})
-    response = detail_client.patch(
-        "/api/plates/34ABC123", headers=auth(admin_token), json={}
-    )
+    response = detail_client.patch("/api/plates/34ABC123", headers=auth(admin_token), json={})
     assert response.status_code == 400
 
 
@@ -2266,9 +2192,7 @@ def test_listing_users_requires_admin(users_client: TestClient) -> None:
     assert users_client.get("/api/users", headers=operator_auth()).status_code == 403
 
 
-def test_listing_users_never_returns_password_material(
-    users_client: TestClient
-) -> None:
+def test_listing_users_never_returns_password_material(users_client: TestClient) -> None:
     """A leaked hash is an offline cracking target; it must not leave the box."""
     response = users_client.get("/api/users", headers=admin_auth())
     assert response.status_code == 200
@@ -2288,9 +2212,7 @@ def test_listing_users_reports_the_session_length(users_client: TestClient) -> N
 def test_creating_a_user_requires_admin(users_client: TestClient) -> None:
     payload = {"username": "yeni", "password": "parola1234"}
     assert users_client.post("/api/users", json=payload).status_code == 401
-    assert (
-        users_client.post("/api/users", json=payload, headers=operator_auth()).status_code == 403
-    )
+    assert users_client.post("/api/users", json=payload, headers=operator_auth()).status_code == 403
 
 
 def test_an_admin_creates_an_operator(
@@ -2434,9 +2356,7 @@ def test_the_last_admin_cannot_be_deleted(
     assert users_repo.count_by_role("admin") == 1
 
 
-def test_the_last_admin_rule_is_checked_before_the_self_rule(
-    users_client: TestClient
-) -> None:
+def test_the_last_admin_rule_is_checked_before_the_self_rule(users_client: TestClient) -> None:
     """When both apply, the last-admin message is the one that says what to do.
 
     "Ask another admin" is unhelpful on an installation with no other admin.
@@ -2487,18 +2407,14 @@ def test_a_per_account_override_beats_the_role_policy(
 # -- bootstrap signalling ---------------------------------------------------
 
 
-def test_health_reports_setup_required_on_an_empty_installation(
-    api_app: Any
-) -> None:
+def test_health_reports_setup_required_on_an_empty_installation(api_app: Any) -> None:
     """The login screen reads this to decide whether to offer bootstrap."""
     empty = ManagedUserRepository()
     api_app.dependency_overrides[deps.get_user_repository] = lambda: empty
     assert TestClient(api_app).get("/health").json()["setup_required"] is True
 
 
-def test_health_stops_advertising_setup_once_an_account_exists(
-    users_client: TestClient
-) -> None:
+def test_health_stops_advertising_setup_once_an_account_exists(users_client: TestClient) -> None:
     assert users_client.get("/health").json()["setup_required"] is False
 
 
@@ -2515,17 +2431,13 @@ def licensing(tmp_settings: Any, users_repo: ManagedUserRepository) -> Any:
 
 
 @pytest.fixture()
-def license_client(
-    api_app: Any, users_repo: ManagedUserRepository, licensing: Any
-) -> TestClient:
+def license_client(api_app: Any, users_repo: ManagedUserRepository, licensing: Any) -> TestClient:
     api_app.dependency_overrides[deps.get_user_repository] = lambda: users_repo
     api_app.state.user_repository = users_repo
     return TestClient(api_app)
 
 
-def test_an_unlicensed_operator_is_blocked_with_403(
-    license_client: TestClient
-) -> None:
+def test_an_unlicensed_operator_is_blocked_with_403(license_client: TestClient) -> None:
     """403, with the detail carrying the reason.
 
     A lapsed licence and an ordinary role refusal are both "you may not", and
@@ -2541,9 +2453,7 @@ def test_an_unlicensed_operator_is_blocked_with_403(
 
 def test_an_admin_is_never_blocked(license_client: TestClient) -> None:
     """Exempt by construction: the account that issues keys cannot need one."""
-    response = license_client.post(
-        "/api/plates", json={"plate": "34ABC123"}, headers=admin_auth()
-    )
+    response = license_client.post("/api/plates", json={"plate": "34ABC123"}, headers=admin_auth())
     assert response.status_code == 201
 
 
@@ -2555,8 +2465,12 @@ def test_a_licensed_operator_passes(
     key = issue_key("bekci", 30, licensing)
     state = activate(key, "bekci", licensing)
     users_repo.set_license(
-        "bekci", key, state.expires_at, state.status,
-        duration_days=state.duration_days, activated_at=state.activated_at,
+        "bekci",
+        key,
+        state.expires_at,
+        state.status,
+        duration_days=state.duration_days,
+        activated_at=state.activated_at,
     )
 
     response = license_client.post(
@@ -2574,17 +2488,27 @@ def test_a_revoked_licence_blocks_immediately(
     key = issue_key("bekci", 30, licensing)
     state = activate(key, "bekci", licensing)
     users_repo.set_license(
-        "bekci", key, state.expires_at, state.status,
-        duration_days=state.duration_days, activated_at=state.activated_at,
+        "bekci",
+        key,
+        state.expires_at,
+        state.status,
+        duration_days=state.duration_days,
+        activated_at=state.activated_at,
     )
-    assert license_client.post(
-        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
-    ).status_code == 201
+    assert (
+        license_client.post(
+            "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+        ).status_code
+        == 201
+    )
 
     users_repo.set_license("bekci", key, state.expires_at, STATUS_REVOKED)
-    assert license_client.post(
-        "/api/plates", json={"plate": "06MNP99"}, headers=operator_auth()
-    ).status_code == 403
+    assert (
+        license_client.post(
+            "/api/plates", json={"plate": "06MNP99"}, headers=operator_auth()
+        ).status_code
+        == 403
+    )
 
 
 def test_reading_your_own_licence_is_never_gated(license_client: TestClient) -> None:
@@ -2601,9 +2525,7 @@ def test_an_admin_reads_an_unlimited_licence(license_client: TestClient) -> None
     assert body["unlimited"] is True
 
 
-def test_activating_a_key_is_never_gated(
-    license_client: TestClient, licensing: Any
-) -> None:
+def test_activating_a_key_is_never_gated(license_client: TestClient, licensing: Any) -> None:
     """It is the way *out* of being unlicensed, so it cannot require a licence."""
     from lpr.user_license import issue_key
 
@@ -2632,14 +2554,15 @@ def test_activating_someone_elses_key_is_refused(
     assert response.status_code == 400
 
 
-def test_activation_unblocks_the_operator(
-    license_client: TestClient, licensing: Any
-) -> None:
+def test_activation_unblocks_the_operator(license_client: TestClient, licensing: Any) -> None:
     from lpr.user_license import issue_key
 
-    assert license_client.post(
-        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
-    ).status_code == 403
+    assert (
+        license_client.post(
+            "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+        ).status_code
+        == 403
+    )
 
     license_client.post(
         "/api/license/activate",
@@ -2647,21 +2570,22 @@ def test_activation_unblocks_the_operator(
         headers=operator_auth(),
     )
 
-    assert license_client.post(
-        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
-    ).status_code == 201
+    assert (
+        license_client.post(
+            "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+        ).status_code
+        == 201
+    )
 
 
 def _expire(users_repo: ManagedUserRepository, licensing: Any, username: str = "bekci") -> None:
     """Give ``username`` a licence that ran out yesterday."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from lpr.user_license import STATUS_ACTIVE
 
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    users_repo.set_license(
-        username, "eski-anahtar", yesterday, STATUS_ACTIVE, duration_days=30
-    )
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    users_repo.set_license(username, "eski-anahtar", yesterday, STATUS_ACTIVE, duration_days=30)
 
 
 # -- the application door ----------------------------------------------------
@@ -2749,11 +2673,21 @@ def test_a_key_issued_to_somebody_else_does_not_open_the_door(
 
 @pytest.mark.parametrize(
     "path",
-    ["/api/plates", "/api/logs", "/api/logs/dates", "/api/stats", "/api/cameras",
-     "/api/parking", "/api/events/export", "/api/system/version"],
+    [
+        "/api/plates",
+        "/api/logs",
+        "/api/logs/dates",
+        "/api/stats",
+        "/api/cameras",
+        "/api/parking",
+        "/api/events/export",
+        "/api/system/version",
+    ],
 )
 def test_an_expired_operator_cannot_read_the_site_either(
-    license_client: TestClient, users_repo: ManagedUserRepository, licensing: Any,
+    license_client: TestClient,
+    users_repo: ManagedUserRepository,
+    licensing: Any,
     path: str,
 ) -> None:
     """A lapsed licence is not a read-only mode; it is the door being shut.
@@ -2802,8 +2736,12 @@ def test_a_licensed_operator_still_reads_the_site(
     key = issue_key("bekci", 30, licensing)
     state = activate(key, "bekci", licensing)
     users_repo.set_license(
-        "bekci", key, state.expires_at, state.status,
-        duration_days=state.duration_days, activated_at=state.activated_at,
+        "bekci",
+        key,
+        state.expires_at,
+        state.status,
+        duration_days=state.duration_days,
+        activated_at=state.activated_at,
     )
 
     assert license_client.get("/api/plates", headers=operator_auth()).status_code == 200
@@ -2854,9 +2792,7 @@ def test_generating_a_key_does_not_activate_the_account(
     assert row.get("license_expires_at") is None
 
 
-def test_the_generated_key_carries_the_requested_span(
-    license_client: TestClient
-) -> None:
+def test_the_generated_key_carries_the_requested_span(license_client: TestClient) -> None:
     """30 days asked for is 30 days signed into the token.
 
     The regression this guards: the dashboard used to post whatever a single
@@ -2877,9 +2813,7 @@ def test_the_generated_key_carries_the_requested_span(
 
 
 @pytest.mark.parametrize("days", [1, 30, 90, 365, 3650])
-def test_every_accepted_span_survives_the_round_trip(
-    license_client: TestClient, days: int
-) -> None:
+def test_every_accepted_span_survives_the_round_trip(license_client: TestClient, days: int) -> None:
     from lpr.user_license import inspect_key
 
     response = license_client.post(
@@ -2890,7 +2824,7 @@ def test_every_accepted_span_survives_the_round_trip(
 
 
 def test_omitting_the_span_is_refused_rather_than_defaulted_to_a_year(
-    license_client: TestClient
+    license_client: TestClient,
 ) -> None:
     """A missing `days` used to mean 365 silently.
 
@@ -2898,9 +2832,7 @@ def test_omitting_the_span_is_refused_rather_than_defaulted_to_a_year(
     caller with a typo'd field name got a one-year licence and no complaint.
     The span a licence grants is not something to guess at.
     """
-    response = license_client.post(
-        "/api/users/bekci/license", json={}, headers=admin_auth()
-    )
+    response = license_client.post("/api/users/bekci/license", json={}, headers=admin_auth())
     assert response.status_code == 422
 
 
@@ -2912,18 +2844,17 @@ def test_an_out_of_range_span_is_refused(license_client: TestClient) -> None:
         assert response.status_code == 422, f"{days} should not be issuable"
 
 
-def test_a_generated_key_still_leaves_the_operator_blocked(
-    license_client: TestClient
-) -> None:
+def test_a_generated_key_still_leaves_the_operator_blocked(license_client: TestClient) -> None:
     license_client.post("/api/users/bekci/license", json={"days": 90}, headers=admin_auth())
-    assert license_client.post(
-        "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
-    ).status_code == 403
+    assert (
+        license_client.post(
+            "/api/plates", json={"plate": "34ABC123"}, headers=operator_auth()
+        ).status_code
+        == 403
+    )
 
 
-def test_generating_a_licence_for_an_admin_is_refused(
-    license_client: TestClient
-) -> None:
+def test_generating_a_licence_for_an_admin_is_refused(license_client: TestClient) -> None:
     """A key that would never be checked is misleading to hand somebody."""
     response = license_client.post(
         "/api/users/mudur/license", json={"days": 30}, headers=admin_auth()
@@ -2994,17 +2925,16 @@ def test_a_30_day_key_yields_a_30_day_licence_end_to_end(
 
     # 3. what the dashboard renders
     listed = {
-        r["username"]: r
-        for r in license_client.get("/api/users", headers=admin_auth()).json()
+        r["username"]: r for r in license_client.get("/api/users", headers=admin_auth()).json()
     }
     assert listed["bekci"]["license_duration_days"] == 30
     assert listed["bekci"]["license_status"] == "active"
 
     # And the date the table prints is 30 days out, not 365.
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     expires = datetime.fromisoformat(listed["bekci"]["license_expires_at"])
-    remaining = (expires - datetime.now(timezone.utc)).total_seconds() / 86400.0
+    remaining = (expires - datetime.now(UTC)).total_seconds() / 86400.0
     assert 29 <= remaining <= 30, f"{remaining:.1f} days -- expected a 30-day span"
 
 
@@ -3014,7 +2944,9 @@ def test_the_user_listing_reports_live_licence_state(
     from lpr.user_license import issue_key
 
     def listing() -> dict[str, Any]:
-        return {r["username"]: r for r in license_client.get("/api/users", headers=admin_auth()).json()}
+        return {
+            r["username"]: r for r in license_client.get("/api/users", headers=admin_auth()).json()
+        }
 
     assert listing()["mudur"]["license_status"] == "unlimited"
     assert listing()["bekci"]["license_status"] == "pending_activation"
@@ -3046,9 +2978,7 @@ def test_the_auth_path_uses_the_overridden_repository(api_app: Any) -> None:
             return {"username": username, "role": "admin"}
 
     api_app.dependency_overrides[deps.get_user_repository] = lambda: Watching()
-    response = TestClient(api_app).get(
-        "/api/auth/me", headers=auth(create_token("mudur", "admin"))
-    )
+    response = TestClient(api_app).get("/api/auth/me", headers=auth(create_token("mudur", "admin")))
 
     assert response.status_code == 200
     assert seen == ["mudur"], "the override was bypassed"
@@ -3115,9 +3045,7 @@ def test_a_viewer_may_not_write(
     assert "salt okunur" in response.json()["error"]["detail"]
 
 
-def test_a_viewer_may_not_open_the_barrier(
-    api_client: TestClient, viewer_token: str
-) -> None:
+def test_a_viewer_may_not_open_the_barrier(api_client: TestClient, viewer_token: str) -> None:
     """Named on its own because it is the reason the role exists.
 
     Before it, an attendant who needed to read the pass log had to be given
@@ -3147,9 +3075,7 @@ def test_a_viewer_may_not_manage_users(
     assert getattr(api_client, method)(path, **kwargs).status_code == 403
 
 
-def test_an_operator_may_still_write(
-    api_client: TestClient, operator_token: str
-) -> None:
+def test_an_operator_may_still_write(api_client: TestClient, operator_token: str) -> None:
     """The guard is a floor, not a narrowing: nothing an operator could do
     before may have been taken away."""
     response = api_client.post("/api/relay/trigger", headers=auth(operator_token))
@@ -3170,9 +3096,7 @@ def test_a_token_with_an_unknown_role_gets_the_least_authority(
     assert api_client.post("/api/relay/trigger", headers=auth(token)).status_code == 403
 
 
-def test_whoami_reports_the_viewer_role(
-    api_client: TestClient, viewer_token: str
-) -> None:
+def test_whoami_reports_the_viewer_role(api_client: TestClient, viewer_token: str) -> None:
     response = api_client.get("/api/auth/me", headers=auth(viewer_token))
     assert response.status_code == 200
     assert response.json()["role"] == "viewer"
@@ -3200,9 +3124,7 @@ def test_repeated_bad_logins_are_eventually_refused_with_429(
     assert "Retry-After" in refused.headers
 
 
-def test_the_lockout_response_says_how_long_to_wait(
-    api_client: TestClient, api_app: Any
-) -> None:
+def test_the_lockout_response_says_how_long_to_wait(api_client: TestClient, api_app: Any) -> None:
     from lpr.api.ratelimit import LoginLimiter
 
     api_app.state.login_limiter = LoginLimiter(lockout_after=1)

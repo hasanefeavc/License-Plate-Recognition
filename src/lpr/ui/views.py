@@ -133,9 +133,7 @@ TXT_OFFLINE_BANNER = "Sunucuya bağlanılamıyor - yeniden deneniyor..."
 TXT_CLOSE = "Kapat"
 TXT_NOTE = "Not"
 TXT_LICENSE_LOCKED = "LİSANS SÜRESİ DOLDU"
-TXT_LICENSE_BANNER = (
-    "Lisans geçersiz - görüntü işleme durduruldu. Yeni bir lisans anahtarı girin."
-)
+TXT_LICENSE_BANNER = "Lisans geçersiz - görüntü işleme durduruldu. Yeni bir lisans anahtarı girin."
 TXT_LICENSE_BUTTON = "Lisans Gir"
 TXT_STAT_READ = "OKUNAN"
 TXT_STAT_GRANT = "İZİN"
@@ -516,9 +514,9 @@ class LoginView(ttk.Frame):
 
         brand = tk_frame(form, bg=COL_CARD)
         brand.grid(row=0, column=0, columnspan=2, pady=(0, 22))
-        tk_label(
-            brand, text=ICON_BRAND, bg=COL_CARD, fg=COL_ACCENT, font=ui_font(16, "bold")
-        ).pack(side="left")
+        tk_label(brand, text=ICON_BRAND, bg=COL_CARD, fg=COL_ACCENT, font=ui_font(16, "bold")).pack(
+            side="left"
+        )
         tk_label(
             brand,
             text=TXT_APP_TITLE.upper(),
@@ -684,9 +682,7 @@ class CameraPane(ttk.Frame):
         self._fps = tk_label(header, text="", bg=COL_CARD, fg=COL_MUTED, font=mono_font(9))
         self._fps.pack(side="right", padx=(0, 12))
 
-        video = tk_frame(
-            card, bg=COL_VOID, highlightthickness=1, highlightbackground=COL_BORDER
-        )
+        video = tk_frame(card, bg=COL_VOID, highlightthickness=1, highlightbackground=COL_BORDER)
         video.pack(fill="both", expand=True, padx=12)
         self._canvas = tk_label(video, bg=COL_VOID, borderwidth=0, anchor="center")
         self._canvas.pack(fill="both", expand=True)
@@ -843,9 +839,7 @@ class LivePlateFeed(ttk.Frame):
 
         body = tk_frame(card, bg=COL_CARD)
         body.pack(fill="both", expand=True)
-        self._canvas = tk_canvas(
-            body, bg=COL_CARD, highlightthickness=0, borderwidth=0, width=300
-        )
+        self._canvas = tk_canvas(body, bg=COL_CARD, highlightthickness=0, borderwidth=0, width=300)
         scroll = ttk.Scrollbar(body, orient="vertical", command=self._canvas.yview)
         self._canvas.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y", pady=6)
@@ -1101,9 +1095,7 @@ class MainView(ttk.Frame):
         self._build_header()
 
         # -- offline / licence banner ----------------------------------
-        self._banner = ttk.Label(
-            self, text=TXT_OFFLINE_BANNER, anchor="center", padding=8
-        )
+        self._banner = ttk.Label(self, text=TXT_OFFLINE_BANNER, anchor="center", padding=8)
         apply_style(self._banner, "Banner.TLabel")
         # Gridded and removed dynamically by set_banner().
 
@@ -1115,9 +1107,7 @@ class MainView(ttk.Frame):
 
     def _build_header(self) -> None:
         """Brand on the left, uptime centred, operator and link state right."""
-        header = tk_frame(
-            self, bg=COL_HEADER, highlightthickness=1, highlightbackground=COL_BORDER
-        )
+        header = tk_frame(self, bg=COL_HEADER, highlightthickness=1, highlightbackground=COL_BORDER)
         header.grid(row=0, column=0, sticky="ew")
         for column in (0, 1, 2):
             header.columnconfigure(column, weight=1, uniform="header")
@@ -1161,9 +1151,7 @@ class MainView(ttk.Frame):
             right, text="●", bg=COL_HEADER, fg=COL_BAD, font=ui_font(10)
         )
         self._connection_dot.pack(side="right", padx=(0, 6))
-        self._user = tk_label(
-            right, text="", bg=COL_HEADER, fg=COL_TEXT, font=ui_font(10, "bold")
-        )
+        self._user = tk_label(right, text="", bg=COL_HEADER, fg=COL_TEXT, font=ui_font(10, "bold"))
         self._user.pack(side="right", padx=(0, 18))
 
     def _build_body(self) -> None:
@@ -1212,16 +1200,12 @@ class MainView(ttk.Frame):
         self._stat_grants = self._stat_tile(strip, TXT_STAT_GRANT, COL_OK)
         self._stat_plates = self._stat_tile(strip, TXT_STAT_READ, COL_ACCENT)
 
-        self._license = tk_label(
-            strip, text="", bg=COL_BG, fg=COL_MUTED, font=mono_font(9)
-        )
+        self._license = tk_label(strip, text="", bg=COL_BG, fg=COL_MUTED, font=mono_font(9))
         self._license.pack(side="right", padx=(0, 18))
 
     @staticmethod
     def _stat_tile(master: tk.Misc, caption: str, color: str) -> tk.Label:
-        box = tk_frame(
-            master, bg=COL_HEADER, highlightthickness=1, highlightbackground=COL_BORDER
-        )
+        box = tk_frame(master, bg=COL_HEADER, highlightthickness=1, highlightbackground=COL_BORDER)
         box.pack(side="right", padx=(8, 0))
         value = tk_label(box, text="0", bg=COL_HEADER, fg=color, font=mono_font(12, "bold"))
         value.pack(padx=14, pady=(4, 0))
@@ -1230,9 +1214,7 @@ class MainView(ttk.Frame):
 
     def _build_controls(self) -> None:
         """Bottom control panel. Size and colour carry the hierarchy."""
-        footer = tk_frame(
-            self, bg=COL_HEADER, highlightthickness=1, highlightbackground=COL_BORDER
-        )
+        footer = tk_frame(self, bg=COL_HEADER, highlightthickness=1, highlightbackground=COL_BORDER)
         footer.grid(row=4, column=0, sticky="ew")
         row = tk_frame(footer, bg=COL_HEADER)
         row.pack(fill="x", padx=12, pady=10)
@@ -1325,9 +1307,7 @@ class MainView(ttk.Frame):
 
     def _set_connection(self, online: bool) -> None:
         color = COL_OK if online else COL_BAD
-        self._connection.configure(
-            text=TXT_CONNECTED if online else TXT_DISCONNECTED, fg=color
-        )
+        self._connection.configure(text=TXT_CONNECTED if online else TXT_DISCONNECTED, fg=color)
         self._connection_dot.configure(fg=color)
 
     def set_banner(self, visible: bool, message: str = TXT_OFFLINE_BANNER) -> None:
@@ -1506,9 +1486,7 @@ class PlatesWindow(tk.Toplevel):
             show="headings",
             selectmode="browse",
         )
-        tree_style = derive_style(
-            self.tree, "Plates", font=mono_font(12), rowheight=34
-        )
+        tree_style = derive_style(self.tree, "Plates", font=mono_font(12), rowheight=34)
         ttk.Style(self).configure(f"{tree_style}.Heading", font=ui_font(9, "bold"))
         self.tree.heading("index", text="#")
         self.tree.heading("plate", text=TXT_PLATE_FIELD)

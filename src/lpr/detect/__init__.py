@@ -74,7 +74,7 @@ __all__ = [
 ]
 
 
-def build_detector(settings: "Settings | None" = None) -> Detector:
+def build_detector(settings: Settings | None = None) -> Detector:
     """Construct the configured detector.
 
     Returns :class:`~lpr.detect.yolo.YoloPlateDetector`. It falls back to the
@@ -98,8 +98,7 @@ def build_detector(settings: "Settings | None" = None) -> Detector:
         return YoloPlateDetector(settings)
     except UnusablePlateWeights as exc:
         logger.warning(
-            "=" * 72
-            + "\nDetection weights are not a plate model -- falling back to the legacy "
+            "=" * 72 + "\nDetection weights are not a plate model -- falling back to the legacy "
             "contour\ndetector.\n%s\nThe contour detector is MATERIALLY LESS ACCURATE: it "
             "needs a clean, well-lit,\nnear-frontal plate border and will miss angled, "
             "blurred, night and\npartially-occluded plates entirely. Do not run a real "
@@ -112,19 +111,19 @@ def build_detector(settings: "Settings | None" = None) -> Detector:
         if "weights not found" not in message.lower():
             raise
         logger.warning(
-            "=" * 72
-            + "\nNo detection weights found -- falling back to the legacy contour "
+            "=" * 72 + "\nNo detection weights found -- falling back to the legacy contour "
             "detector.\n%s\nThe contour detector is MATERIALLY LESS ACCURATE: it needs a "
             "clean,\nwell-lit, near-frontal plate border and will miss angled, blurred, "
             "night\nand partially-occluded plates entirely. Do not run a real gate on it.\n"
-            + "=" * 72,
+            + "="
+            * 72,
             message,
         )
         return ContourPlateDetector(settings)
 
 
 def build_frame_preprocessor(
-    settings: "Settings | None" = None,
+    settings: Settings | None = None,
 ) -> Callable[[np.ndarray], np.ndarray] | None:
     """A whole-frame enhancement callable, or ``None`` when it is switched off.
 

@@ -41,7 +41,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from lpr.contracts import (
@@ -497,9 +497,7 @@ class PipelineOrchestrator:
             logger.warning("Cannot encode frames: opencv is not installed")
             return None
         try:
-            ok, buffer = cv2.imencode(
-                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
-            )
+            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
         except Exception as exc:
             logger.warning("JPEG encoding failed for camera %s: %s", camera, exc)
             return None
@@ -687,8 +685,7 @@ class PipelineOrchestrator:
 
         if not selected:
             logger.warning(
-                "No usable camera sources configured; the pipeline will run "
-                "without capture"
+                "No usable camera sources configured; the pipeline will run without capture"
             )
         return selected
 
@@ -794,9 +791,7 @@ class PipelineOrchestrator:
             if self._track_voter is not None and not self._track_voter.should_recognize(
                 camera, track_id
             ):
-                logger.debug(
-                    "Camera %s: track %s already settled, skipping OCR", camera, track_id
-                )
+                logger.debug("Camera %s: track %s already settled, skipping OCR", camera, track_id)
                 with self._stats_lock:
                     self._stats.ocr_skipped += 1
                 continue
@@ -856,9 +851,7 @@ class PipelineOrchestrator:
             # confident read, open on frame 1" hold for every recogniser
             # rather than only for the one that was handed a predicate.
             fast_plate = (
-                probe.plate
-                if probe is not None and probe.fired
-                else self._probe_fast_path(read)
+                probe.plate if probe is not None and probe.fired else self._probe_fast_path(read)
             )
 
             confirmed: str | None
@@ -909,9 +902,7 @@ class PipelineOrchestrator:
         """
         if not self._fast_path_enabled:
             return ""
-        probe = _FastPathProbe(
-            self._fast_path_min_confidence, self._plates.authorization
-        )
+        probe = _FastPathProbe(self._fast_path_min_confidence, self._plates.authorization)
         return probe.plate if probe(read) else ""
 
     def _capture_snapshot(self, camera: str, event: LprEvent, frame: Frame) -> None:
@@ -935,9 +926,7 @@ class PipelineOrchestrator:
         if reason is not None:
             on_saved = lambda path: self._send_notification(event, reason, path)  # noqa: E731
 
-        queued = self._snapshots.submit(
-            event.plate, frame, camera=camera, on_saved=on_saved
-        )
+        queued = self._snapshots.submit(event.plate, frame, camera=camera, on_saved=on_saved)
         if reason is not None and not queued:
             # Snapshots are off, or the disk is behind. The alert still goes
             # out; it just goes out without a photograph, which is far better
@@ -957,9 +946,7 @@ class PipelineOrchestrator:
         if self._notifier is None or event.action != str(Action.DENIED):
             return None
         try:
-            reason = _NOTIFY_REASON.get(
-                self._plates.authorization(event.plate), "unauthorized"
-            )
+            reason = _NOTIFY_REASON.get(self._plates.authorization(event.plate), "unauthorized")
             return reason if self._notifier.wants(reason) else None
         except Exception:
             logger.debug("Bildirim gerekçesi belirlenemedi", exc_info=True)
@@ -1018,9 +1005,7 @@ class PipelineOrchestrator:
             return self._tracking_detector.detect_tracked(frame, camera)
         return self._detector.detect(frame)
 
-    def _submit(
-        self, camera: str, read: PlateRead, track_id: int | None
-    ) -> str | None:
+    def _submit(self, camera: str, read: PlateRead, track_id: int | None) -> str | None:
         """Submit a read to the voter, with its track id when it understands one."""
         if self._track_voter is not None:
             return self._track_voter.submit(camera, read, track_id)
@@ -1093,9 +1078,7 @@ class PipelineOrchestrator:
         # later edit could thread a `trigger()` back into.
         with self._stats_lock:
             self._stats.denials += 1
-        logger.info(
-            "Camera %s: %s %s", camera, plate, _DENIAL_LOG.get(verdict, "denied")
-        )
+        logger.info("Camera %s: %s %s", camera, plate, _DENIAL_LOG.get(verdict, "denied"))
         return self._record(camera, plate, Action.DENIED, confidence)
 
     def _passback_refuses(self, camera: str, plate: str) -> bool:
@@ -1131,9 +1114,7 @@ class PipelineOrchestrator:
             return False
 
         window = max(1.0, float(getattr(config, "window_s", 0.0)))
-        since = (
-            datetime.now(timezone.utc) - timedelta(seconds=window)
-        ).isoformat(timespec="seconds")
+        since = (datetime.now(UTC) - timedelta(seconds=window)).isoformat(timespec="seconds")
 
         try:
             last = self._logs.last_granted_camera(plate, since)
@@ -1152,9 +1133,7 @@ class PipelineOrchestrator:
         )
         return True
 
-    def _record(
-        self, camera: str, plate: str, action: Action, confidence: float
-    ) -> LprEvent:
+    def _record(self, camera: str, plate: str, action: Action, confidence: float) -> LprEvent:
         """Persist one decision and fan it out to subscribers."""
         event = LprEvent(
             ts=utc_now_iso(),

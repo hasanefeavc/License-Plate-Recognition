@@ -97,7 +97,7 @@ class Notification:
 class EmailNotifier:
     """Sends alerts on a worker thread. ``notify`` never blocks or raises."""
 
-    def __init__(self, config: "SmtpConfig", sender: Any = None) -> None:
+    def __init__(self, config: SmtpConfig, sender: Any = None) -> None:
         self._config = config
         # Injectable purely so the tests can drive every branch without an
         # SMTP server; production passes nothing and gets smtplib.
@@ -212,9 +212,7 @@ class EmailNotifier:
         """Account for an alert nothing will ever send. Warns once per process."""
         self.suppressed += 1
         if self._warned_unconfigured:
-            logger.debug(
-                "Bildirim gönderilemedi (%s), yapılandırma eksik", notification.plate
-            )
+            logger.debug("Bildirim gönderilemedi (%s), yapılandırma eksik", notification.plate)
             return
         self._warned_unconfigured = True
         logger.warning(
@@ -346,7 +344,7 @@ class EmailNotifier:
         )
 
 
-def build_notifier(settings: "Settings | None" = None, sender: Any = None) -> EmailNotifier:
+def build_notifier(settings: Settings | None = None, sender: Any = None) -> EmailNotifier:
     """Construct the notifier from settings. Never raises."""
     if settings is None:
         from lpr.config import get_settings

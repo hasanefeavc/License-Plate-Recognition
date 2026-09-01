@@ -56,9 +56,7 @@ BASELINE_NAME = "yolov8n.pt"
 PLATE_MODEL_NAME = "plate_yolov8n.pt"
 
 #: Same release Ultralytics itself pulls weights from when auto-downloading.
-DOWNLOAD_URL = (
-    f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{BASELINE_NAME}"
-)
+DOWNLOAD_URL = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{BASELINE_NAME}"
 
 #: SHA-256 of the official v8.3.0 ``yolov8n.pt``. A ``.pt`` is a pickle:
 #: ``torch.load`` executes what is inside it, so an unverified download from a
@@ -182,9 +180,7 @@ class ModelAssets:
     def ready(self) -> bool:
         """True when detection and OCR can both run as configured."""
         return (
-            self.detection_present
-            and not self.detection_is_stock_baseline
-            and not self.ocr_missing
+            self.detection_present and not self.detection_is_stock_baseline and not self.ocr_missing
         )
 
     @property
@@ -213,7 +209,7 @@ class ModelAssets:
         }
 
 
-def resolve_detection_weights(settings: "Settings") -> Path:
+def resolve_detection_weights(settings: Settings) -> Path:
     """Absolute path to the configured detection weights.
 
     Mirrors :meth:`lpr.detect.yolo.YoloPlateDetector._resolve_weights` exactly
@@ -232,7 +228,7 @@ def resolve_detection_weights(settings: "Settings") -> Path:
     return (models_dir / raw).resolve()
 
 
-def describe_assets(settings: "Settings | None" = None) -> ModelAssets:
+def describe_assets(settings: Settings | None = None) -> ModelAssets:
     """Inspect the filesystem and report what is present. Never raises."""
     if settings is None:
         from lpr.config import get_settings
@@ -250,9 +246,7 @@ def describe_assets(settings: "Settings | None" = None) -> ModelAssets:
     ocr_dir = settings.paths.ocr_models_dir
     ocr_missing: tuple[str, ...] = ()
     if backend == "easyocr":
-        ocr_missing = tuple(
-            name for name in EASYOCR_WEIGHTS if not (ocr_dir / name).is_file()
-        )
+        ocr_missing = tuple(name for name in EASYOCR_WEIGHTS if not (ocr_dir / name).is_file())
 
     missing: list[str] = []
     notes: list[str] = []
@@ -299,7 +293,7 @@ def describe_assets(settings: "Settings | None" = None) -> ModelAssets:
 
 
 def ensure_detection_weights(
-    settings: "Settings | None" = None,
+    settings: Settings | None = None,
     *,
     allow_download: bool = True,
     timeout: float = 30.0,
@@ -356,7 +350,7 @@ def ensure_detection_weights(
     return describe_assets(settings)
 
 
-def ensure_runtime_dirs(settings: "Settings | None" = None) -> list[Path]:
+def ensure_runtime_dirs(settings: Settings | None = None) -> list[Path]:
     """Create every directory the service writes into. Returns them.
 
     Each ``settings.paths`` attribute mkdirs on access, so this is really a

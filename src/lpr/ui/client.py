@@ -285,9 +285,7 @@ class LprClient:
         )
         return self._store_token(data)
 
-    def register(
-        self, username: str, password: str, role: str = "operator"
-    ) -> dict[str, Any]:
+    def register(self, username: str, password: str, role: str = "operator") -> dict[str, Any]:
         """Create an account. Works without a token only for the first user."""
         data = self._request(
             "POST",
@@ -376,9 +374,7 @@ class LprClient:
         return data if isinstance(data, dict) else {}
 
     def remove_plate(self, plate: str) -> bool:
-        self._request(
-            "DELETE", f"/api/plates/{quote(plate, safe='')}", expected=(200, 204)
-        )
+        self._request("DELETE", f"/api/plates/{quote(plate, safe='')}", expected=(200, 204))
         return True
 
     # -- logs -----------------------------------------------------------
@@ -510,7 +506,7 @@ class LprClient:
 
     # -- events ---------------------------------------------------------
 
-    def event_stream(self, **kwargs: Any) -> "EventStream":
+    def event_stream(self, **kwargs: Any) -> EventStream:
         """Build an :class:`EventStream` bound to this client's token."""
         return EventStream(self.base_url, lambda: self._token, **kwargs)
 
@@ -600,9 +596,7 @@ class EventStream:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop, name="lpr-event-stream", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run_loop, name="lpr-event-stream", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 2.0) -> None:

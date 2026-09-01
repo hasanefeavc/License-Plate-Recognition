@@ -25,7 +25,7 @@ from lpr.pipeline.orchestrator import PipelineOrchestrator  # noqa: E402
 from .conftest import FakeDetector, FakeRecognizer, FakeRelay, FakeVoter  # noqa: E402
 
 
-def make_plate_scene(height: int = 60, width: int = 240) -> "np.ndarray":
+def make_plate_scene(height: int = 60, width: int = 240) -> np.ndarray:
     """A bordered plate on a dark bumper: an outline rectification can find."""
     import cv2
 
@@ -55,7 +55,7 @@ class ScriptedRecognizer(_BaseRecognizer):
         self._reads = list(reads)
         self.variants_seen: list[tuple[int, ...]] = []
 
-    def _read_fragments(self, image: "np.ndarray") -> list[tuple[str, float]]:
+    def _read_fragments(self, image: np.ndarray) -> list[tuple[str, float]]:
         self.variants_seen.append(tuple(image.shape))
         if not self._reads:
             return []
@@ -247,7 +247,7 @@ def test_recognize_rejects_junk_without_touching_the_backend() -> None:
     assert recognizer.variants_seen == []
 
 
-def _skew(scene: "np.ndarray", pinch: int = 10) -> "np.ndarray":
+def _skew(scene: np.ndarray, pinch: int = 10) -> np.ndarray:
     import cv2
 
     height, width = scene.shape[:2]
@@ -332,6 +332,7 @@ def test_the_original_frame_is_what_gets_published_and_photographed(
         tmp_settings,
         frame_preprocessor=lambda _frame: np.full((80, 160, 3), 7, dtype=np.uint8),
     )
+
     # Signature mirrors SnapshotWriter.submit, including the on_saved hook the
     # notifier uses, so this stub keeps failing loudly if that contract moves.
     def fake_submit(plate, frame, *, camera=None, when=None, on_saved=None):

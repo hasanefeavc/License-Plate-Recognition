@@ -80,9 +80,22 @@ _BAND_RE: re.Pattern[str] = re.compile(r"\bTR\b")
 
 #: Turkish diacritics folded to their ASCII base before anything else runs.
 _FOLD: dict[str, str] = {
-    "Ç": "C", "Ğ": "G", "İ": "I", "I": "I", "Ö": "O", "Ş": "S", "Ü": "U",
-    "ç": "C", "ğ": "G", "ı": "I", "ö": "O", "ş": "S", "ü": "U",
-    "Â": "A", "Î": "I", "Û": "U",
+    "Ç": "C",
+    "Ğ": "G",
+    "İ": "I",
+    "I": "I",
+    "Ö": "O",
+    "Ş": "S",
+    "Ü": "U",
+    "ç": "C",
+    "ğ": "G",
+    "ı": "I",
+    "ö": "O",
+    "ş": "S",
+    "ü": "U",
+    "Â": "A",
+    "Î": "I",
+    "Û": "U",
 }
 
 # Total length bounds of a plausible plate string: 2 + 1 + 2 = 5 .. 2 + 3 + 4 = 9

@@ -146,9 +146,7 @@ def test_the_stats_503_names_what_is_missing(degraded_client: TestClient) -> Non
 def test_the_503_still_carries_the_original_message(degraded_client: TestClient) -> None:
     """Clients switch on the Turkish phrase; it stays at the front."""
     response = degraded_client.get("/api/stats", headers=auth(create_token("a", "admin")))
-    assert response.json()["error"]["detail"].startswith(
-        "Görüntü işleme hattı kullanılamıyor"
-    )
+    assert response.json()["error"]["detail"].startswith("Görüntü işleme hattı kullanılamıyor")
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +157,7 @@ def test_the_503_still_carries_the_original_message(degraded_client: TestClient)
 def test_the_assets_endpoint_reports_the_missing_model(
     degraded_client: TestClient, tmp_settings: Any
 ) -> None:
-    response = degraded_client.get(
-        "/api/system/assets", headers=auth(create_token("a", "admin"))
-    )
+    response = degraded_client.get("/api/system/assets", headers=auth(create_token("a", "admin")))
     assert response.status_code == 200
     body = response.json()
     assert body["ready"] is False
@@ -188,9 +184,7 @@ def test_the_assets_endpoint_lists_refused_camera_roles(
     app.state.pipeline = None
     client = TestClient(app)
 
-    body = client.get(
-        "/api/system/assets", headers=auth(create_token("a", "admin"))
-    ).json()
+    body = client.get("/api/system/assets", headers=auth(create_token("a", "admin"))).json()
     assert [issue["role"] for issue in body["cameras"]] == ["exit"]
     assert body["cameras"][0]["reason"] == "duplicate"
 
@@ -209,7 +203,5 @@ def test_the_assets_endpoint_answers_without_the_ml_stack(
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", refuse_ml)
-    response = degraded_client.get(
-        "/api/system/assets", headers=auth(create_token("a", "admin"))
-    )
+    response = degraded_client.get("/api/system/assets", headers=auth(create_token("a", "admin")))
     assert response.status_code == 200

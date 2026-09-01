@@ -150,9 +150,7 @@ def _build_ts(day: str, raw_timestamp: str | None) -> str:
     return f"{day}T{clock}+00:00"
 
 
-def parse_legacy_message(
-    message: str, last_plate: dict[str, str]
-) -> tuple[str, str, str] | None:
+def parse_legacy_message(message: str, last_plate: dict[str, str]) -> tuple[str, str, str] | None:
     """Turn one legacy log sentence into ``(camera, plate, action)``.
 
     ``last_plate`` maps camera role -> the most recently seen plate for that
@@ -209,9 +207,7 @@ def _import_plates(
         return
 
     has_added_at = "added_at" in columns
-    select = (
-        "SELECT plate, added_at FROM plates" if has_added_at else "SELECT plate FROM plates"
-    )
+    select = "SELECT plate, added_at FROM plates" if has_added_at else "SELECT plate FROM plates"
     for row in legacy.execute(select).fetchall():
         plate = normalise_plate(str(row[0] or ""))
         if not plate:

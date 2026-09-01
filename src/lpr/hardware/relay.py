@@ -113,9 +113,7 @@ class SerialRelay:
         self.pulses_sent = 0
         self.pulses_dropped = 0
 
-        self._thread = threading.Thread(
-            target=self._run, name=f"relay-{port}", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name=f"relay-{port}", daemon=True)
         self._thread.start()
         logger.info("SerialRelay worker started for %s @ %d baud", port, self._baud)
 
@@ -149,8 +147,9 @@ class SerialRelay:
         if self._thread.is_alive():  # pragma: no cover - worker wedged in serial I/O
             logger.warning("Relay worker did not stop within the timeout")
         self._close_serial()
-        logger.info("SerialRelay closed (%d pulses sent, %d dropped)",
-                    self.pulses_sent, self.pulses_dropped)
+        logger.info(
+            "SerialRelay closed (%d pulses sent, %d dropped)", self.pulses_sent, self.pulses_dropped
+        )
 
     @property
     def available(self) -> bool:

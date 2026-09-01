@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import (
@@ -43,6 +43,7 @@ from lpr.api.schemas import (
     CameraStatusOut,
     HealthOut,
     LicenseIn,
+    LicenseKeyIn,
     LicenseOut,
     LoginIn,
     LogOut,
@@ -52,10 +53,10 @@ from lpr.api.schemas import (
     ParkingIn,
     ParkingOut,
     PipelineStateOut,
-    PlateIn,
-    PlateListOut,
     PlateDetailOut,
     PlateImportOut,
+    PlateIn,
+    PlateListOut,
     PlateOut,
     PlateUpdateIn,
     RegisterIn,
@@ -65,7 +66,6 @@ from lpr.api.schemas import (
     SystemUpdateIn,
     SystemUpdateOut,
     TokenOut,
-    LicenseKeyIn,
     UserCreateIn,
     UserLicenseIn,
     UserLicenseOut,
@@ -84,8 +84,8 @@ from lpr.api.security import (
     license_forbidden,
     license_refusal,
     require_admin,
-    require_licensed_operator,
     require_license,
+    require_licensed_operator,
     token_ttl_seconds,
     user_from_token,
 )
@@ -925,7 +925,7 @@ def _day_start_iso() -> str:
     contract, and a counter that silently drifts for weeks is worse than one
     that is honest about its window.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
@@ -1462,9 +1462,7 @@ async def system_assets(request: Request, _: LicensedUser) -> ModelAssetsOut:
     settings = deps.get_settings_dep()
     return ModelAssetsOut(
         **assets.to_dict(),
-        cameras=[
-            CameraIssueOut(**issue.model_dump()) for issue in settings.cameras.issues
-        ],
+        cameras=[CameraIssueOut(**issue.model_dump()) for issue in settings.cameras.issues],
     )
 
 
@@ -1590,7 +1588,7 @@ def _csv_response(payload: bytes, filename: str) -> Response:
 
 
 def _export_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    return datetime.now(UTC).strftime("%Y%m%d-%H%M")
 
 
 @router.post(
@@ -1764,9 +1762,7 @@ async def activate_user_license(
     binding an operator could activate a colleague's key and inherit its
     validity.
     """
-    return _user_license_out(
-        await _activate_license_key(user_repo, user.username, payload.key)
-    )
+    return _user_license_out(await _activate_license_key(user_repo, user.username, payload.key))
 
 
 async def _activate_license_key(user_repo: Any, username: str, key: str) -> Any:

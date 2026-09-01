@@ -302,7 +302,7 @@ class CamerasConfig(BaseModel):
     ROLES: ClassVar[tuple[str, ...]] = ("entry", "exit")
 
     @model_validator(mode="after")
-    def _validate_sources(self) -> "CamerasConfig":
+    def _validate_sources(self) -> CamerasConfig:
         """Disable any role that cannot work, and record why.
 
         Two failures are caught here rather than at open time, because at open
@@ -345,7 +345,7 @@ class CamerasConfig(BaseModel):
                     "invalid",
                     f"Camera {role} source {camera.source!r} is not a camera index, "
                     "device, URL or existing file; the role has been disabled. "
-                    "Use a number (\"0\"), an RTSP/HTTP URL, or leave it blank.",
+                    'Use a number ("0"), an RTSP/HTTP URL, or leave it blank.',
                 )
                 continue
 
@@ -1240,7 +1240,7 @@ class Settings(BaseSettings):
         )
 
     @model_validator(mode="after")
-    def _merge_legacy_fast_path(self) -> "Settings":
+    def _merge_legacy_fast_path(self) -> Settings:
         """Fold a legacy ``fast_path:`` section onto ``voting``.
 
         The fast path used to be its own top-level section. It reads better
@@ -1264,7 +1264,7 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _check_secret_key_in_production(self) -> "Settings":
+    def _check_secret_key_in_production(self) -> Settings:
         is_production = os.environ.get("LPR_ENV", "").strip().lower() == "production"
         if self.app.headless and is_production and self.api.secret_key == "change-me":
             raise ValueError(
@@ -1275,7 +1275,7 @@ class Settings(BaseSettings):
         return self
 
     @property
-    def paths(self) -> "ResolvedPaths":
+    def paths(self) -> ResolvedPaths:
         """Absolute, existing paths derived from ``app.*`` and ``database.path``.
 
         Directories are created (mkdir -p) the first time each attribute is

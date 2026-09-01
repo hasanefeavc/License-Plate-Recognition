@@ -278,9 +278,7 @@ class PlateListOut(BaseModel):
     """Response of ``GET /api/plates``."""
 
     model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [{"plates": ["06XYZ42", "34ABC123"], "count": 2}]
-        }
+        json_schema_extra={"examples": [{"plates": ["06XYZ42", "34ABC123"], "count": 2}]}
     )
 
     plates: list[str] = Field(default_factory=list, examples=[["06XYZ42", "34ABC123"]])
@@ -329,7 +327,7 @@ class LogOut(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, examples=[0.9712])
 
     @classmethod
-    def from_event(cls, event: Any) -> "LogOut":
+    def from_event(cls, event: Any) -> LogOut:
         """Build from anything exposing ``to_dict()`` (i.e. ``LprEvent``)."""
         return cls.model_validate(event.to_dict())
 
@@ -509,9 +507,7 @@ class MetricsOut(BaseModel):
     license_valid: bool = Field(default=False, examples=[True])
     license_reason: str = Field(default="missing", examples=["ok"])
     license_client: str | None = Field(default=None, examples=["Site A"])
-    license_expires_at: str | None = Field(
-        default=None, examples=["2026-09-24T16:42:47+00:00"]
-    )
+    license_expires_at: str | None = Field(default=None, examples=["2026-09-24T16:42:47+00:00"])
     license_days_remaining: float | None = Field(default=None, examples=[29.7])
 
 
@@ -694,9 +690,7 @@ class ModelAssetsOut(BaseModel):
 class PipelineStateOut(BaseModel):
     """Response of the pause/resume endpoints."""
 
-    model_config = ConfigDict(
-        json_schema_extra={"examples": [{"paused": True, "running": True}]}
-    )
+    model_config = ConfigDict(json_schema_extra={"examples": [{"paused": True, "running": True}]})
 
     paused: bool = Field(examples=[True])
     running: bool = Field(default=False, examples=[True])
@@ -710,9 +704,7 @@ class CameraSourceIn(BaseModel):
         json_schema_extra={"examples": [{"source": "rtsp://10.0.0.5/stream"}]},
     )
 
-    source: str = Field(
-        min_length=1, max_length=512, examples=["rtsp://10.0.0.5/stream", "0"]
-    )
+    source: str = Field(min_length=1, max_length=512, examples=["rtsp://10.0.0.5/stream", "0"])
 
     @field_validator("source", mode="before")
     @classmethod
@@ -817,9 +809,7 @@ class RegisterIn(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
-            "examples": [
-                {"username": "operator1", "password": "s3cret!", "role": "operator"}
-            ]
+            "examples": [{"username": "operator1", "password": "s3cret!", "role": "operator"}]
         },
     )
 
@@ -868,9 +858,7 @@ class UserOut(BaseModel):
 
     model_config = ConfigDict(
         json_schema_extra={
-            "examples": [
-                {"username": "admin", "role": "admin", "created_at": "2026-05-01"}
-            ]
+            "examples": [{"username": "admin", "role": "admin", "created_at": "2026-05-01"}]
         }
     )
 
@@ -1112,9 +1100,7 @@ class UserCreateIn(BaseModel):
 class UserLicenseIn(BaseModel):
     """Body of ``POST /api/users/{username}/license`` -- generate a key."""
 
-    model_config = ConfigDict(
-        extra="forbid", json_schema_extra={"examples": [{"days": 90}]}
-    )
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"days": 90}]})
 
     #: Validity in days. **Required**, deliberately: this used to default to
     #: 365, so a caller that omitted the field -- or sent a typo'd one, since
@@ -1164,9 +1150,9 @@ class UserLicenseOut(BaseModel):
         }
     )
 
-    status: Literal[
-        "active", "expired", "pending_activation", "revoked", "unlimited"
-    ] = "pending_activation"
+    status: Literal["active", "expired", "pending_activation", "revoked", "unlimited"] = (
+        "pending_activation"
+    )
     username: str | None = None
     #: Set at activation, not at generation. ``None`` until the operator enters
     #: their key -- which is what ``pending_activation`` means.

@@ -252,7 +252,7 @@ def _run_command(
     command: Sequence[str],
     cwd: Path,
     timeout: float,
-    env: "Mapping[str, str] | None" = None,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     """Run one command with no shell, capturing both streams.
 
@@ -309,7 +309,7 @@ class SystemUpdater:
 
     def __init__(
         self,
-        settings: "Settings | None" = None,
+        settings: Settings | None = None,
         runner: RunnerFn | None = None,
     ) -> None:
         if settings is None:
@@ -348,7 +348,7 @@ class SystemUpdater:
         except OSError:  # pragma: no cover - unresolvable path
             return self._repo_dir
 
-    def _resolve_state_path(self, cfg: Any, settings: "Settings") -> Path | None:
+    def _resolve_state_path(self, cfg: Any, settings: Settings) -> Path | None:
         """Where the outcome is persisted across the restart, or None."""
         configured = str(getattr(cfg, "state_file", "") or "").strip()
         try:
@@ -613,9 +613,7 @@ class SystemUpdater:
                 state="running",
                 step=STEP_REVISION,
                 detail=(
-                    "Zorla yeniden derleme başlatıldı."
-                    if forced
-                    else "Güncelleme başlatıldı."
+                    "Zorla yeniden derleme başlatıldı." if forced else "Güncelleme başlatıldı."
                 ),
                 started_at=time.time(),
                 forced=forced,

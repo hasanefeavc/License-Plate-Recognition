@@ -99,9 +99,7 @@ def _install_exception_handlers(app: FastAPI) -> None:
         return _error_response(exc.status_code, exc.detail, headers)
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(
-        request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         # Pydantic's error list is safe to echo (field names + messages) but is
         # normalised to strings so no exception objects reach the wire.
         problems = [
@@ -276,7 +274,7 @@ async def _license_watchdog(app: FastAPI, interval: float) -> None:
             logger.exception("Lisans denetimi başarısız")
 
 
-def _start_nightly_update(app: FastAPI, settings: Settings) -> "asyncio.Task[None] | None":
+def _start_nightly_update(app: FastAPI, settings: Settings) -> asyncio.Task[None] | None:
     """Start the nightly OTA check, or return None when it is switched off.
 
     Returning ``None`` rather than starting a task that immediately does
@@ -314,9 +312,7 @@ def _start_nightly_update(app: FastAPI, settings: Settings) -> "asyncio.Task[Non
         minute,
         job.auto_update,
     )
-    return asyncio.create_task(
-        nightly_update_loop(job, hour, minute), name="nightly-update"
-    )
+    return asyncio.create_task(nightly_update_loop(job, hour, minute), name="nightly-update")
 
 
 def _docs_urls() -> dict[str, str | None]:
@@ -411,8 +407,7 @@ def _verify_update_health(app: FastAPI, phase: str) -> None:
             outcome = updater.verify_after_restart()
             if outcome == "rolled-back":
                 logger.error(
-                    "Son güncelleme geri alındı. Depo önceki sürümde; yeniden "
-                    "derleme gerekiyor."
+                    "Son güncelleme geri alındı. Depo önceki sürümde; yeniden derleme gerekiyor."
                 )
             elif outcome == "rollback-failed":
                 logger.error("Geri alma başarısız. Elle müdahale gerekiyor.")
@@ -422,7 +417,7 @@ def _verify_update_health(app: FastAPI, phase: str) -> None:
         logger.exception("Güncelleme sağlık kapısı çalıştırılamadı (%s)", phase)
 
 
-def _start_nightly_backup(settings: Settings) -> "asyncio.Task[None] | None":
+def _start_nightly_backup(settings: Settings) -> asyncio.Task[None] | None:
     """Schedule the daily database backup.
 
     Unconditional, unlike the update job. A site that never takes an update
@@ -448,9 +443,7 @@ def _start_nightly_backup(settings: Settings) -> "asyncio.Task[None] | None":
         return None
 
     logger.info("Gecelik veritabanı yedeği %02d:%02d için planlandı", hour, minute)
-    return asyncio.create_task(
-        nightly_backup_loop(job, hour, minute), name="nightly-backup"
-    )
+    return asyncio.create_task(nightly_backup_loop(job, hour, minute), name="nightly-backup")
 
 
 @asynccontextmanager
@@ -525,8 +518,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="LPR API",
         description=(
-            "Plaka tanıma servisi: canlı görüntü, olay akışı, plaka yönetimi "
-            "ve bariyer kontrolü."
+            "Plaka tanıma servisi: canlı görüntü, olay akışı, plaka yönetimi ve bariyer kontrolü."
         ),
         version=app_version(),
         lifespan=lifespan,

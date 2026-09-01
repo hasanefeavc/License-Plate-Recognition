@@ -239,7 +239,7 @@ def test_the_hint_does_not_change_a_read_without_a_lowercase_b() -> None:
 
 
 def test_coercion_prefers_the_cheapest_segmentation() -> None:
-    """"34A8C123" is one repair away from 2+3+3 but two away from 2+2+4."""
+    """ "34A8C123" is one repair away from 2+3+3 but two away from 2+2+4."""
     assert coerce_positional("34A8C123") == "34ABC123"
 
 

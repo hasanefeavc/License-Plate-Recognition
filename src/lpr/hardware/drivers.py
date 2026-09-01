@@ -82,9 +82,7 @@ class WorkerRelay:
         self.pulses_sent = 0
         self.pulses_dropped = 0
 
-        self._thread = threading.Thread(
-            target=self._run, name=f"relay-{self._name}", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name=f"relay-{self._name}", daemon=True)
         self._thread.start()
         logger.info("%s worker started (%s)", type(self).__name__, self._name)
 
@@ -357,8 +355,7 @@ class ModbusRelay(WorkerRelay):
                 client = ModbusTcpClient(self._host, port=self._port, timeout=2)
         except ImportError as exc:
             raise RuntimeError(
-                "pymodbus is not installed; pip install pymodbus to drive a "
-                "Modbus relay"
+                "pymodbus is not installed; pip install pymodbus to drive a Modbus relay"
             ) from exc
 
         if not client.connect():
@@ -451,9 +448,7 @@ class HttpRelay(WorkerRelay):
 
         request = urllib.request.Request(url, method=self._method)
         if self._user:
-            token = base64.b64encode(
-                f"{self._user}:{self._password}".encode()
-            ).decode("ascii")
+            token = base64.b64encode(f"{self._user}:{self._password}".encode()).decode("ascii")
             request.add_header("Authorization", f"Basic {token}")
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:

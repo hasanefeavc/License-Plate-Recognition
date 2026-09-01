@@ -25,7 +25,7 @@ import os
 import stat
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from lpr.license import ALGORITHM, ISSUER, LICENSE_FILE_NAME, PUBLIC_KEY_NAME
@@ -253,7 +253,7 @@ def sign_license(
     """
     import jwt
 
-    now = issued_at or datetime.now(timezone.utc)
+    now = issued_at or datetime.now(UTC)
     expires = now + timedelta(days=days)
     claims: dict[str, object] = {
         "iss": ISSUER,
@@ -320,7 +320,7 @@ def ensure_dev_license(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(token + "\n", encoding="utf-8")
 
-    expires = datetime.fromtimestamp(float(str(claims["exp"])), tz=timezone.utc)
+    expires = datetime.fromtimestamp(float(str(claims["exp"])), tz=UTC)
     return Step(
         "license",
         True,

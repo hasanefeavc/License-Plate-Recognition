@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 
-def _cached_on_state(app: "Starlette", attr: str, factory: Any) -> Any:
+def _cached_on_state(app: Starlette, attr: str, factory: Any) -> Any:
     """Return ``app.state.<attr>``, building it once on first use."""
     existing = getattr(app.state, attr, None)
     if existing is None:
@@ -70,7 +70,7 @@ def get_pipeline_optional(request: Request) -> Any | None:
     return getattr(request.app.state, "pipeline", None)
 
 
-def get_model_assets(app: "Starlette") -> Any:
+def get_model_assets(app: Starlette) -> Any:
     """What the model files on this box are, cached on ``app.state``.
 
     Computed at start-up by the lifespan handler; recomputed here if something
@@ -87,7 +87,7 @@ def get_model_assets(app: "Starlette") -> Any:
     return _cached_on_state(app, "model_assets", factory)
 
 
-def pipeline_unavailable_detail(app: "Starlette") -> str:
+def pipeline_unavailable_detail(app: Starlette) -> str:
     """Why the pipeline is not there, in one sentence an operator can act on.
 
     "Görüntü işleme hattı kullanılamıyor" is true and useless: it is the same
@@ -120,11 +120,11 @@ def get_pipeline(request: Request) -> Any:
     return pipeline
 
 
-def is_paused(app: "Starlette") -> bool:
+def is_paused(app: Starlette) -> bool:
     return bool(getattr(app.state, "paused", False))
 
 
-def set_paused(app: "Starlette", value: bool) -> bool:
+def set_paused(app: Starlette, value: bool) -> bool:
     """Flip the pause flag, forwarding to the orchestrator when it supports it.
 
     ``PipelineOrchestrator`` is not required to expose pause/resume; when it
@@ -147,7 +147,7 @@ def set_paused(app: "Starlette", value: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def get_license_guard(app: "Starlette") -> Any:
+def get_license_guard(app: Starlette) -> Any:
     """The app's :class:`lpr.license.LicenseGuard`, built on first use."""
 
     def factory() -> Any:
@@ -162,7 +162,7 @@ def get_license_guard_dep(request: Request) -> Any:
     return get_license_guard(request.app)
 
 
-def is_license_halted(app: "Starlette") -> bool:
+def is_license_halted(app: Starlette) -> bool:
     """True while the pipeline is paused *because of* the licence.
 
     Tracked separately from ``app.state.paused`` so an operator's manual
@@ -173,7 +173,7 @@ def is_license_halted(app: "Starlette") -> bool:
     return bool(getattr(app.state, "license_halted", False))
 
 
-def apply_license_state(app: "Starlette", valid: bool) -> bool:
+def apply_license_state(app: Starlette, valid: bool) -> bool:
     """Record the deployment licence state. **No longer halts the pipeline.**
 
     The deployment licence used to pause recognition and refuse the gate when
@@ -243,7 +243,7 @@ def get_meta_repository(request: Request) -> Any:
     return _cached_on_state(request.app, "meta_repository", factory)
 
 
-def get_system_updater_for(app: "Starlette") -> Any:
+def get_system_updater_for(app: Starlette) -> Any:
     """The app's :class:`lpr.updater.SystemUpdater`, built on first use.
 
     One instance per app, because it owns the single-flight lock that keeps two

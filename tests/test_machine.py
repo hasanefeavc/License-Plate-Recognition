@@ -70,7 +70,7 @@ def test_the_same_input_yields_the_same_digest(monkeypatch: pytest.MonkeyPatch) 
 def test_a_component_that_cannot_be_read_is_absent_not_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """"We did not look" and "it is blank" decide different things.
+    """ "We did not look" and "it is blank" decide different things.
 
     A component the licence names but this host cannot read must not count as
     a mismatch, or an unreadable DMI after a kernel upgrade would close a
@@ -346,7 +346,10 @@ def test_an_expired_bound_licence_reports_expiry_not_the_machine(
     from tests.test_license import VENDOR_PRIVATE
 
     token, _ = generate(
-        days=-1, client="Site A", note="", private_key=VENDOR_PRIVATE,
+        days=-1,
+        client="Site A",
+        note="",
+        private_key=VENDOR_PRIVATE,
         binding=MACHINE_A.to_claims(),
     )
     monkeypatch.setattr(machine, "current_fingerprint", lambda: MACHINE_B)

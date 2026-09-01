@@ -73,7 +73,7 @@ __all__ = [
 BACKENDS = ("easyocr", "paddleocr")
 
 
-def build_recognizer(settings: "Settings | None" = None) -> "Recognizer":
+def build_recognizer(settings: Settings | None = None) -> Recognizer:
     """Construct the recogniser named by ``settings.ocr.backend``.
 
     Raises ``RuntimeError`` for an unknown backend name, and (from the backend
@@ -113,7 +113,7 @@ def build_recognizer(settings: "Settings | None" = None) -> "Recognizer":
     return EnsembleRecognizer(members)
 
 
-def _build_backend(name: str, settings: "Settings") -> "Recognizer":
+def _build_backend(name: str, settings: Settings) -> Recognizer:
     """Construct one named OCR backend."""
     backend = (name or "").strip().lower()
     if backend == "easyocr":

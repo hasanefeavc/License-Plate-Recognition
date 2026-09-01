@@ -68,9 +68,7 @@ def test_the_stock_baseline_wearing_the_plate_name_is_not_ready(
     detection. Reporting it as "model installed" is how that survived.
     """
     weights = _write_weights(resolve_detection_weights(tmp_settings), b"coco")
-    monkeypatch.setattr(
-        model_assets, "BASELINE_SHA256", model_assets.sha256_of(weights)
-    )
+    monkeypatch.setattr(model_assets, "BASELINE_SHA256", model_assets.sha256_of(weights))
     tmp_settings.ocr.backend = "none"
 
     assets = describe_assets(tmp_settings)
@@ -120,9 +118,7 @@ def test_runtime_directories_are_created(tmp_settings: Any) -> None:
         assert path.is_dir()
 
 
-def test_being_offline_is_not_an_error(
-    tmp_settings: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_being_offline_is_not_an_error(tmp_settings: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Offline is the normal state of a gate box.
 
     A download that cannot happen is recorded in the status and logged; it

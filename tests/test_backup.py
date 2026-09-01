@@ -71,9 +71,7 @@ def test_a_backup_captures_writes_made_after_the_last_checkpoint(populated: Any)
 
     conn = sqlite3.connect(result.path)
     try:
-        row = conn.execute(
-            "SELECT owner FROM plates WHERE plate = ?", ("35ZZ99",)
-        ).fetchone()
+        row = conn.execute("SELECT owner FROM plates WHERE plate = ?", ("35ZZ99",)).fetchone()
     finally:
         conn.close()
     assert row is not None and row[0] == "Son Yazan"
@@ -201,9 +199,7 @@ def test_restore_puts_the_data_back(populated: Any) -> None:
 
     conn = sqlite3.connect(database_path())
     try:
-        row = conn.execute(
-            "SELECT owner FROM plates WHERE plate = ?", ("34ABC123",)
-        ).fetchone()
+        row = conn.execute("SELECT owner FROM plates WHERE plate = ?", ("34ABC123",)).fetchone()
     finally:
         conn.close()
     assert row is not None and row[0] == "Ahmet"

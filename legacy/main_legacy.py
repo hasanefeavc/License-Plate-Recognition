@@ -1,25 +1,26 @@
-import cv2
-import pytesseract
-import re
-import numpy as np
-import time
-import serial
-import sqlite3
-import threading
-import tkinter as tk
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
-from PIL import Image, ImageTk
-from datetime import datetime, timedelta
+import ctypes
 import hashlib
 import logging
 import os
-import ctypes
+import re
+import sqlite3
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+
+import cv2
+import numpy as np
+import pytesseract
+import serial
+import ttkbootstrap as ttk
+from PIL import Image, ImageTk
+from ttkbootstrap.constants import *
 
 # =============================
 # Logging yapılandırması
 # =============================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =============================
 # Tesseract yolu (sisteme göre ayarla)
@@ -95,9 +96,9 @@ def kapiyi_ac():
     """Röleyi kısa süre tetikler (A/a)."""
     if rolu:
         try:
-            rolu.write(b'A')  # Aç
+            rolu.write(b"A")  # Aç
             time.sleep(1)
-            rolu.write(b'a')  # Kapat
+            rolu.write(b"a")  # Kapat
             logging.info("Kapı açıldı")
         except Exception as e:
             logging.error(f"Röle işlemi hatası: {e}")
@@ -135,7 +136,10 @@ def four_point_transform(image, pts):
         heightA = np.linalg.norm(tr - br)
         heightB = np.linalg.norm(tl - bl)
         maxHeight = max(int(heightA), int(heightB))
-        dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+        dst = np.array(
+            [[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]],
+            dtype="float32",
+        )
         M = cv2.getPerspectiveTransform(rect, dst)
         warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
         return warped
@@ -157,8 +161,8 @@ def detect_plate(frame):
             if len(approx) == 4:
                 warped = four_point_transform(gray, approx)
                 if warped is not None:
-                    text = pytesseract.image_to_string(warped, config='--psm 8')
-                    match = re.findall(r'\b\d{2}\s?[A-Z]{1,3}\s?\d{1,4}\b', text.upper())
+                    text = pytesseract.image_to_string(warped, config="--psm 8")
+                    match = re.findall(r"\b\d{2}\s?[A-Z]{1,3}\s?\d{1,4}\b", text.upper())
                     if match:
                         return match[0].replace(" ", "").strip()
         return None
@@ -174,9 +178,8 @@ bekleme_suresi = 10
 
 def islem_yapilabilir(plaka):
     simdi = time.time()
-    if plaka in son_okunanlar:
-        if simdi - son_okunanlar[plaka] < bekleme_suresi:
-            return False
+    if plaka in son_okunanlar and simdi - son_okunanlar[plaka] < bekleme_suresi:
+        return False
     son_okunanlar[plaka] = simdi
     return True
 
@@ -228,8 +231,10 @@ def is_user_registered(username):
 
 def register_user(username, password):
     try:
-        cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                       (username, hash_password(password)))
+        cursor.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, hash_password(password)),
+        )
         conn.commit()
         logging.info(f"Kullanıcı kaydedildi: {username}")
         return True
@@ -286,7 +291,9 @@ def save_log_to_db(timestamp, message):
     table_name = f"logs_{date_str.replace('-', '_')}"
     create_log_table(date_str)
     try:
-        cursor.execute(f"INSERT INTO {table_name} (timestamp, message) VALUES (?, ?)", (timestamp, message))
+        cursor.execute(
+            f"INSERT INTO {table_name} (timestamp, message) VALUES (?, ?)", (timestamp, message)
+        )
         conn.commit()
     except Exception as e:
         logging.error(f"Log kaydetme hatası ({table_name}): {e}")
@@ -373,9 +380,11 @@ class LoginGUI:
         self.main_frame.pack(fill=BOTH, expand=True)
 
         # Başlık
-        ttk.Label(self.main_frame,
-                  text="Kayıt" if self.is_register_mode else "Giriş",
-                  font=("Segoe UI", 16, "bold")).pack(pady=10)
+        ttk.Label(
+            self.main_frame,
+            text="Kayıt" if self.is_register_mode else "Giriş",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(pady=10)
 
         # Kullanıcı adı
         ttk.Label(self.main_frame, text="Kullanıcı Adı:").pack(anchor=W)
@@ -395,14 +404,16 @@ class LoginGUI:
         self.error_label.pack(pady=5)
 
         # Buton
-        self.submit_button = ttk.Button(self.main_frame,
-                                        text="Kayıt Ol" if self.is_register_mode else "Giriş Yap",
-                                        bootstyle="success",
-                                        command=self.submit)
+        self.submit_button = ttk.Button(
+            self.main_frame,
+            text="Kayıt Ol" if self.is_register_mode else "Giriş Yap",
+            bootstyle="success",
+            command=self.submit,
+        )
         self.submit_button.pack(fill=X, pady=10)
 
         # Enter tuşu bağlama
-        self.root.bind('<Return>', lambda event: self.submit())
+        self.root.bind("<Return>", lambda event: self.submit())
 
     def submit(self):
         username = self.username_var.get().strip()
@@ -414,7 +425,9 @@ class LoginGUI:
 
         if self.is_register_mode:
             if register_user(username, password):
-                self.error_label.config(text="Kayıt başarılı! Giriş yapılıyor...", bootstyle="success")
+                self.error_label.config(
+                    text="Kayıt başarılı! Giriş yapılıyor...", bootstyle="success"
+                )
                 self.root.after(1000, self.proceed)
             else:
                 self.error_label.config(text="Bu kullanıcı adı zaten alınmış!")
@@ -453,20 +466,25 @@ class PlatesWindow:
             fg="white",
             font=("Consolas", 12),
             selectbackground="#00bc8c",
-            activestyle='none'
+            activestyle="none",
         )
         self.plate_listbox.pack(side=LEFT, fill=BOTH, expand=True)
-        self.plate_scrollbar = ttk.Scrollbar(self.plate_frame, orient=VERTICAL, command=self.plate_listbox.yview)
+        self.plate_scrollbar = ttk.Scrollbar(
+            self.plate_frame, orient=VERTICAL, command=self.plate_listbox.yview
+        )
         self.plate_scrollbar.pack(side=RIGHT, fill=Y)
         self.plate_listbox.config(yscrollcommand=self.plate_scrollbar.set)
 
         # Plaka girişi ve butonlar
         self.plate_entry = ttk.Entry(self.root)
         self.plate_entry.pack(fill=X, padx=10, pady=(5, 5))
-        self.add_button = ttk.Button(self.root, text="➕ Plaka Ekle", bootstyle="success", command=self.add_plate)
+        self.add_button = ttk.Button(
+            self.root, text="➕ Plaka Ekle", bootstyle="success", command=self.add_plate
+        )
         self.add_button.pack(fill=X, padx=10, pady=2)
-        self.remove_button = ttk.Button(self.root, text="🗑️ Seçili Plakayı Sil", bootstyle="danger",
-                                        command=self.remove_plate)
+        self.remove_button = ttk.Button(
+            self.root, text="🗑️ Seçili Plakayı Sil", bootstyle="danger", command=self.remove_plate
+        )
         self.remove_button.pack(fill=X, padx=10, pady=2)
 
         # Plaka listesini doldur
@@ -512,14 +530,14 @@ class LicensePlateGUI:
         self.style = ttk.Style("darkly")
 
         # Tam ekran yap
-        self.root.attributes('-fullscreen', True)
+        self.root.attributes("-fullscreen", True)
         # Ekran çözünürlüğünü al
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         self.root.geometry(f"{screen_width}x{screen_height}+0+0")
 
         # Esc tuşu ile tam ekrandan çık
-        self.root.bind('<Escape>', self.toggle_fullscreen)
+        self.root.bind("<Escape>", self.toggle_fullscreen)
 
         self.start_time = datetime.now()
         self.running = True
@@ -531,12 +549,12 @@ class LicensePlateGUI:
         self.header = ttk.Frame(root, padding=15)
         self.header.pack(fill=X)
         self.title_label = ttk.Label(
-            self.header,
-            text="Plaka Tanıma Sistemi",
-            font=("Segoe UI", 18, "bold")
+            self.header, text="Plaka Tanıma Sistemi", font=("Segoe UI", 18, "bold")
         )
         self.title_label.pack(side=LEFT)
-        self.uptime_label = ttk.Label(self.header, text="Çalışma Süresi: 00:00:00", font=("Segoe UI", 12))
+        self.uptime_label = ttk.Label(
+            self.header, text="Çalışma Süresi: 00:00:00", font=("Segoe UI", 12)
+        )
         self.uptime_label.pack(side=RIGHT)
 
         # ---------- BODY CONTAINER ----------
@@ -552,14 +570,18 @@ class LicensePlateGUI:
         self.camera_frame.grid_rowconfigure(1, weight=1)
         self.camera_frame.grid_columnconfigure(0, weight=1)
 
-        self.entry_frame = ttk.LabelFrame(self.camera_frame, text="📷 Giriş Kamerası", padding=10, bootstyle="info")
+        self.entry_frame = ttk.LabelFrame(
+            self.camera_frame, text="📷 Giriş Kamerası", padding=10, bootstyle="info"
+        )
         self.entry_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.entry_canvas = ttk.Label(self.entry_frame)
         self.entry_canvas.pack(fill=BOTH, expand=True)
         self.entry_status = ttk.Label(self.entry_frame, text="Bağlı Değil", bootstyle="danger")
         self.entry_status.pack(pady=6)
 
-        self.exit_frame = ttk.LabelFrame(self.camera_frame, text="📷 Çıkış Kamerası", padding=10, bootstyle="info")
+        self.exit_frame = ttk.LabelFrame(
+            self.camera_frame, text="📷 Çıkış Kamerası", padding=10, bootstyle="info"
+        )
         self.exit_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.exit_canvas = ttk.Label(self.exit_frame)
         self.exit_canvas.pack(fill=BOTH, expand=True)
@@ -573,13 +595,20 @@ class LicensePlateGUI:
         # Kontroller
         self.control_frame = ttk.LabelFrame(self.sidebar, text="⚙️ Kontroller", padding=10)
         self.control_frame.pack(fill=X, pady=6)
-        self.pause_button = ttk.Button(self.control_frame, text="⏸ Duraklat", bootstyle="warning",
-                                       command=self.toggle_pause)
+        self.pause_button = ttk.Button(
+            self.control_frame, text="⏸ Duraklat", bootstyle="warning", command=self.toggle_pause
+        )
         self.pause_button.pack(fill=X, pady=4)
-        self.gate_button = ttk.Button(self.control_frame, text="🔓 Kapıyı Aç", bootstyle="success", command=kapiyi_ac)
+        self.gate_button = ttk.Button(
+            self.control_frame, text="🔓 Kapıyı Aç", bootstyle="success", command=kapiyi_ac
+        )
         self.gate_button.pack(fill=X, pady=4)
-        self.fullscreen_button = ttk.Button(self.control_frame, text="🖥️ Tam Ekrandan Çık", bootstyle="info",
-                                            command=self.toggle_fullscreen)
+        self.fullscreen_button = ttk.Button(
+            self.control_frame,
+            text="🖥️ Tam Ekrandan Çık",
+            bootstyle="info",
+            command=self.toggle_fullscreen,
+        )
         self.fullscreen_button.pack(fill=X, pady=4)
 
         # Kamera ayarları
@@ -593,20 +622,27 @@ class LicensePlateGUI:
         self.exit_ip_var = tk.StringVar(value="1")
         self.exit_ip_entry = ttk.Entry(self.camera_ip_frame, textvariable=self.exit_ip_var)
         self.exit_ip_entry.pack(fill=X, pady=2)
-        self.update_ip_button = ttk.Button(self.camera_ip_frame, text="🔄 Uygula", bootstyle="info",
-                                           command=self.update_camera_ips)
+        self.update_ip_button = ttk.Button(
+            self.camera_ip_frame, text="🔄 Uygula", bootstyle="info", command=self.update_camera_ips
+        )
         self.update_ip_button.pack(fill=X, pady=6)
 
         # Plaka yönetimi butonu
-        self.plate_button = ttk.Button(self.sidebar, text="🚙 Kayıtlı Plakalar", bootstyle="info",
-                                       command=self.open_plates_window)
+        self.plate_button = ttk.Button(
+            self.sidebar,
+            text="🚙 Kayıtlı Plakalar",
+            bootstyle="info",
+            command=self.open_plates_window,
+        )
         self.plate_button.pack(fill=X, pady=6)
 
         # Geçmiş Loglar
         self.log_history_frame = ttk.LabelFrame(self.sidebar, text="📜 Geçmiş Loglar", padding=10)
         self.log_history_frame.pack(fill=BOTH, expand=True, pady=6)
         self.log_date_var = tk.StringVar()
-        self.log_date_combo = ttk.Combobox(self.log_history_frame, textvariable=self.log_date_var, state="readonly")
+        self.log_date_combo = ttk.Combobox(
+            self.log_history_frame, textvariable=self.log_date_var, state="readonly"
+        )
         self.log_date_combo.pack(fill=X, pady=2)
         self.log_date_combo.bind("<<ComboboxSelected>>", self.display_selected_log)
         self.log_history_text = tk.Text(
@@ -615,17 +651,21 @@ class LicensePlateGUI:
             bg="#1e1e1e",
             fg="white",
             font=("Consolas", 11),
-            state="disabled"
+            state="disabled",
         )
         self.log_history_text.pack(side=LEFT, fill=BOTH, expand=True)
-        self.log_history_scrollbar = ttk.Scrollbar(self.log_history_frame, orient=VERTICAL,
-                                                   command=self.log_history_text.yview)
+        self.log_history_scrollbar = ttk.Scrollbar(
+            self.log_history_frame, orient=VERTICAL, command=self.log_history_text.yview
+        )
         self.log_history_scrollbar.pack(side=RIGHT, fill=Y)
-        self.log_history_text['yscrollcommand'] = self.log_history_scrollbar.set
+        self.log_history_text["yscrollcommand"] = self.log_history_scrollbar.set
 
         # Röle durumu
-        self.relay_status = ttk.Label(root, text="Röle: " + ("Bağlı" if rolu else "Bağlı Değil"),
-                                      bootstyle=("success" if rolu else "danger"))
+        self.relay_status = ttk.Label(
+            root,
+            text="Röle: " + ("Bağlı" if rolu else "Bağlı Değil"),
+            bootstyle=("success" if rolu else "danger"),
+        )
         self.relay_status.pack(side=BOTTOM, pady=(0, 10))
 
         # Kameraları başlat
@@ -652,10 +692,12 @@ class LicensePlateGUI:
     def toggle_fullscreen(self, event=None):
         """Tam ekran modunu açar/kapatır."""
         self.is_fullscreen = not self.is_fullscreen
-        self.root.attributes('-fullscreen', self.is_fullscreen)
+        self.root.attributes("-fullscreen", self.is_fullscreen)
         if self.is_fullscreen:
             self.fullscreen_button.config(text="🖥️ Tam Ekrandan Çık", bootstyle="info")
-            self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
+            self.root.geometry(
+                f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0"
+            )
         else:
             self.fullscreen_button.config(text="🖥️ Tam Ekran Yap", bootstyle="info")
             self.root.geometry("1600x900+0+0")
@@ -698,7 +740,7 @@ class LicensePlateGUI:
         if current_date not in dates:
             dates.insert(0, current_date)  # Güncel tarihi ekle
         self.log_date_var.set("")
-        self.log_date_combo['values'] = dates
+        self.log_date_combo["values"] = dates
         if dates:
             self.log_date_var.set(dates[0])  # En son tarihi seç
             self.display_selected_log(None)
@@ -728,7 +770,7 @@ class LicensePlateGUI:
         self.paused = not self.paused
         self.pause_button.config(
             text=("▶️ Devam Et" if self.paused else "⏸ Duraklat"),
-            bootstyle=("success" if self.paused else "warning")
+            bootstyle=("success" if self.paused else "warning"),
         )
         self.log("Sistem " + ("duraklatıldı" if self.paused else "devam ediyor"))
 
@@ -745,7 +787,9 @@ class LicensePlateGUI:
         exit_src = parse_camera_source(self.exit_ip_var.get())
         self.giris_kamera = open_camera(entry_src)
         self.cikis_kamera = open_camera(exit_src)
-        self.log(f"Kamera kaynakları güncellendi: Giriş({self.entry_ip_var.get()}) / Çıkış({self.exit_ip_var.get()})")
+        self.log(
+            f"Kamera kaynakları güncellendi: Giriş({self.entry_ip_var.get()}) / Çıkış({self.exit_ip_var.get()})"
+        )
 
     def process_cameras(self):
         while self.running:

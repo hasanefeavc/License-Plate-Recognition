@@ -135,9 +135,7 @@ def backup_database(
     else:
         candidate = Path(destination)
         if candidate.is_dir() or not candidate.suffix:
-            target = candidate / (
-                f"plates-{_timestamp()}{f'-{tag}' if tag else ''}{BACKUP_SUFFIX}"
-            )
+            target = candidate / (f"plates-{_timestamp()}{f'-{tag}' if tag else ''}{BACKUP_SUFFIX}")
         else:
             target = candidate
 

@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import jwt
@@ -144,7 +144,7 @@ class UserLicense:
         }
 
 
-def _secret(settings: "Settings | None" = None) -> str:
+def _secret(settings: Settings | None = None) -> str:
     if settings is None:
         from lpr.config import get_settings
 
@@ -152,7 +152,7 @@ def _secret(settings: "Settings | None" = None) -> str:
     return str(getattr(settings, "license_secret", "") or "").strip()
 
 
-def enforcement_enabled(settings: "Settings | None" = None) -> bool:
+def enforcement_enabled(settings: Settings | None = None) -> bool:
     """True when a signing secret is configured, i.e. licences are in force."""
     return bool(_secret(settings))
 
@@ -172,7 +172,7 @@ def requires_license(role: str) -> bool:
 def issue_key(
     username: str,
     days: int,
-    settings: "Settings | None" = None,
+    settings: Settings | None = None,
     now: datetime | None = None,
 ) -> str:
     """Sign a licence key granting ``days`` of access to ``username``.
@@ -198,7 +198,7 @@ def issue_key(
         raise ValueError("Lisans anahtarı için kullanıcı adı gerekli")
     span = max(MIN_DAYS, min(MAX_DAYS, int(days)))
 
-    issued = now or datetime.now(timezone.utc)
+    issued = now or datetime.now(UTC)
     token = jwt.encode(
         {
             "typ": LICENSE_TYP,
@@ -218,7 +218,7 @@ def issue_key(
 def inspect_key(
     key: str,
     username: str | None = None,
-    settings: "Settings | None" = None,
+    settings: Settings | None = None,
 ) -> KeyInfo:
     """Read one key without activating it. Never raises.
 
@@ -275,7 +275,7 @@ def inspect_key(
 def activate(
     key: str,
     username: str,
-    settings: "Settings | None" = None,
+    settings: Settings | None = None,
     now: datetime | None = None,
 ) -> UserLicense:
     """Bind a key to the clock. This is where the countdown starts.
@@ -289,7 +289,7 @@ def activate(
     if not info.valid:
         return UserLicense(status=STATUS_PENDING, username=username, detail=info.detail)
 
-    moment = now or datetime.now(timezone.utc)
+    moment = now or datetime.now(UTC)
     expires = moment + timedelta(days=info.duration_days)
     return UserLicense(
         status=STATUS_ACTIVE,
@@ -305,7 +305,7 @@ def activate(
 def license_for(
     role: str,
     row: dict[str, Any] | None,
-    settings: "Settings | None" = None,
+    settings: Settings | None = None,
     now: datetime | None = None,
 ) -> UserLicense:
     """The licence state of one account, as the API reports and enforces it.
@@ -352,7 +352,7 @@ def license_for(
             duration_days=duration_days,
         )
 
-    moment = now or datetime.now(timezone.utc)
+    moment = now or datetime.now(UTC)
     remaining = _days_until(expires_at, moment)
     if remaining is None:
         # An unparseable date is not an active licence; treat it as unentered
@@ -391,16 +391,12 @@ def _days_until(expires_at: str, now: datetime) -> float | None:
     except (TypeError, ValueError):
         return None
     if moment.tzinfo is None:  # pragma: no cover - stored values carry an offset
-        moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.replace(tzinfo=UTC)
     return (moment - now).total_seconds() / 86400.0
 
 
 def _iso(timestamp: Any) -> str | None:
     try:
-        return (
-            datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-        )
+        return datetime.fromtimestamp(float(timestamp), tz=UTC).replace(microsecond=0).isoformat()
     except (TypeError, ValueError, OSError, OverflowError):
         return None

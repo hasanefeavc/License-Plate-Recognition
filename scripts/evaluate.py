@@ -80,9 +80,7 @@ def find_images(root: Path) -> tuple[list[Path], list[str]]:
     seen: dict[str, Path] = {}
     duplicates: list[str] = []
     for path in sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
     ):
         if path.name in seen:
             duplicates.append(path.name)
@@ -194,9 +192,7 @@ def run_pass(
         name = path.name
         if name not in truth_map:
             continue  # unlabelled: scoring it either way would invent a result
-        samples.append(
-            evaluate_one(path, truth_map[name], detector, recognizer, min_confidence)
-        )
+        samples.append(evaluate_one(path, truth_map[name], detector, recognizer, min_confidence))
         if index % 25 == 0 or index == total:
             print(f"[eval]   {index}/{total}", end="\r", file=sys.stderr)
     print(file=sys.stderr)
@@ -287,8 +283,7 @@ def check_thresholds(metrics: Metrics, args: argparse.Namespace) -> list[str]:
             failures.append("wrong-plate rate could not be measured (nothing was emitted)")
         elif value > args.max_wrong_plate:
             failures.append(
-                f"wrong-plate rate {value:.4f} exceeds "
-                f"--max-wrong-plate {args.max_wrong_plate:.3f}"
+                f"wrong-plate rate {value:.4f} exceeds --max-wrong-plate {args.max_wrong_plate:.3f}"
             )
 
     if args.max_latency_p95 > 0:
@@ -334,8 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--warmup",
         type=int,
         default=3,
-        help="Untimed frames before measurement, so lazy CUDA/cuDNN init does "
-        "not land in the p95.",
+        help="Untimed frames before measurement, so lazy CUDA/cuDNN init does not land in the p95.",
     )
     parser.add_argument(
         "--min-confidence",
@@ -434,9 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"[eval] ===== {device.upper()} =====")
         try:
-            metrics = run_pass(
-                labelled, truth_map, device, settings, min_confidence, args.warmup
-            )
+            metrics = run_pass(labelled, truth_map, device, settings, min_confidence, args.warmup)
         except ImportError as exc:
             print(f"[eval] ERROR: a required package is missing ({exc}).", file=sys.stderr)
             return 2

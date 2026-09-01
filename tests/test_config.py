@@ -334,8 +334,7 @@ def test_a_plausible_misspelling_is_reported(isolated_sources: Any) -> None:
     a ``.env`` that says otherwise.
     """
     isolated_sources.env_file.write_text(
-        "LPR_SMTP__TO_ADDRS=['a@example.com']\n"
-        "LPR_SMTP__USERNAME=a@example.com\n",
+        "LPR_SMTP__TO_ADDRS=['a@example.com']\nLPR_SMTP__USERNAME=a@example.com\n",
         encoding="utf-8",
     )
     assert unknown_env_names() == ["LPR_SMTP__TO_ADDRS", "LPR_SMTP__USERNAME"]

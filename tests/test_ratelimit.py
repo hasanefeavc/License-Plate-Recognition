@@ -138,9 +138,9 @@ def test_the_escalation_survives_a_successful_guess(
     limiter.record_success("10.0.0.1", "admin")
 
     fail_times(limiter, 3)
-    assert limiter.check("10.0.0.1", "admin").retry_after_s == pytest.approx(
-        LOCKOUT_STEPS_S[1]
-    ), "the second lockout starts where the first left off"
+    assert limiter.check("10.0.0.1", "admin").retry_after_s == pytest.approx(LOCKOUT_STEPS_S[1]), (
+        "the second lockout starts where the first left off"
+    )
 
 
 def test_one_account_lockout_does_not_affect_another(limiter: LoginLimiter) -> None:
