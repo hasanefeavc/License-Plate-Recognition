@@ -36,8 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -51,13 +50,14 @@ _SRC = repo_root() / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-import jwt  # noqa: E402
+from lpr.license import PUBLIC_KEY_NAME, validate_token  # noqa: E402
 
-from lpr.license import ALGORITHM, ISSUER, PUBLIC_KEY_NAME, validate_token  # noqa: E402
+# Signing lives in the library so this script and `lpr init` mint the same
+# artefact -- same claims, same algorithm, one implementation.
+from lpr.provisioning import PRIVATE_KEY_NAME, default_key_dir, sign_license  # noqa: E402
 
 #: Written by scripts/generate_keys.py. Never leaves the vendor machine.
-PRIVATE_KEY_NAME = "private_key.pem"
-DEFAULT_KEY_DIR = repo_root() / "keys"
+DEFAULT_KEY_DIR = default_key_dir()
 
 #: Where every generated key is recorded. See the module docstring.
 HISTORY_FILENAME = "license_history.log"
@@ -183,37 +183,17 @@ def generate(
 ) -> tuple[str, dict[str, object]]:
     """Sign one licence. Returns ``(token, claims)``.
 
-    ``exp`` is the whole mechanism: it is what the offline verifier compares
-    the system clock against, and it is inside the signature, so it cannot be
-    edited without the private key -- which exists only on this machine.
-
-    ``binding`` carries the customer's machine fingerprint components. With
-    it the key is a site licence; without it the key is a bearer token that
-    works on every machine it is copied to, which is the right shape for an
-    evaluation and the wrong shape for a sale. The components are already
-    hashed by :mod:`lpr.machine` before they reach here, so a licence file
-    never carries a customer's MAC address or serial numbers in the clear.
+    Kept as a name in this module because it has always been one; the
+    implementation is :func:`lpr.provisioning.sign_license`.
     """
-    now = issued_at or datetime.now(timezone.utc)
-    expires = now + timedelta(days=days)
-    claims: dict[str, object] = {
-        "iss": ISSUER,
-        "sub": client or "unnamed",
-        "client": client or "unnamed",
-        "note": note,
-        "days": days,
-        "jti": uuid.uuid4().hex,
-        "iat": int(now.timestamp()),
-        "nbf": int(now.timestamp()),
-        "exp": int(expires.timestamp()),
-    }
-    for name, value in (binding or {}).items():
-        if value:
-            claims[name] = str(value)
-    token = jwt.encode(claims, private_key, algorithm=ALGORITHM)
-    if isinstance(token, bytes):  # pragma: no cover - PyJWT 1.x
-        token = token.decode("utf-8")
-    return token, claims
+    return sign_license(
+        days=days,
+        client=client,
+        note=note,
+        private_key=private_key,
+        issued_at=issued_at,
+        binding=binding,
+    )
 
 
 def resolve_binding(args: argparse.Namespace) -> dict[str, str] | None:

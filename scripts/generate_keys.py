@@ -34,8 +34,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import os
-import stat
 import sys
 from pathlib import Path
 
@@ -44,16 +42,26 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+# A checkout that was never ``pip install -e``'d still has to be able to run
+# this, so src/ goes on the path before lpr is imported.
+_SRC = repo_root() / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+# The generation itself lives in the library, so that `lpr init` and this
+# script produce the same artefact rather than two implementations that drift.
+from lpr.provisioning import (  # noqa: E402
+    DEFAULT_KEY_SIZE,
+    MINIMUM_KEY_SIZE,
+    PRIVATE_KEY_NAME,
+    PUBLIC_KEY_NAME,
+    default_key_dir,
+    generate_keypair,
+)
+
 #: Default output directory. Ignored by .gitignore in its entirety, so a
 #: private key cannot be committed by reflex.
-DEFAULT_KEY_DIR = repo_root() / "keys"
-PRIVATE_KEY_NAME = "private_key.pem"
-PUBLIC_KEY_NAME = "public_key.pem"
-
-#: 2048 is the floor for RS256 and is what this project standardises on.
-#: Smaller keys are refused outright rather than warned about.
-DEFAULT_KEY_SIZE = 2048
-MINIMUM_KEY_SIZE = 2048
+DEFAULT_KEY_DIR = default_key_dir()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,44 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def generate(out_dir: Path, key_size: int = DEFAULT_KEY_SIZE) -> tuple[Path, Path]:
-    """Write a fresh key pair into ``out_dir``. Returns ``(private, public)``."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    """Write a fresh key pair into ``out_dir``. Returns ``(private, public)``.
 
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
-
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        # Deliberately unencrypted: the signing step is a non-interactive CLI
-        # and a passphrase typed into a script ends up in a shell history or a
-        # CI variable. Protect this file with filesystem permissions and by
-        # keeping it off every machine that does not mint keys.
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    public_pem = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    private_path = out_dir / PRIVATE_KEY_NAME
-    public_path = out_dir / PUBLIC_KEY_NAME
-
-    # Create the private key with 0600 from the start rather than writing it
-    # world-readable and tightening afterwards -- the gap is a real window.
-    descriptor = os.open(
-        private_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR
-    )
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(private_pem)
-    try:
-        os.chmod(private_path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:  # pragma: no cover - filesystem without POSIX modes
-        pass
-
-    public_path.write_bytes(public_pem)
-    return private_path, public_path
+    Kept as a name in this module because it has always been one; the
+    implementation is :func:`lpr.provisioning.generate_keypair`.
+    """
+    return generate_keypair(out_dir, key_size)
 
 
 def main(argv: list[str] | None = None) -> int:

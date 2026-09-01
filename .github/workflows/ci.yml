@@ -70,6 +70,13 @@ jobs:
       - name: Ruff
         run: ruff check .
 
+      # The dashboard's stylesheet is generated from its markup and committed.
+      # A class added to web/index.html without regenerating it ships as a
+      # silently unstyled element, which no test that reads the HTML would
+      # catch. Pure stdlib, so it belongs in the cheap job.
+      - name: Dashboard stylesheet is current
+        run: python scripts/build_web_css.py --check
+
       - name: Pure-python layers import without torch
         run: |
           python - <<'PY'
@@ -85,7 +92,10 @@ jobs:
           PY
 
       - name: Unit tests
-        run: pytest tests/test_dataset.py tests/test_evaluation.py tests/test_normalize.py tests/test_voting.py -q
+        run: >-
+          pytest tests/test_dataset.py tests/test_evaluation.py
+          tests/test_normalize.py tests/test_voting.py
+          tests/test_camera_sources.py tests/test_env_example.py -q
 
   # ---------------------------------------------------------------------
   # The full suite, with the ML stack. Slower and heavier, so it runs after

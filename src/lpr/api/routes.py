@@ -38,6 +38,7 @@ from pydantic import ValidationError
 from lpr.api import deps
 from lpr.api.ratelimit import client_address
 from lpr.api.schemas import (
+    CameraIssueOut,
     CameraSourceIn,
     CameraStatusOut,
     HealthOut,
@@ -47,6 +48,7 @@ from lpr.api.schemas import (
     LogOut,
     LogQuery,
     MetricsOut,
+    ModelAssetsOut,
     ParkingIn,
     ParkingOut,
     PipelineStateOut,
@@ -256,13 +258,17 @@ async def health(request: Request, user_repo: deps.UserRepo) -> HealthOut:
     version = app_version()
     pipeline = deps.get_pipeline_optional(request)
     if pipeline is None:
-        detail = getattr(request.app.state, "pipeline_error", None)
+        # `pipeline_unavailable_detail` folds in the recorded start-up error
+        # *and* the model-asset status, so the probe names the missing file
+        # rather than only the fact that something is missing. A fresh clone's
+        # first boot is the common case here, and "models/plate_yolov8n.pt is
+        # not there" is the whole answer.
         return HealthOut(
             status="degraded",
             version=version,
             pipeline_running=False,
             cameras={role.value: False for role in CameraRole},
-            detail=str(detail) if detail else "İşlem hattı başlatılamadı",
+            detail=deps.pipeline_unavailable_detail(request.app),
             setup_required=_setup_required(user_repo),
         )
 
@@ -288,12 +294,20 @@ async def health(request: Request, user_repo: deps.UserRepo) -> HealthOut:
         )
 
     healthy = running and any(cameras.values())
+    detail: str | None = None
+    if not healthy:
+        # A role that configuration validation switched off (duplicate device,
+        # unopenable source) looks exactly like an unplugged camera from here.
+        # It is not, and the difference is the difference between checking a
+        # cable and editing one line of .env -- so say which it is.
+        issues = deps.get_settings_dep().cameras.issues
+        detail = "; ".join(issue.message for issue in issues) or "Kamera bağlantısı yok"
     return HealthOut(
         status="ok" if healthy else "degraded",
         version=version,
         pipeline_running=running,
         cameras=cameras,
-        detail=None if healthy else "Kamera bağlantısı yok",
+        detail=detail,
         setup_required=setup_required,
     )
 
@@ -1423,6 +1437,35 @@ async def system_version(request: Request, _: LicensedUser) -> VersionOut:
     updater = deps.get_system_updater(request)
     info = await _in_thread(updater.version)
     return VersionOut(**info.to_dict(), update_enabled=bool(updater.enabled))
+
+
+@router.get(
+    "/api/system/assets",
+    response_model=ModelAssetsOut,
+    tags=["system"],
+    summary="Model dosyaları ve kamera yapılandırması",
+)
+async def system_assets(request: Request, _: LicensedUser) -> ModelAssetsOut:
+    """What this installation is missing, named file by file.
+
+    A fresh clone has an empty ``models/`` -- every ``.pt`` is gitignored -- so
+    the very first run of a new checkout is also the run most likely to be
+    degraded. ``/health`` says *that* the service is degraded; this says
+    *which file* to put where, and repeats the camera roles the configuration
+    refused to start.
+
+    Readable by any authenticated user, and cheap: it stats a handful of paths
+    and imports nothing from the ML stack, which is what lets it answer on a
+    box where that stack is what is missing.
+    """
+    assets = await _in_thread(deps.get_model_assets, request.app)
+    settings = deps.get_settings_dep()
+    return ModelAssetsOut(
+        **assets.to_dict(),
+        cameras=[
+            CameraIssueOut(**issue.model_dump()) for issue in settings.cameras.issues
+        ],
+    )
 
 
 @router.get(

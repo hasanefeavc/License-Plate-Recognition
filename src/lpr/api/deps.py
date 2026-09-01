@@ -32,6 +32,7 @@ __all__ = [
     "get_license_guard",
     "get_license_guard_dep",
     "get_log_repository",
+    "get_model_assets",
     "get_pipeline",
     "get_pipeline_optional",
     "get_plate_repository",
@@ -69,13 +70,52 @@ def get_pipeline_optional(request: Request) -> Any | None:
     return getattr(request.app.state, "pipeline", None)
 
 
+def get_model_assets(app: "Starlette") -> Any:
+    """What the model files on this box are, cached on ``app.state``.
+
+    Computed at start-up by the lifespan handler; recomputed here if something
+    asks before then (a ``TestClient`` built without ``with``, for instance).
+    Reading the filesystem is cheap, and answering "which file is missing?"
+    with "I do not know" would defeat the purpose of the endpoint.
+    """
+
+    def factory() -> Any:
+        from lpr.model_assets import describe_assets
+
+        return describe_assets(get_settings())
+
+    return _cached_on_state(app, "model_assets", factory)
+
+
+def pipeline_unavailable_detail(app: "Starlette") -> str:
+    """Why the pipeline is not there, in one sentence an operator can act on.
+
+    "Görüntü işleme hattı kullanılamıyor" is true and useless: it is the same
+    message whether torch is missing, a model file is absent or a camera is
+    unplugged. The recorded start-up error and the model-asset status are both
+    already on ``app.state``, so the 503 can name the actual gap instead of
+    sending the operator to the container logs.
+    """
+    parts = ["Görüntü işleme hattı kullanılamıyor"]
+    error = getattr(app.state, "pipeline_error", None)
+    if error:
+        parts.append(str(error))
+    try:
+        assets = get_model_assets(app)
+        if not assets.ready:
+            parts.append(assets.detail)
+    except Exception:  # pragma: no cover - defensive; a 503 must not 500
+        logger.debug("Model varlık durumu okunamadı", exc_info=True)
+    return " -- ".join(parts)
+
+
 def get_pipeline(request: Request) -> Any:
     """The orchestrator, or HTTP 503 when the service is running degraded."""
     pipeline = get_pipeline_optional(request)
     if pipeline is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Görüntü işleme hattı kullanılamıyor",
+            detail=pipeline_unavailable_detail(request.app),
         )
     return pipeline
 
@@ -236,6 +276,10 @@ def get_system_event_repository(request: Request) -> Any:
     return _cached_on_state(request.app, "system_event_repository", factory)
 
 
+def get_model_assets_dep(request: Request) -> Any:
+    return get_model_assets(request.app)
+
+
 def get_settings_dep() -> Settings:
     return get_settings()
 
@@ -246,6 +290,7 @@ LogRepo = Annotated[Any, Depends(get_log_repository)]
 UserRepo = Annotated[Any, Depends(get_user_repository)]
 MetaRepo = Annotated[Any, Depends(get_meta_repository)]
 AdminSettings = Annotated[Settings, Depends(get_settings_dep)]
+ModelAssetsDep = Annotated[Any, Depends(get_model_assets_dep)]
 SystemUpdaterDep = Annotated[Any, Depends(get_system_updater)]
 SystemEventRepo = Annotated[Any, Depends(get_system_event_repository)]
 Pipeline = Annotated[Any, Depends(get_pipeline)]

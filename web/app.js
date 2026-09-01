@@ -166,7 +166,7 @@
     "login-error", "login-submit", "login-register", "login-hint",
     "login-license", "login-license-key",
     "dashboard", "banner",
-    "cdn-warning",
+    "style-warning",
     "uptime", "user-label", "conn-dot", "conn-label", "feed", "feed-empty",
     "feed-count", "activity", "stat-read", "stat-grant", "stat-deny",
     "btn-gate", "btn-gate-label", "gate-spinner",
@@ -2490,7 +2490,14 @@
   // -----------------------------------------------------------------------
 
   function init() {
-    if (!window.tailwind && el["cdn-warning"]) el["cdn-warning"].hidden = false;
+    // app.css sets --lpr-css on :root. Reading it back is the only way to
+    // tell "the stylesheet loaded" from "the stylesheet 404'd" without a
+    // network probe, and a 404 here is a deployment fault worth naming rather
+    // than a page that silently looks broken.
+    const styled = getComputedStyle(document.documentElement)
+      .getPropertyValue("--lpr-css")
+      .trim();
+    if (!styled && el["style-warning"]) el["style-warning"].hidden = false;
 
     el["login-form"].addEventListener("submit", (event) => {
       event.preventDefault();

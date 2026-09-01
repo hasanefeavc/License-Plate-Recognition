@@ -48,6 +48,10 @@ dev = [
 gpu = []
 
 [project.scripts]
+# Setup and inspection: `lpr init` provisions a fresh checkout, `lpr status`
+# and `lpr doctor` report what is missing. Import-light on purpose -- these
+# have to run before the ML stack is installed.
+lpr = "lpr.cli:main"
 lpr-api = "lpr.api.main:run"
 lpr-gui = "lpr.ui.app:main"
 

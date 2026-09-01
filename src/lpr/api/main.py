@@ -177,6 +177,20 @@ def _mount_web_ui(app: FastAPI, settings: Settings) -> None:
 
 def _start_pipeline(app: FastAPI, settings: Settings) -> None:
     """Build and start the orchestrator, tolerating a total failure."""
+    # Recorded before the build, so it survives one: a pipeline that failed
+    # because the weights are absent is exactly the case where /health and
+    # /api/system/assets have to be able to say which file is absent.
+    try:
+        from lpr.model_assets import describe_assets
+
+        app.state.model_assets = describe_assets(settings)
+    except Exception:  # pragma: no cover - defensive; must not stop start-up
+        logger.exception("Model dosyaları incelenemedi")
+        app.state.model_assets = None
+
+    for issue in settings.cameras.issues:
+        logger.warning("Kamera yapılandırması: %s", issue.message)
+
     try:
         from lpr.pipeline.factory import build_pipeline
 
@@ -189,6 +203,15 @@ def _start_pipeline(app: FastAPI, settings: Settings) -> None:
         app.state.pipeline = None
         app.state.pipeline_error = str(exc)
         return
+
+    # The build may have downloaded the baseline weights; re-read so the
+    # endpoints report the filesystem as it is now, not as it was a moment ago.
+    try:
+        from lpr.model_assets import describe_assets
+
+        app.state.model_assets = describe_assets(settings)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Model dosyaları yeniden incelenemedi", exc_info=True)
 
     app.state.pipeline = pipeline
     app.state.pipeline_error = None
@@ -531,6 +554,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.license_halted = False
     app.state.license_guard = None
     app.state.web_dir = None
+    #: Filled in by the lifespan handler; built on first use by
+    #: ``deps.get_model_assets`` when something asks before start-up.
+    app.state.model_assets = None
 
     _install_cors(app, resolved)
 

@@ -650,11 +650,19 @@ class PipelineOrchestrator:
         selected: list[tuple[str, CameraConfig]] = []
         claimed: dict[str, str] = {}
 
+        # `CamerasConfig` already blanked any role it refused (duplicate device,
+        # unopenable source) and recorded why. Repeat the reason here rather
+        # than logging "no source configured", which is true but describes a
+        # deliberate single-camera site and a misconfiguration identically.
+        disabled_by_validation = {issue.role: issue for issue in cameras.issues}
+
         for role, config in (("entry", cameras.entry), ("exit", cameras.exit)):
             if not config.enabled:
-                logger.info(
-                    "Camera %s has no source configured; skipping it", role
-                )
+                issue = disabled_by_validation.get(role)
+                if issue is None:
+                    logger.info("Camera %s has no source configured; skipping it", role)
+                else:
+                    logger.warning("Camera %s disabled: %s", role, issue.message)
                 continue
 
             key = config.device_key

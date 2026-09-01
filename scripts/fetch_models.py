@@ -39,28 +39,35 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import socket
 import sys
 import urllib.error
-import urllib.request
 from pathlib import Path
 
-BASELINE_NAME = "yolov8n.pt"
-PLATE_MODEL_NAME = "plate_yolov8n.pt"
-# Same release Ultralytics itself pulls weights from when auto-downloading.
-DOWNLOAD_URL = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{BASELINE_NAME}"
 
-#: SHA-256 of the official v8.3.0 yolov8n.pt, verified against the release URL
-#: above. A .pt is a pickle: torch.load executes what is inside it, so an
-#: unverified download from a redirected or poisoned mirror is arbitrary code
-#: on the gate box. Checked on every download; a mismatch deletes the file
-#: rather than leaving something plausible-looking on disk.
-#:
-#: Only pinned for the default URL. A --url override is somebody's own mirror
-#: or air-gapped copy, and refusing to fetch it because it does not match the
-#: upstream hash would break the case the flag exists for.
-BASELINE_SHA256 = "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36"
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+# A checkout that was never ``pip install -e``'d still has to be able to run
+# this -- it is one of the first commands on a fresh machine -- so src/ goes on
+# the path before lpr is imported.
+_SRC = _repo_root() / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+# The URL, the pinned digest and the verified download all live in the library,
+# so this script and the API's start-up provisioning fetch the same file with
+# the same checks rather than two copies that drift apart.
+from lpr.model_assets import (  # noqa: E402
+    BASELINE_NAME,
+    BASELINE_SHA256,
+    DOWNLOAD_URL,
+    EASYOCR_WEIGHTS,
+    PLATE_MODEL_NAME,
+    download,
+    is_stock_baseline,
+)
 
 DATASET_LAYOUT_NOTE = """
 Fine-tuning dataset layout (YOLO format, single class "plate")
@@ -98,72 +105,6 @@ Fine-tuning dataset layout (YOLO format, single class "plate")
   detection.model_path defaults to -- drop your fine-tune there and the
   pipeline picks it up with no config changes.
 """.strip("\n")
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
-
-
-def sha256_of(path: Path) -> str:
-    """Hex digest of a file, read in chunks so a 100 MB weight file is cheap."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 256), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def download(
-    url: str, dest: Path, timeout: float = 30.0, expected_sha256: str | None = None
-) -> None:
-    """Fetch ``url`` to ``dest``, verifying the digest before it lands.
-
-    The download goes to a ``.part`` file and is renamed into place only after
-    the hash matches, so an interrupted or tampered fetch can never leave
-    something the loader would happily execute. A ``.pt`` is a pickle:
-    ``torch.load`` runs what is inside it.
-    """
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dest = dest.with_suffix(dest.suffix + ".part")
-    request = urllib.request.Request(url, headers={"User-Agent": "lpr-fetch-models/1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response, tmp_dest.open("wb") as out:
-        while True:
-            chunk = response.read(1024 * 256)
-            if not chunk:
-                break
-            out.write(chunk)
-
-    if expected_sha256:
-        actual = sha256_of(tmp_dest)
-        if actual != expected_sha256:
-            tmp_dest.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"checksum mismatch for {url}\n"
-                f"  expected {expected_sha256}\n"
-                f"  got      {actual}\n"
-                "The download was discarded. This is either a corrupted transfer or "
-                "a substituted file; a .pt is executed by torch.load, so it is not "
-                "being kept either way."
-            )
-    tmp_dest.replace(dest)
-
-
-def is_stock_baseline(path: Path) -> bool:
-    """True when ``path`` is the stock COCO baseline wearing another name.
-
-    Hash comparison rather than class-name inspection, so it answers without
-    importing torch -- this script has to work on a box that has not installed
-    the ML wheels yet, which is exactly when somebody is running it.
-    """
-    try:
-        return path.is_file() and sha256_of(path) == BASELINE_SHA256
-    except OSError:
-        return False
-
-
-#: Weight files a default ``easyocr.Reader(["en"])`` needs on disk. Used to
-#: report what the cache is missing; EasyOCR itself decides what to download.
-EASYOCR_WEIGHTS = ("craft_mlt_25k.pth", "english_g2.pth")
 
 
 def fetch_easyocr(models_dir: Path, timeout: float = 120.0) -> int:

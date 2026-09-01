@@ -1,80 +1,124 @@
-.PHONY: install install-gui dev lint fmt test test-fast secrets dataset-scaffold \
-        dataset-check evaluate train export-onnx run-api run-gui docker-build \
-        docker-up docker-down clean
+.PHONY: run start stop restart init setup status doctor css css-check install install-gui dev lint fmt \
+        test test-fast secrets dataset-scaffold dataset-check evaluate train \
+        export-onnx run-api run-gui docker-build docker-up docker-down clean
 
-PYTHON ?= python3
+# Sanal ortam yolları (sisteme değil venv'e bakar)
+VENV ?= venv
+PYTHON = $(VENV)/bin/python
+UVICORN = $(VENV)/bin/uvicorn
+PYTEST = $(VENV)/bin/pytest
+RUFF = $(VENV)/bin/ruff
+MYPY = $(VENV)/bin/mypy
+
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-# Headless core only -- what the Docker image / CI needs.
+# --- Kolay Yönetim (Tek Komutlar) --------------------------------------------
+
+# Tek komutla başlat (venv yoksa kurar, sunucuyu reload modunda açar, CTRL+C ile durur)
+run:
+	@test -d $(VENV) || $(MAKE) setup
+	$(UVICORN) lpr.api.main:app --reload --host 0.0.0.0 --port 8000
+
+# Tek komutla arka planda başlat
+start:
+	@test -d $(VENV) || $(MAKE) setup
+	@nohup $(UVICORN) lpr.api.main:app --host 0.0.0.0 --port 8000 > lpr.log 2>&1 & echo "LPR arka planda baslatildi (Port 8000). Loglar: lpr.log"
+
+# Tek komutla portu ve süreci tamamen kapat
+stop:
+	@-fuser -k 8000/tcp 2>/dev/null || true
+	@echo "LPR durduruldu."
+
+# Tek komutla yeniden başlat
+restart: stop start
+
+# --- First run ---------------------------------------------------------------
+# Otomatik sanal ortam oluşturma, paket yükleme ve lisanslama
+setup:
+	@echo "[+] Sanal ortam ve bagimliliklar hazirlaniyor..."
+	@test -d $(VENV) || python3 -m venv $(VENV)
+	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) -m pip install -e .
+	$(PYTHON) scripts/setup_dev.py
+	@echo "[+] Kurulum tamamlandi. 'make run' ile baslatabilirsiniz."
+
+init:
+	@test -d $(VENV) || python3 -m venv $(VENV)
+	$(PYTHON) scripts/setup_dev.py
+
+# Durum ve sistem kontrolü
+status:
+	$(PYTHON) -m lpr.cli status
+
+doctor:
+	$(PYTHON) -m lpr.cli doctor
+
+# --- Dashboard stylesheet ----------------------------------------------------
+css:
+	$(PYTHON) scripts/build_web_css.py
+
+css-check:
+	$(PYTHON) scripts/build_web_css.py --check
+
+# --- Paket Kurulumları ------------------------------------------------------
 install:
+	@test -d $(VENV) || python3 -m venv $(VENV)
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r requirements.txt
 	$(PYTHON) -m pip install -e .
 
-# Adds the Tkinter desktop client's extra deps (ttkbootstrap, non-headless
-# opencv, ...). Run this on the operator's desktop machine, not in Docker.
 install-gui:
 	$(PYTHON) -m pip install -e ".[gui]"
 
-# Full local dev environment: runtime + gui + lint/test tooling.
 dev:
+	@test -d $(VENV) || python3 -m venv $(VENV)
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r requirements.txt -r requirements-dev.txt
 	$(PYTHON) -m pip install -e ".[gui,dev]"
 
+# --- Test ve Kod Kalitesi ---------------------------------------------------
 lint:
-	ruff check .
-	mypy src
+	$(RUFF) check .
+	$(MYPY) src
 
 fmt:
-	ruff check --fix .
-	ruff format .
+	$(RUFF) check --fix .
+	$(RUFF) format .
 
-test:
-	pytest
+test: css-check
+	$(PYTEST)
 
-# The subset that needs no ML wheels. Same set the CI "lint-and-unit" job runs,
-# so a failure here is a failure there.
 test-fast:
-	pytest tests/test_dataset.py tests/test_evaluation.py tests/test_normalize.py \
-	       tests/test_voting.py tests/test_config.py -q
+	$(PYTEST) tests/test_dataset.py tests/test_evaluation.py tests/test_normalize.py \
+	       tests/test_voting.py tests/test_config.py tests/test_camera_sources.py \
+	       tests/test_env_example.py -q
 
-# Credential scan over the working tree AND git history. Run it before any push.
 secrets:
-	pytest tests/test_secrets.py -q
+	$(PYTEST) tests/test_secrets.py -q
 
 # --- Detection model pipeline ------------------------------------------------
-# DATASET points at the YOLO dataset; override it for a set living elsewhere:
-#   make dataset-check DATASET=/srv/plates
 DATASET ?= datasets/plates
 EVAL_IMAGES ?= $(DATASET)/images/test
 
 dataset-scaffold:
 	$(PYTHON) scripts/fetch_dataset.py --scaffold $(DATASET)
 
-# Always run this before booking GPU time. It catches an empty val split, a
-# train/val leak and pixel-coordinate labels -- each of which produces a
-# training run that completes and a model that detects nothing.
 dataset-check:
 	$(PYTHON) scripts/fetch_dataset.py --check $(DATASET)/data.yaml
 
-# --min-map refuses to install weights that did not clear the bar, so a bad run
-# cannot quietly replace a good model.
 train:
 	$(PYTHON) scripts/train_plate_detector.py --data $(DATASET)/data.yaml --min-map 0.85
 
 export-onnx:
 	$(PYTHON) scripts/export_onnx.py
 
-# End-to-end accuracy and latency. Needs a labelled evaluation set including
-# negatives -- images with no plate -- or the false-positive rate cannot be
-# measured and its gate fails rather than passing vacuously.
 evaluate:
 	$(PYTHON) scripts/evaluate.py --images $(EVAL_IMAGES) --device both \
 	       --json accuracy-report.json
 
-run-api:
-	uvicorn lpr.api.main:app --reload --host 0.0.0.0 --port 8000
+# --- Çalıştırma Alternatifleri ----------------------------------------------
+run-api: run
 
 run-gui:
 	$(PYTHON) -m lpr.ui.app
@@ -90,4 +134,4 @@ docker-down:
 
 clean:
 	find . -type d -name '__pycache__' -not -path './.git/*' -exec rm -rf {} +
-	rm -rf build dist *.egg-info .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov
+	rm -rf build dist *.egg-info .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov $(VENV)

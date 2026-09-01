@@ -55,8 +55,18 @@ def _compact(value: str) -> str:
 
 
 #: Assignments whose value must never be a real credential in a tracked file.
+#: A secret-shaped assignment and its value.
+#:
+#: Two details are load-bearing. The value is matched with ``[ \t]`` rather
+#: than ``\s``, so it cannot run past the end of the line: ``\s`` matches a
+#: newline, which made an assignment with an *empty* value swallow the next
+#: line and report a comment header as a leaked secret. And ``PASSWORD`` is
+#: excluded when followed by ``_HASHER`` -- ``LPR_SECURITY__PASSWORD_HASHER``
+#: names an algorithm ("argon2"), not a credential.
 ASSIGNMENT_RE = re.compile(
-    r"^\s*[-#]?\s*(?:LPR_\w*(?:SECRET|PASSWORD)\w*|password|secret_key)\s*[:=]\s*(.+?)\s*$",
+    r"^[ \t]*[-#]?[ \t]*"
+    r"(?:LPR_\w*(?:SECRET|PASSWORD(?!_HASHER))\w*|password|secret_key)"
+    r"[ \t]*[:=][ \t]*(.*?)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 

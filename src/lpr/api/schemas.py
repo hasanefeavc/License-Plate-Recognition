@@ -25,7 +25,9 @@ __all__ = [
     "CameraStatusOut",
     "ErrorOut",
     "HealthOut",
+    "CameraIssueOut",
     "LogOut",
+    "ModelAssetsOut",
     "LicenseIn",
     "LicenseOut",
     "LogQuery",
@@ -612,6 +614,81 @@ class HealthOut(BaseModel):
     #: with no accounts is open by construction, and saying so is what lets the
     #: UI stop advertising public registration once it is not.
     setup_required: bool = Field(default=False, examples=[False])
+
+
+class CameraIssueOut(BaseModel):
+    """One camera role that configuration validation switched off."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "role": "exit",
+                    "source": "0",
+                    "reason": "duplicate",
+                    "message": "Camera exit source '0' is the same device as camera entry",
+                }
+            ]
+        }
+    )
+
+    role: str = Field(examples=["exit"])
+    source: str = Field(default="", examples=["0"])
+    #: ``"duplicate"`` (same physical device as another role) or ``"invalid"``.
+    reason: str = Field(examples=["duplicate"])
+    message: str = Field(examples=["..."])
+
+
+class ModelAssetsOut(BaseModel):
+    """Response of ``GET /api/system/assets``.
+
+    The answer to "why is detection not working on this box?" without shelling
+    into the container. Every field is a fact about the filesystem, so it is
+    answerable even where torch is not installed.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "ready": False,
+                    "detail": "Eksik model dosyaları: tespit modeli (/app/models/plate_yolov8n.pt)",
+                    "configured_path": "models/plate_yolov8n.pt",
+                    "detection_weights": "/app/models/plate_yolov8n.pt",
+                    "detection_present": False,
+                    "detection_is_stock_baseline": False,
+                    "baseline_weights": "/app/models/yolov8n.pt",
+                    "baseline_present": True,
+                    "ocr_backend": "easyocr",
+                    "ocr_models_dir": "/app/models/easyocr",
+                    "ocr_missing": [],
+                    "missing": ["tespit modeli (/app/models/plate_yolov8n.pt)"],
+                    "notes": [],
+                    "cameras": [],
+                }
+            ]
+        }
+    )
+
+    #: True only when detection *and* OCR can run as configured. A present
+    #: file that is the stock COCO baseline renamed counts as not ready.
+    ready: bool = Field(default=False, examples=[False])
+    detail: str = Field(default="", examples=["Eksik model dosyaları: ..."])
+    configured_path: str = Field(default="", examples=["models/plate_yolov8n.pt"])
+    detection_weights: str = Field(default="", examples=["/app/models/plate_yolov8n.pt"])
+    detection_present: bool = Field(default=False, examples=[False])
+    detection_is_stock_baseline: bool = Field(default=False, examples=[False])
+    baseline_weights: str = Field(default="", examples=["/app/models/yolov8n.pt"])
+    baseline_present: bool = Field(default=False, examples=[True])
+    ocr_backend: str = Field(default="", examples=["easyocr"])
+    ocr_models_dir: str = Field(default="", examples=["/app/models/easyocr"])
+    ocr_missing: list[str] = Field(default_factory=list, examples=[[]])
+    missing: list[str] = Field(default_factory=list, examples=[[]])
+    notes: list[str] = Field(default_factory=list, examples=[[]])
+    #: Camera roles disabled by configuration validation. Reported alongside
+    #: the models because both answer the same operator question -- "what did
+    #: this installation refuse to start, and why?"
+    cameras: list[CameraIssueOut] = Field(default_factory=list, examples=[[]])
 
 
 class PipelineStateOut(BaseModel):

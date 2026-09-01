@@ -34,10 +34,10 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_settings import (
     BaseSettings,
     DotEnvSettingsSource,
@@ -45,7 +45,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from lpr.platform_compat import default_serial_port
+from lpr.platform_compat import IS_WINDOWS, default_serial_port
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,79 @@ class CameraConfig(BaseModel):
     #: Applied to network sources only; a V4L2 device ignores it.
     open_timeout_s: float = 5.0
 
+    #: ``/dev/videoN`` -- a Linux device node. Recognised on every platform so
+    #: a config written on Linux can be *understood* on Windows rather than
+    #: handed to a capture backend that can only fail with it.
+    _V4L2_PATH: ClassVar[re.Pattern[str]] = re.compile(r"/dev/video(\d+)\Z")
+
+    #: DirectShow's ``video=<friendly name>`` form, as ``ffmpeg -f dshow``
+    #: takes it. Windows-only, and matched case-insensitively because the
+    #: Device Manager spelling is whatever the vendor chose.
+    _DSHOW_NAME: ClassVar[re.Pattern[str]] = re.compile(r"video=(.+)\Z", re.IGNORECASE)
+
+    @property
+    def source_kind(self) -> str:
+        """What kind of thing ``source`` names, on *this* machine.
+
+        One of ``"disabled"`` (blank), ``"index"`` (a camera number),
+        ``"device"`` (an OS device node or DirectShow name), ``"url"`` (RTSP /
+        HTTP), ``"file"`` (a video file that exists), or ``"invalid"``.
+
+        The last one is the point of the property. A capture backend answers a
+        nonsense source the same way it answers an unplugged camera -- by
+        failing to open -- so without this the reconnect loop is the only
+        symptom, and it looks identical to a cable problem. Classifying the
+        string up front lets :class:`CamerasConfig` disable the role and say
+        which of the two it is.
+        """
+        source = (self.source or "").strip()
+        if not source:
+            return "disabled"
+        if "://" in source:
+            return "url"
+        if source.lstrip("+").isdigit():
+            return "index"
+        if self._V4L2_PATH.fullmatch(source):
+            # Meaningful on Linux; on Windows it is still understood, because
+            # `normalised_source` rewrites it to the bare index.
+            return "device"
+        if IS_WINDOWS and self._DSHOW_NAME.fullmatch(source):
+            return "device"
+        if not IS_WINDOWS and source.startswith("/dev/"):
+            return "device"
+        try:
+            if Path(source).expanduser().is_file():
+                return "file"
+        except OSError:  # pragma: no cover - unrepresentable path on this OS
+            return "invalid"
+        return "invalid"
+
+    @property
+    def normalised_source(self) -> str:
+        """``source`` rewritten into the spelling this OS can actually open.
+
+        The only rewrite that happens today is the cross-platform one:
+        ``/dev/video1`` on Windows becomes ``"1"``. A Linux device node cannot
+        be opened by DirectShow at all, and the two spellings already mean the
+        same camera everywhere else in this file (see :attr:`device_key`), so
+        translating it is strictly better than watching the role fail to open
+        on a machine where that path can never exist.
+
+        Everything else is returned stripped and otherwise untouched.
+        """
+        source = (self.source or "").strip()
+        if not source:
+            return ""
+        if IS_WINDOWS:
+            match = self._V4L2_PATH.fullmatch(source)
+            if match:
+                return str(int(match.group(1)))
+        if source.lstrip("+").isdigit():
+            # "00", " 0 " and "+0" are all camera 0. Windows configs written by
+            # hand pick up stray whitespace from the Device Manager dialog.
+            return str(int(source))
+        return source
+
     @property
     def is_network_source(self) -> bool:
         """True for a URL rather than a local device index or path.
@@ -142,7 +215,7 @@ class CameraConfig(BaseModel):
         ``None`` is what tells :class:`~lpr.pipeline.camera.CameraWorker` and
         the orchestrator that there is nothing to open here.
         """
-        source = (self.source or "").strip()
+        source = self.normalised_source
         if not source:
             return None
         if source.isdigit():
@@ -163,12 +236,12 @@ class CameraConfig(BaseModel):
 
         ``None`` for a disabled camera, which collides with nothing.
         """
-        source = (self.source or "").strip()
+        source = self.normalised_source
         if not source:
             return None
         if source.isdigit():
             return f"v4l2:{int(source)}"
-        match = re.fullmatch(r"/dev/video(\d+)", source)
+        match = self._V4L2_PATH.fullmatch(source)
         if match:
             return f"v4l2:{int(match.group(1))}"
         return source.lower()
@@ -196,10 +269,117 @@ class MotionConfig(BaseModel):
     heartbeat_s: float = 3.0
 
 
+class CameraIssue(BaseModel):
+    """One camera role that was switched off, and why.
+
+    Kept as data rather than only a log line so the API can show an operator
+    the same sentence the log holds. "The exit camera is disabled because it
+    names the same device as the entry camera" is a five-second fix if it
+    reaches the screen and an afternoon if it only reaches a log file nobody
+    is tailing.
+    """
+
+    role: str
+    source: str
+    #: ``"duplicate"`` or ``"invalid"``.
+    reason: str
+    message: str
+
+
 class CamerasConfig(BaseModel):
     entry: CameraConfig = Field(default_factory=CameraConfig)
     exit: CameraConfig = Field(default_factory=CameraConfig)
     motion: MotionConfig = Field(default_factory=MotionConfig)
+
+    #: Roles disabled by :meth:`_validate_sources`, in the order they were hit.
+    #: A private attribute so it is neither settable from the environment nor
+    #: part of the serialised config; read it through :attr:`issues`.
+    _issues: list[CameraIssue] = PrivateAttr(default_factory=list)
+
+    #: The roles this model validates, in priority order. The first role to
+    #: name a device keeps it, so this order is what decides the winner of a
+    #: collision -- deterministically, which is the whole point.
+    ROLES: ClassVar[tuple[str, ...]] = ("entry", "exit")
+
+    @model_validator(mode="after")
+    def _validate_sources(self) -> "CamerasConfig":
+        """Disable any role that cannot work, and record why.
+
+        Two failures are caught here rather than at open time, because at open
+        time they are indistinguishable from an unplugged camera -- a
+        reconnect loop and nothing else:
+
+        **Duplicate device.** Entry and exit pointed at the same camera. On
+        Linux, V4L2 gives exclusive access and the loser gets
+        ``VIDIOC_QBUF: Bad file descriptor``; on Windows, DirectShow locks the
+        device outright and the second ``VideoCapture`` takes the capture
+        pipeline down with it. Which role loses depends on thread scheduling,
+        so the symptom moves between cameras run to run. ``entry: "0"`` with
+        ``exit: "/dev/video0"`` is one webcam spelled two ways -- see
+        :attr:`CameraConfig.device_key`.
+
+        **Unopenable source.** A string that is not an index, a device, a URL
+        or an existing file. Usually a typo, or a ``/dev/video0`` carried to a
+        machine that has no such path (that one is rewritten rather than
+        refused -- see :attr:`CameraConfig.normalised_source`).
+
+        In both cases the role is switched off: blanking ``source`` is exactly
+        what "this camera is not fitted" already means everywhere else, so the
+        orchestrator skips it, the API reports it as disconnected, and the
+        *other* camera keeps working. A site with one good camera and one
+        misconfigured one runs on the good one.
+        """
+        self._issues = []
+        claimed: dict[str, str] = {}
+
+        for role in self.ROLES:
+            camera: CameraConfig = getattr(self, role)
+            kind = camera.source_kind
+            if kind == "disabled":
+                continue
+
+            if kind == "invalid":
+                self._disable(
+                    role,
+                    camera,
+                    "invalid",
+                    f"Camera {role} source {camera.source!r} is not a camera index, "
+                    "device, URL or existing file; the role has been disabled. "
+                    "Use a number (\"0\"), an RTSP/HTTP URL, or leave it blank.",
+                )
+                continue
+
+            key = camera.device_key
+            owner = claimed.get(key) if key is not None else None
+            if owner is not None:
+                self._disable(
+                    role,
+                    camera,
+                    "duplicate",
+                    f"Camera {role} source {camera.source!r} is the same device as "
+                    f"camera {owner} ({getattr(self, owner).source!r}); {role} has "
+                    "been disabled. One capture backend cannot hand the same "
+                    "device to two readers -- give each role its own camera, or "
+                    "leave one source blank.",
+                )
+                continue
+
+            if key is not None:
+                claimed[key] = role
+
+        return self
+
+    def _disable(self, role: str, camera: CameraConfig, reason: str, message: str) -> None:
+        """Blank one role's source and record the reason. Logs at WARNING."""
+        issue = CameraIssue(role=role, source=camera.source, reason=reason, message=message)
+        self._issues.append(issue)
+        logger.warning("%s", message)
+        camera.source = ""
+
+    @property
+    def issues(self) -> list[CameraIssue]:
+        """Roles disabled during validation. Empty on a healthy configuration."""
+        return list(self._issues)
 
 
 class DetectionConfig(BaseModel):

@@ -13,6 +13,122 @@ are currently driving through.
 
 ## [Unreleased]
 
+### Added
+
+- **`lpr init` — one command from `git clone` to a service that starts.**
+  Also `python scripts/setup_dev.py` (works before `pip install -e .`) and
+  `make init`. It creates `data/`, `models/`, `keys/` and `data/snapshots/`,
+  generates the RSA licence-signing pair, mints a local developer licence into
+  `data/.license`, and copies `.env.example` to `.env` when there is no `.env`.
+
+  Setup was previously four steps run in the right order, with nothing checking
+  that they happened. Skipping the licence step in particular produced a
+  service that started, served, and refused every login — a long way from the
+  step that was missed.
+
+  Everything it does is idempotent, and nothing is overwritten without
+  `--force`. That matters most for `.env`, which is the uncommitted file
+  holding the machine's real secrets: a setup script that clobbered one would
+  be the most expensive thing in the repository.
+
+- **`lpr status` and `lpr doctor`.** `status` reports which of the directories,
+  keys, licence, weights and `.env` are present and exits non-zero if any are
+  missing, so CI and a provisioning script can both gate on it. `doctor` adds
+  the checks that need an import — `cv2`, `torch`, `ultralytics`, `easyocr`,
+  the database schema, and every `LPR_` variable that maps to no setting.
+
+- **`GET /api/system/assets`** — what this installation is missing, named file
+  by file, plus any camera role the configuration refused to start. It stats a
+  handful of paths and imports nothing from the ML stack, which is what lets it
+  answer on the box where that stack is what is missing. Readable by any
+  authenticated user.
+
+### Changed
+
+- **BREAKING for offline-hostile deployments — the dashboard no longer loads
+  Tailwind from a CDN.** `web/index.html` pulled `https://cdn.tailwindcss.com`
+  at load time. On a gate box with no route to the internet — which is most of
+  them — the script failed silently and the operator got unstyled raw HTML with
+  a banner explaining why.
+
+  Styling is now a pre-compiled bundle at `web/static/css/app.css`, served from
+  the same `/web` mount as the page. It is generated, not vendored:
+  `scripts/build_web_css.py` scans `web/index.html` and `web/app.js` for
+  utility class names and compiles each against a Tailwind-compatible rule
+  table, including the runtime-assembled ones a `class="..."` scan would miss.
+  A class it cannot compile is reported rather than skipped.
+
+  Fonts are OS stacks and every icon is a Unicode glyph or an inline `<svg>`,
+  so **nothing** on the page is now fetched from a remote host.
+
+  **What to do:** nothing, unless you edit `web/index.html` or `web/app.js` —
+  then run `make css`. `make css-check` (which `make test` runs) fails if the
+  committed bundle is stale.
+
+- **A 503 from a degraded pipeline now names what is missing.** `/api/stats`
+  answered `Görüntü işleme hattı kullanılamıyor`, which was equally true
+  whether torch was absent, the weights were missing or a camera was unplugged;
+  `/health` said only "degraded". Both now carry the recorded start-up error
+  and the model-asset status, so a fresh clone's first boot reports the
+  filename it is waiting for. The original Turkish phrase is still the start of
+  the 503 detail, so clients switching on it are unaffected.
+
+- **`.env.example` now lists every setting**, spelled the way `Settings`
+  declares it, with its default. It had fallen behind on the SMTP
+  (`timeout_s`, `queue_size`) and snapshot (`max_total_mb`, `min_free_mb`)
+  keys among others. `tests/test_env_example.py` fails if the file and the
+  settings models ever disagree again — in both directions, because a stale
+  name misleads and a missing one hides a setting nobody knows exists.
+
+- **The licence-signing and weight-download primitives moved into the library**
+  (`lpr.provisioning`, `lpr.model_assets`). `scripts/generate_keys.py`,
+  `scripts/generate_license.py` and `scripts/fetch_models.py` now delegate to
+  them, so a developer licence minted by `lpr init` and a customer licence
+  minted by the vendor script are the same artefact from the same code. The
+  scripts' interfaces are unchanged.
+
+### Fixed
+
+- **Two cameras pointed at one device took the capture pipeline down** instead
+  of being refused. Setting entry and exit to the same index — the default
+  `"0"` on both, which is what a fresh `config.yaml` gives you — locks the
+  device: V4L2 hands the second opener `VIDIOC_QBUF: Bad file descriptor`, and
+  DirectShow on Windows locks it outright and crashes the second capture. Which
+  role lost depended on thread scheduling, so the symptom moved between cameras
+  run to run.
+
+  The configuration layer now detects the collision before anything is opened
+  and disables the **second** role with a warning naming the first. `"0"` and
+  `/dev/video0` are recognised as the same webcam spelled two ways. The other
+  camera keeps working, and `/health` and `/api/system/assets` both report
+  which role was disabled and why.
+
+- **An unopenable camera source is now refused rather than retried forever.** A
+  string that is not an index, a device, a URL or an existing file disabled the
+  role instead of producing a reconnect loop indistinguishable from a cable
+  fault.
+
+- **`/dev/videoN` on Windows now resolves to the bare camera index.** That path
+  cannot exist there, so a configuration written on the Linux box and carried
+  over opened nothing. The two spellings already meant the same device
+  everywhere else in the config layer.
+
+- **String integers are accepted in any spelling a hand-edited file produces**
+  (`" 0 "`, `"00"`, `"+0"`). `VideoCapture(" 0 ")` treats its argument as a
+  filename and opens nothing.
+
+- **A missing model file is provisioned and reported instead of surfacing
+  several hundred lines into the log.** `lpr.model_assets` checks the
+  configured weights before the ML stack is imported, fetches the COCO baseline
+  into `models/yolov8n.pt` when they are absent and the network answers, and
+  records the state either way. Being offline is not an error — the pipeline
+  still builds, on the contour detector, as the degraded-mode contract already
+  promised.
+
+  The baseline is **never** installed as `plate_yolov8n.pt`. Doing so would
+  make every check pass while the gate read no plates at all, which is the
+  exact state this repository once shipped in.
+
 ### Security
 
 - **BREAKING — `role` now defaults to `viewer` when a request omits it.**

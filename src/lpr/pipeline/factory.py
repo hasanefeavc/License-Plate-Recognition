@@ -18,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from lpr.hardware.relay import build_relay
+from lpr.model_assets import ensure_detection_weights, ensure_runtime_dirs
 from lpr.pipeline.orchestrator import PipelineOrchestrator
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -35,6 +36,11 @@ _ML_HINT = (
 def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
     """Wire the real detector, recognizer, voter and relay into a pipeline.
 
+    Runtime directories are created and the detection weights are checked (and,
+    when missing and reachable, the baseline is fetched) before any of the ML
+    stack is imported -- see :mod:`lpr.model_assets`. Neither step can fail the
+    build: a missing model degrades detection, it does not stop the service.
+
     Raises
     ------
     RuntimeError
@@ -46,6 +52,20 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
         from lpr.config import get_settings
 
         settings = get_settings()
+
+    # Provisioning, before the expensive imports and before anything tries to
+    # write. A fresh clone has no data/, no models/ and no weights; creating
+    # the first two and reporting on the third here means the failure is one
+    # named line at the top of the log rather than an OSError from whichever
+    # component happened to write first.
+    ensure_runtime_dirs(settings)
+    assets = ensure_detection_weights(settings)
+    if assets.ready:
+        logger.info("%s", assets.detail)
+    else:
+        logger.warning("%s", assets.detail)
+        for note in assets.notes:
+            logger.warning("%s", note)
 
     # Imported here, never at module scope -- see the module docstring.
     try:
@@ -85,13 +105,14 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
 
     logger.info(
         "Pipeline built (detector=%s, recognizer=%s, voter=%s, relay=%s, "
-        "frame_enhance=%s, email=%s)",
+        "frame_enhance=%s, email=%s, models_ready=%s)",
         type(detector).__name__,
         type(recognizer).__name__,
         type(voter).__name__,
         type(relay).__name__,
         frame_preprocessor is not None,
         notifier.enabled,
+        assets.ready,
     )
     return PipelineOrchestrator(
         settings=settings,

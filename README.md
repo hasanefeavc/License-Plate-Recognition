@@ -80,10 +80,38 @@ legacy/main_legacy.py   the original 836-line single-file app, kept for referenc
 
 ## Quick start
 
+### First run (any platform)
+
+```bash
+python scripts/setup_dev.py    # or `make init`, or `lpr init` once installed
+```
+
+That is the whole of provisioning a fresh clone, and it is idempotent — run it
+again any time you are not sure whether you ran it. It creates `data/`,
+`models/`, `keys/` and `data/snapshots/`; generates the RSA licence-signing
+pair; mints a local developer licence into `data/.license`; and copies
+`.env.example` to `.env` if there is no `.env`. Nothing existing is
+overwritten without `--force`, which matters most for `.env`: that is the
+uncommitted file holding this machine's real secrets.
+
+Then check what is still missing, and why:
+
+```bash
+make status    # what is installed, what is not; exits non-zero if anything is
+make doctor    # ...plus torch/cv2/easyocr imports, the database, and stray LPR_ vars
+```
+
+A fresh clone has no detection weights — every `.pt` is gitignored — so the
+service starts *degraded*, on the much weaker contour detector, and says so.
+`GET /api/system/assets` names the exact file it is waiting for. Fetch the
+baseline with `python scripts/fetch_models.py`; train the real plate model per
+**[README_TRAINING.md](README_TRAINING.md)**.
+
 ### Docker (headless core — recommended)
 
 ```bash
-cp .env.example .env                      # repo root — then set LPR_API__SECRET_KEY
+python scripts/setup_dev.py               # .env, keys, licence, directories
+# ...then set LPR_API__SECRET_KEY in the .env it just wrote
 python scripts/fetch_models.py --easyocr  # baseline detector + OCR weights into models/
 docker compose -f docker/docker-compose.yml up --build
 curl http://localhost:8000/health
@@ -111,9 +139,13 @@ below for the toolkit it needs and how to run without one.
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 pip install -e ".[gui]"                               # only for the desktop client
+lpr init                                              # directories, keys, licence, .env
 lpr-api                                               # http://127.0.0.1:8000/docs
 lpr-gui --api-url http://127.0.0.1:8000               # separate process/machine
 ```
+
+`make setup` is `install` followed by `init`, which is the whole of a fresh
+checkout in one target.
 
 ---
 
@@ -177,7 +209,36 @@ LPR_RELAY__PORT=/dev/ttyUSB0      # COM3 on Windows, "auto" resolves per-OS
 LPR_DETECTION__DEVICE=cuda
 ```
 
-See `.env.example` for the full annotated list.
+`.env.example` lists **every** setting, spelled the way `Settings` declares it,
+with its default. That completeness is enforced: `Settings` is declared
+`extra="ignore"`, so a near miss (`LPR_SMTP__TO_ADDRS` for `to_emails`) is
+silently discarded and the setting keeps whatever `config.yaml` said —
+`tests/test_env_example.py` fails if the file and the models ever disagree, the
+service warns at startup about any `LPR_` variable that configures nothing, and
+`make doctor` lists them on demand.
+
+### Camera sources
+
+A source is a device index (`"0"`, `"1"`), an RTSP/HTTP URL, a device node
+(`/dev/video0`), or a video file. **Blank means "this camera is not fitted"** —
+that is the normal single-camera site, not an error.
+
+Two configurations are refused at startup rather than left to fail at open
+time, because at open time both look exactly like an unplugged camera:
+
+| Configuration | What happens | Why |
+|---|---|---|
+| Entry and exit naming the same device — including `"0"` and `/dev/video0`, which are one webcam spelled two ways | The **second** role is disabled, with a warning naming the first | V4L2 gives exclusive access and hands the loser `VIDIOC_QBUF: Bad file descriptor`; DirectShow on Windows locks the device outright and takes the capture pipeline down with it. Which role loses depends on thread scheduling, so the symptom moves between cameras run to run |
+| A source that is not an index, a device, a URL or an existing file | That role is disabled, with a warning quoting what was configured | Otherwise it is an endless reconnect loop indistinguishable from a cable fault |
+
+Either way the *other* camera keeps working: a site with one good camera and
+one misconfigured one runs on the good one. `GET /api/system/assets` and
+`/health` both report which role was disabled and why.
+
+Cross-platform: `"0"` works everywhere, and string integers are accepted in any
+spelling a hand-edited file produces (`" 0 "`, `"00"`, `"+0"`). A `/dev/videoN`
+path is rewritten to the bare index on Windows, so a config written on the
+Linux box still opens the right camera when it is carried over.
 
 ---
 
@@ -204,9 +265,24 @@ Two details make it work in a browser: an `<img>` cannot send an
 event endpoints also accept the bearer token as `?token=`. That was already in
 the API before the web UI existed.
 
-Styling is Tailwind from the CDN, so a site with no internet gets a plain but
-working page and an on-screen warning saying why. Vendor `tailwind.css` into
-`web/` if that matters for your deployment.
+Styling is a pre-compiled local bundle at `web/static/css/app.css`, served
+from the same `/web` mount as the page, so the dashboard renders identically on
+a gate box with no route to the internet — which is most of them. Fonts are OS
+stacks and every icon is a Unicode glyph or an inline `<svg>`, so nothing on
+the page is fetched from a remote host at all.
+
+The bundle is generated, not hand-written: `scripts/build_web_css.py` scans
+`web/index.html` and `web/app.js` for utility class names and compiles each one
+against a Tailwind-compatible rule table. Regenerate it after editing either
+file:
+
+```bash
+make css          # rebuild web/static/css/app.css
+make css-check    # fail if the committed file is stale (CI and `make test` run this)
+```
+
+A class the markup uses and the table cannot compile is reported rather than
+skipped, so a new utility cannot ship as a silently unstyled element.
 
 **Desktop** — `lpr-gui` is unchanged and remains the fallback for a control
 room with no browser, or where the operator wants a native window.

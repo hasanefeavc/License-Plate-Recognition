@@ -6,40 +6,26 @@
 <meta name="color-scheme" content="dark">
 <title>Plaka Tanıma Sistemi</title>
 
-<!-- Tailwind from the CDN. If the site has no internet the script simply does
-     not load, so the base styles below keep the page dark and legible and
-     #cdn-warning tells the operator why it looks plain. -->
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  if (window.tailwind) {
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            ground: "#10141b",   /* window surface            */
-            chrome: "#161c26",   /* header / control panel    */
-            card:   "#1a2029",   /* card body                 */
-            row:    "#212936",   /* one row inside a card     */
-            void:   "#0a0d12",   /* video area, no signal     */
-            line:   "#2c3542",
-            ink:    "#e8ecf3",
-            muted:  "#78859a",
-            ok:     "#2ecc71",
-            bad:    "#ff5c5c",
-            warn:   "#f0ad4e",
-            accent: "#4c9aff",
-          },
-          fontFamily: {
-            sans: ['Segoe UI', 'Helvetica Neue', 'Helvetica', 'Arial', 'sans-serif'],
-            mono: ['Consolas', 'DejaVu Sans Mono', 'Menlo', 'monospace'],
-          },
-        },
-      },
-    };
-  }
-</script>
+<!-- Styling is a local, pre-compiled bundle -- no CDN, no network at load
+     time. A gate box normally has no route to the internet, and the previous
+     https://cdn.tailwindcss.com script simply failed there, leaving the
+     operator with unstyled HTML.
+
+     web/static/css/app.css is generated from the class names used in this file
+     and in app.js. After editing either one, regenerate it:
+
+         python scripts/build_web_css.py
+
+     The path is relative so it resolves under the /web mount wherever the API
+     is hosted (see lpr.api.main._mount_web_ui). -->
+<link rel="stylesheet" href="static/css/app.css">
+
+<!-- Fonts are OS stacks (Segoe UI / Helvetica / Arial, Consolas / DejaVu Sans
+     Mono) and every icon in the page is a Unicode glyph or an inline <svg>, so
+     nothing here needs a webfont or an icon CDN either. -->
 <style>
-  /* Enough to survive a blocked CDN: dark ground, readable text, no flash. */
+  /* Floor under a missing/failed stylesheet: dark ground, readable text,
+     no flash of white before app.css paints. */
   :root { color-scheme: dark; }
   html, body { height: 100%; }
   body {
@@ -186,9 +172,12 @@
   </div>
   <div id="banner" hidden role="alert"
        class="shrink-0 rounded-lg bg-bad px-4 py-2.5 text-center text-sm font-bold text-white"></div>
-  <div id="cdn-warning" hidden
+  <!-- Shown only if static/css/app.css did not load at all -- a broken
+       deployment (missing file, misconfigured reverse proxy), not a missing
+       internet connection: nothing on this page is fetched from the network. -->
+  <div id="style-warning" hidden
        class="shrink-0 rounded-lg bg-warn px-4 py-2 text-center text-sm font-bold text-ground">
-    Tailwind CDN yüklenemedi (internet yok). Panel sade görünümde çalışıyor.
+    Stil dosyası yüklenemedi (static/css/app.css). Panel sade görünümde çalışıyor.
   </div>
 
   <!-- Body: cameras | live feed ----------------------------------------- -->
