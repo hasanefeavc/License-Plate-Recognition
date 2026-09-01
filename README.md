@@ -83,11 +83,18 @@ legacy/main_legacy.py   the original 836-line single-file app, kept for referenc
 ### Docker (headless core — recommended)
 
 ```bash
-cp .env.example docker/.env               # then set LPR_API__SECRET_KEY
+cp .env.example .env                      # repo root — then set LPR_API__SECRET_KEY
 python scripts/fetch_models.py --easyocr  # baseline detector + OCR weights into models/
 docker compose -f docker/docker-compose.yml up --build
 curl http://localhost:8000/health
 ```
+
+**The `.env` goes in the repo root, not in `docker/`.** That is the file the
+compose stack injects (`env_file: ../.env`) and the file the application reads
+directly when you run it on the host. A `.env` inside `docker/` is loaded by
+Compose for `${...}` substitution *only* — and since nothing in the compose
+files substitutes `LPR_API__SECRET_KEY`, a secret put there reaches neither the
+container nor the app.
 
 `data/`, `models/` and `config.yaml` are bind-mounted, so the database, weights and
 settings live on the host and survive rebuilds. `--easyocr` pre-fills
@@ -118,8 +125,19 @@ committed and all three are templates:
 | File | Holds | Rule |
 |---|---|---|
 | `config.yaml` | Operational settings | No secrets. `smtp.password` stays `""`; `api.secret_key` stays `change-me`, which is what makes `LPR_ENV=production` refuse to boot unconfigured. |
-| `.env.example` | Variable names and placeholders | Every value is a placeholder. Copy to `.env` and fill that in. |
-| `docker/docker-compose.yml` | Service definition | Reads `.env`; carries no values of its own. |
+| `.env.example` | Variable names and placeholders | Every value is a placeholder. Copy to `.env` **in the repo root** and fill that in. |
+| `docker/docker-compose.yml` | Service definition | Injects the root `.env` with `env_file: ../.env`; carries no values of its own. |
+
+Settings resolve in this order, lowest to highest:
+
+```
+config.yaml  <  .env  <  environment variables  <  constructor arguments
+```
+
+`.env` sits above `config.yaml` because `config.yaml` is committed and `.env`
+is not — the uncommitted file is the one carrying the secret, so the committed
+one must not be able to overwrite it. It sits below the real environment
+because that is what it stands in for.
 
 `.gitignore` ignores `.env` **and** `.env.*` while keeping `!.env.example`. The
 wildcard matters as much as the plain name — `.env.production`, `.env.local`

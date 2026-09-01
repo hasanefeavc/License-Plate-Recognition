@@ -15,10 +15,21 @@ default that is right for an arm barrier is actively harmful here.
 
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 
-from lpr.config import FastPathConfig, OcrConfig, RelayConfig, Settings, VotingConfig
-
+from lpr.config import (
+    FastPathConfig,
+    OcrConfig,
+    RelayConfig,
+    Settings,
+    VotingConfig,
+    _default_config_yaml_path,
+    _default_env_file_path,
+)
 
 # ---------------------------------------------------------------------------
 # Voting: the re-trigger window
@@ -170,3 +181,132 @@ def test_nothing_is_copied_back_onto_the_legacy_section() -> None:
     settings = Settings(voting=VotingConfig(fast_path_confidence=0.7))
     assert settings.voting.fast_path_confidence == 0.7
     assert settings.fast_path.min_confidence == FastPathConfig().min_confidence
+
+
+# ---------------------------------------------------------------------------
+# Where settings come from, and which source wins
+# ---------------------------------------------------------------------------
+#
+# These are the exception to this module's rule about not going through
+# ``Settings``: the thing under test *is* the source stack, so it has to be
+# exercised end to end. They stay hermetic by pointing both file sources at
+# a tmp_path through ``LPR_CONFIG_FILE`` and ``LPR_ENV_FILE``, so they never
+# read -- and can never be broken by -- the developer's own configuration.
+
+
+@pytest.fixture()
+def isolated_sources(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Point both file-backed sources at an empty tmp_path.
+
+    Also clears any ``LPR_`` variable already exported into the test runner's
+    environment, so a developer who has the real secret in their shell does
+    not get a green run that CI cannot reproduce.
+    """
+    for name in list(os.environ):
+        if name.startswith("LPR_"):
+            monkeypatch.delenv(name, raising=False)
+
+    config_yaml = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("LPR_CONFIG_FILE", str(config_yaml))
+    monkeypatch.setenv("LPR_ENV_FILE", str(env_file))
+    return SimpleNamespace(config_yaml=config_yaml, env_file=env_file, monkeypatch=monkeypatch)
+
+
+def test_a_dotenv_file_is_actually_read(isolated_sources: Any) -> None:
+    """The regression behind ``POST /api/users/{u}/license`` returning 503.
+
+    ``.env`` was listed in the source stack but no ``env_file`` was ever
+    configured, so the source read nothing. Under Compose the same file is
+    injected as real environment variables and everything worked, which is why
+    it survived: only a host run was broken, and only for whoever had not
+    exported the variable by hand.
+    """
+    isolated_sources.env_file.write_text("LPR_LICENSE_SECRET=from-dotenv\n", encoding="utf-8")
+    assert Settings().license_secret == "from-dotenv"
+
+
+def test_a_real_environment_variable_beats_the_dotenv_file(isolated_sources: Any) -> None:
+    """`.env` is a stand-in for the environment, not an override of it."""
+    isolated_sources.env_file.write_text("LPR_LICENSE_SECRET=from-dotenv\n", encoding="utf-8")
+    isolated_sources.monkeypatch.setenv("LPR_LICENSE_SECRET", "from-real-env")
+    assert Settings().license_secret == "from-real-env"
+
+
+def test_the_dotenv_file_beats_config_yaml(isolated_sources: Any) -> None:
+    """The uncommitted file carries the secret; the committed one must not win.
+
+    ``config.yaml`` ships ``api.secret_key: change-me`` and an empty
+    ``smtp.password`` as *written* values, not as field defaults. With YAML
+    ranked above ``.env`` both of the overrides SECURITY.md tells a site to use
+    would lose to the placeholder they exist to replace -- silently, and in the
+    smtp case leaving alerting switched off while the file said otherwise.
+    """
+    isolated_sources.config_yaml.write_text(
+        "api:\n"
+        "  secret_key: change-me\n"
+        "smtp:\n"
+        "  enabled: true\n"
+        "  host: smtp.example.com\n"
+        "  user: gate@example.com\n"
+        "  password: ''\n"
+        "  from_email: gate@example.com\n"
+        "  to_emails: ['guard@example.com']\n",
+        encoding="utf-8",
+    )
+    isolated_sources.env_file.write_text(
+        "LPR_API__SECRET_KEY=real-secret\nLPR_SMTP__PASSWORD=real-password\n", encoding="utf-8"
+    )
+
+    settings = Settings()
+    assert settings.api.secret_key == "real-secret"
+    assert settings.smtp.password == "real-password"
+    # The consequence, not just the value: with YAML on top this reads
+    # ["password"] and the notifier is switched on and mute.
+    assert settings.smtp.missing_fields == []
+
+
+def test_config_yaml_still_fills_in_what_the_dotenv_file_does_not(isolated_sources: Any) -> None:
+    """Ranking `.env` higher must not stop YAML being the bulk of the config."""
+    isolated_sources.config_yaml.write_text("api:\n  port: 9100\n", encoding="utf-8")
+    isolated_sources.env_file.write_text("LPR_LICENSE_SECRET=x\n", encoding="utf-8")
+    assert Settings().api.port == 9100
+
+
+def test_an_absent_dotenv_file_is_not_an_error(isolated_sources: Any) -> None:
+    """A fresh checkout has no `.env`, and must still start."""
+    assert not isolated_sources.env_file.exists()
+    assert Settings().license_secret == ""
+
+
+def test_an_explicit_env_file_path_is_honoured(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A site keeping its secrets under /etc rather than in the checkout."""
+    for name in list(os.environ):
+        if name.startswith("LPR_"):
+            monkeypatch.delenv(name, raising=False)
+    elsewhere = tmp_path / "etc" / "lpr.env"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text("LPR_LICENSE_SECRET=from-etc\n", encoding="utf-8")
+
+    monkeypatch.setenv("LPR_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    monkeypatch.setenv("LPR_ENV_FILE", str(elsewhere))
+    assert Settings().license_secret == "from-etc"
+
+
+def test_both_config_files_are_looked_for_in_the_same_place(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """`.env` and `config.yaml` must resolve together, and not from the cwd.
+
+    Resolving either one relative to the working directory means the secret is
+    present or absent depending on where the process was launched -- the same
+    unit file behaving differently from ``make run-api`` in the checkout.
+    """
+    monkeypatch.delenv("LPR_CONFIG_FILE", raising=False)
+    monkeypatch.delenv("LPR_ENV_FILE", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    assert _default_env_file_path().parent == _default_config_yaml_path().parent
+    assert _default_env_file_path().name == ".env"

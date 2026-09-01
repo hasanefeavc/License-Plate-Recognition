@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from lpr.api import deps  # noqa: E402
 from lpr.api.main import create_app  # noqa: E402
-from lpr.api.security import LICENSE_LAPSED_DETAIL, create_token  # noqa: E402
+from lpr.api.security import LICENSE_LAPSED_DETAIL, AuthUser, create_token  # noqa: E402
 from lpr.contracts import LprEvent, utc_now_iso  # noqa: E402
 from lpr.license import LicenseError, LicenseStatus  # noqa: E402
 
@@ -2303,6 +2303,59 @@ def test_an_admin_creates_an_operator(
     )
     assert response.status_code == 201
     assert response.json()["role"] == "operator"
+    assert users_repo.rows["yeni"]["role"] == "operator"
+
+
+def test_an_omitted_role_creates_a_viewer(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """An optional role field must default to the least privilege there is.
+
+    This used to default to ``operator``, which carries the manual gate-open
+    button -- so the account nobody chose a role for got the one privilege the
+    ``viewer`` role exists to withhold.
+    """
+    response = users_client.post(
+        "/api/users",
+        headers=admin_auth(),
+        json={"username": "yeni", "password": "parola1234"},
+    )
+    assert response.status_code == 201
+    assert response.json()["role"] == "viewer"
+    assert users_repo.rows["yeni"]["role"] == "viewer"
+
+
+def test_a_user_created_without_a_role_may_not_write(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """The default stated as a consequence rather than as a string.
+
+    Asserted against ``can_write`` rather than against a write endpoint on
+    purpose. Every write route composes the role check with the licence check,
+    so a 403 from one of them says "refused" without saying which layer did
+    it -- and an unlicensed *operator* is refused there too, which would make
+    this pass no matter what the default was.
+    """
+    users_client.post(
+        "/api/users",
+        headers=admin_auth(),
+        json={"username": "yeni", "password": "parola1234"},
+    )
+    created = AuthUser(username="yeni", role=users_repo.rows["yeni"]["role"])
+    assert created.can_write is False
+    assert created.is_viewer is True
+
+
+def test_an_admin_can_still_ask_for_an_operator(
+    users_client: TestClient, users_repo: ManagedUserRepository
+) -> None:
+    """Least privilege by default, not least privilege only."""
+    response = users_client.post(
+        "/api/users",
+        headers=admin_auth(),
+        json={"username": "yeni", "password": "parola1234", "role": "operator"},
+    )
+    assert response.status_code == 201
     assert users_repo.rows["yeni"]["role"] == "operator"
 
 

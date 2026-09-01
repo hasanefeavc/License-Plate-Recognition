@@ -13,7 +13,50 @@ are currently driving through.
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
+
+- **BREAKING — `role` now defaults to `viewer` when a request omits it.**
+  Affects `POST /api/users` and `POST /api/auth/register`. It previously
+  defaulted to `operator`, which carries eleven write endpoints including
+  `POST /api/relay/trigger`, the manual gate-open button — so an account
+  created without anyone choosing a role received the one privilege the
+  `viewer` role had just been added to withhold.
+
+  The two failure directions are not symmetric. A viewer who should have been
+  an operator is refused with a 403 and an admin corrects the role in seconds;
+  an operator who should have been a viewer is invisible until the wrong person
+  opens the barrier.
+
+  **What to check before upgrading:** any client or script that creates
+  accounts *without* naming a role and expects them to be able to write. Add
+  `"role": "operator"` to those calls — the role remains fully selectable, this
+  changes only what happens when nobody chooses. The bootstrap path is
+  unaffected: the first account on an empty installation is forced to `admin`
+  regardless of the request body.
+
+### Fixed
+
+- **`.env` was never read outside Docker**, so `POST /api/users/{username}/license`
+  answered 503 (`LPR_LICENSE_SECRET tanımlı değil`) on any host run.
+  `Settings` listed a dotenv source in its precedence chain but configured no
+  `env_file` for it to read — it looked configured and did nothing. Under
+  Compose the same file is injected as real environment variables by
+  `env_file: ../.env`, which is why only host runs were affected, and only for
+  anyone who had not exported the variable by hand.
+- **`config.yaml` outranked `.env`.** Once the dotenv source read anything, the
+  two overrides the documentation tells a site to use would still have lost to
+  the placeholders they exist to replace: `config.yaml` ships
+  `api.secret_key: change-me` and `smtp.password: ''` as *written* values, so
+  `LPR_API__SECRET_KEY` stayed `change-me` and the mail notifier stayed on and
+  mute. `.env` now sits directly beneath the real environment — the
+  uncommitted file carries the secret, and the committed one cannot overwrite
+  it.
+- **`.env` is resolved from the repo root, not the working directory**, so a
+  systemd unit and `make run-api` find the same file. `LPR_ENV_FILE` relocates
+  it for a site keeping secrets outside the checkout.
+- **README told you to put `.env` in `docker/`.** Compose reads a file there
+  for `${...}` substitution only, and nothing substitutes `LPR_API__SECRET_KEY`
+  — a secret placed there reached neither the container nor the application.
 
 ---
 

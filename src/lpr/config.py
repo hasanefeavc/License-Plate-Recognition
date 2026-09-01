@@ -2,13 +2,21 @@
 
 Precedence, lowest to highest:
 
-    config.yaml  <  environment variables (LPR_ prefix, "__" nesting)  <  explicit constructor args
+    config.yaml  <  .env  <  environment (LPR_ prefix, "__" nesting)  <  constructor args
 
 i.e. an explicit ``Settings(api=ApiConfig(port=9000))`` always wins, an
 environment variable like ``LPR_API__PORT=9000`` beats whatever is in
 ``config.yaml``, and ``config.yaml`` fills in anything neither of those
 touched. Field defaults (below) are the last resort if a key is missing
 everywhere.
+
+``.env`` sits directly beneath the real environment because that is what it
+stands in for: Compose loads it with ``env_file:`` and hands the values to the
+process as ordinary variables, so a host run must resolve it the same way or
+the same file means two different things depending on how the service was
+started. It is above ``config.yaml`` for the same reason -- ``config.yaml`` is
+committed and ``.env`` is not, so the uncommitted file is the one carrying the
+secret, and the committed one must not be able to overwrite it.
 
 Usage:
 
@@ -31,6 +39,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
+    DotEnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
@@ -917,6 +926,30 @@ def _default_config_yaml_path() -> Path:
     return Path.cwd() / "config.yaml"
 
 
+def _default_env_file_path() -> Path:
+    """Locate ``.env``, by the same rules as :func:`_default_config_yaml_path`.
+
+    Resolved from the repo root rather than the working directory, because the
+    working directory is not something an operator thinks about. ``lpr-api``
+    started from a systemd unit, or from ``/``, has to find the same ``.env``
+    that ``make run-api`` finds from the checkout -- otherwise the secret is
+    present or absent depending on where the process happened to be launched,
+    which is the hardest class of configuration bug to see.
+
+    Honours ``LPR_ENV_FILE`` for a file kept outside the checkout entirely,
+    which is what a site putting secrets under ``/etc`` wants.
+    """
+    env_path = os.environ.get("LPR_ENV_FILE")
+    if env_path:
+        return Path(env_path)
+
+    guess = Path(__file__).resolve().parents[2] / ".env"
+    if guess.exists():
+        return guess
+
+    return Path.cwd() / ".env"
+
+
 class _YamlSettingsSource(PydanticBaseSettingsSource):
     """Reads the whole YAML document as the base layer of settings.
 
@@ -994,16 +1027,32 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Order = lowest priority first, wins-over relation flows left->right
-        # in the sense that *earlier* sources are overridden by *later* ones
-        # is backwards for pydantic-settings: the FIRST source in this tuple
-        # has the HIGHEST priority. So: init args > env > yaml > dotenv > secrets.
+        # The FIRST source in this tuple has the HIGHEST priority.
+        # So: init args > env > .env > yaml > secrets.
+        #
+        # Both file-backed sources are rebuilt here rather than taken from the
+        # arguments. `model_config` is evaluated once at class-definition time,
+        # so a path baked in there would freeze whatever LPR_ENV_FILE happened
+        # to say at import; resolving per instantiation keeps the two file
+        # sources behaving identically and keeps them testable.
+        #
+        # In particular `dotenv_settings` as passed in reads nothing at all:
+        # it is constructed from `model_config`, which names no env_file. That
+        # is why a `.env` in the repo root was inert on a host run while
+        # working under Compose -- Compose injects the same file as real
+        # environment variables, so only the host path was broken, and only
+        # for whoever had not exported the variable by hand.
         yaml_source = _YamlSettingsSource(settings_cls, _default_config_yaml_path())
+        env_file_source = DotEnvSettingsSource(
+            settings_cls,
+            env_file=_default_env_file_path(),
+            env_file_encoding="utf-8",
+        )
         return (
             init_settings,
             env_settings,
+            env_file_source,
             yaml_source,
-            dotenv_settings,
             file_secret_settings,
         )
 

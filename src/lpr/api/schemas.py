@@ -748,7 +748,11 @@ class RegisterIn(BaseModel):
 
     username: str = Field(min_length=3, max_length=64, examples=["operator1"])
     password: str = Field(min_length=4, max_length=256, examples=["s3cret!"])
-    role: Literal["admin", "operator", "viewer"] = Field(default="operator", examples=["operator"])
+    #: Least privilege by default, as in :class:`UserCreateIn`; see the note
+    #: there. The bootstrap case is unaffected -- the route forces ``admin``
+    #: for the first account on an empty installation regardless of the body,
+    #: so this default only governs later, admin-authenticated registrations.
+    role: Literal["admin", "operator", "viewer"] = Field(default="viewer", examples=["operator"])
 
     @field_validator("username", mode="before")
     @classmethod
@@ -1002,7 +1006,19 @@ class UserCreateIn(BaseModel):
 
     username: str = Field(min_length=3, max_length=40, examples=["bekci"])
     password: str = Field(min_length=8, max_length=128)
-    role: Literal["admin", "operator", "viewer"] = Field(default="operator")
+    #: Defaults to the *least* privileged role, because the field is optional.
+    #:
+    #: An omitted role used to mean ``operator``, which carries eleven write
+    #: endpoints including ``POST /api/relay/trigger`` -- the manual gate-open
+    #: button. That is the exact over-granting the ``viewer`` role was added to
+    #: end, arriving through the one path where nobody chose it.
+    #:
+    #: The two failures are not symmetric. A viewer who should have been an
+    #: operator is refused with a 403 and an admin fixes the role in seconds; an
+    #: operator who should have been a viewer is invisible until the wrong
+    #: person opens the barrier. ``lpr.api.security.role_at_least`` already
+    #: takes this side of the argument for a role it does not recognise.
+    role: Literal["admin", "operator", "viewer"] = Field(default="viewer")
     #: Session length for this account, in minutes. ``None`` inherits the
     #: policy for the role (365 days for an admin, one 8-hour shift for an
     #: operator), which is what makes the policy retunable centrally.

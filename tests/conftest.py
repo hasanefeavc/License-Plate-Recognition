@@ -3,6 +3,9 @@
 Everything here is designed so the test suite runs on a machine with no
 camera, no serial port, no GPU and no ML stack:
 
+It also runs the same way whether or not the developer has a ``.env`` in
+their checkout -- see ``_ignore_the_developers_dotenv`` below.
+
 * ``tmp_settings`` points the whole application at a throwaway SQLite file in
   ``tmp_path`` and clears the ``lru_cache`` behind ``get_settings``.
 * ``db`` gives you that database with the schema already applied.
@@ -50,6 +53,40 @@ _SETTINGS_CONSUMERS = (
 # ---------------------------------------------------------------------------
 # Settings / database
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _ignore_the_developers_dotenv() -> Iterator[None]:
+    """Point ``LPR_ENV_FILE`` at a path that does not exist, for the session.
+
+    ``Settings`` reads ``<repo-root>/.env``, which is where a developer keeps
+    the real ``LPR_LICENSE_SECRET``. Left alone, that file decides whether
+    per-operator licence enforcement is on while the suite runs: an unlicensed
+    operator gets refused at login, and a handful of session-policy tests fail
+    on the developer's machine and pass in CI, which is the wrong way round for
+    a signal to be useful.
+
+    Only ``.env`` is neutralised, not ``config.yaml``. That file is committed,
+    so every checkout sees the same one; a secret file is by definition not
+    the same everywhere, and a suite whose result depends on one is not
+    reproducible.
+
+    Tests that exercise the source stack itself set ``LPR_ENV_FILE`` to their
+    own tmp_path with ``monkeypatch``, which shadows this for their duration.
+    """
+    import os
+
+    previous = os.environ.get("LPR_ENV_FILE")
+    os.environ["LPR_ENV_FILE"] = str(
+        Path(__file__).resolve().parent / "_no_such_dotenv_for_tests"
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("LPR_ENV_FILE", None)
+        else:
+            os.environ["LPR_ENV_FILE"] = previous
 
 
 @pytest.fixture
