@@ -1,3 +1,18 @@
+# Production stack. Unprivileged, network-isolated, no engine socket.
+#
+# Two overlays add back what this file deliberately leaves out. Neither is on
+# by default, because each trades away part of the isolation here:
+#
+#   docker-compose.ota.yml    in-app updates. Mounts the engine socket, which
+#                             is host-root access, and the repo checkout.
+#   docker-compose.proxy.yml  TLS termination, security headers and the public
+#                             port. This file publishes only to loopback.
+#   docker-compose.cdi.yml    GPU passthrough on Podman / CDI hosts.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.proxy.yml up -d
+
 services:
   lpr-api:
     build:
@@ -21,11 +36,50 @@ services:
     image: lpr-api:latest
     container_name: lpr-api
     restart: unless-stopped
-    user: "0:0"
-    network_mode: "host"
-    devices:
-      - "/dev/video0:/dev/video0"
-      - "/dev/video1:/dev/video1"
+
+    # --- Identity ----------------------------------------------------------
+    #
+    # Runs as the unprivileged `lpr` user baked into the image (uid 1000).
+    # This block used to say `user: "0:0"`, which undid the Dockerfile's USER
+    # line and made the container root -- and, with the engine socket mounted,
+    # host root. Camera access comes from a supplementary group instead, which
+    # is the whole reason the override was there.
+    #
+    # `video` is gid 44 on Debian and Ubuntu. Check the host with
+    # `getent group video` and override when it differs:
+    #   LPR_VIDEO_GID=27 docker compose -f docker/docker-compose.yml up -d
+    group_add:
+      - "${LPR_VIDEO_GID:-44}"
+
+    security_opt:
+      - no-new-privileges:true
+
+    # --- Network -----------------------------------------------------------
+    #
+    # One published port, on loopback by default. This used to be
+    # `network_mode: host`, which put the container on the host's network
+    # stack with no isolation and bound the API to every interface -- with no
+    # TLS and no rate limiting.
+    #
+    # 127.0.0.1 because the intended front door is the reverse proxy in
+    # docker-compose.proxy.yml. A site that genuinely wants the API exposed
+    # directly sets LPR_BIND=0.0.0.0 and accepts serving JWTs over plain HTTP.
+    ports:
+      - "${LPR_BIND:-127.0.0.1}:${LPR_PORT:-8000}:8000"
+
+    # --- Devices -----------------------------------------------------------
+    #
+    # Empty by default. The old file hard-coded /dev/video0 and /dev/video1,
+    # so an RTSP-only site -- or one with a single camera -- could not start
+    # the stack at all: Compose fails container-create on a device that does
+    # not exist. Add what this site actually has:
+    #
+    #   docker compose -f docker/docker-compose.yml \
+    #     -f docker/docker-compose.usb.yml up -d
+    #
+    # or write the device into a local override file.
+    devices: []
+
     volumes:
       - ../data:/app/data
       # Holds the YOLO weights *and*, under easyocr/, the EasyOCR detection and
@@ -34,33 +88,18 @@ services:
       # offline-capable.
       - ../models:/app/models
       # EasyOCR's built-in default location, mounted as well as configured.
-      # Belt and braces: any code path that ignores model_storage_directory --
-      # a helper script, a future easyocr release, a manual `python -c` inside
-      # the container -- still writes to the host instead of to a container
-      # layer that the next `up --build` deletes.
-      - ../data/easyocr_cache:/root/.EasyOCR
-      # torch.hub / ultralytics asset cache, for the same reason.
-      - ../data/torch_cache:/root/.cache/torch
+      # Belt and braces: any code path that ignores model_storage_directory
+      # still writes to the host instead of to a container layer that the next
+      # `up --build` deletes.
+      #
+      # Under /home/lpr, not /root: the container is no longer root, and a
+      # cache pointed at a home directory the process cannot write is a
+      # silent re-download on every start.
+      - ../data/easyocr_cache:/home/lpr/.EasyOCR
+      - ../data/torch_cache:/home/lpr/.cache/torch
       - ../config.yaml:/app/config.yaml:ro
-      - ..:/repo
-      # The engine socket the OTA rebuild talks to. Parameterised because the
-      # path is not universal, and the default is the rootless-Podman one
-      # because that is what this deployment runs: /var/run/docker.sock there
-      # is a *different*, root-owned engine, so mounting it gives the container
-      # either "permission denied" or -- worse -- a working connection to an
-      # engine that is not running this service, rebuilding an image nothing
-      # uses.
-      #
-      # The uid in the default path is the host user's (1000 here). Check
-      # `echo $DOCKER_HOST` on the host and set LPR_DOCKER_SOCK in .env when it
-      # differs -- a Docker Engine host wants
-      # LPR_DOCKER_SOCK=/var/run/docker.sock.
-      #
-      # Read-write on purpose: the engine API is a bidirectional socket, and a
-      # read-only bind is refused at connect time, not at mount time.
-      - ${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}:/var/run/docker.sock:rw
+
     environment:
-      LPR_SYSTEM_UPDATE__REPO_DIR: /repo
       # Put the OCR weights on the models/ volume rather than in $HOME, so they
       # survive `docker compose up --build`. Without this every rebuild
       # re-downloaded ~100 MB before the first frame could be processed, and a
@@ -73,16 +112,32 @@ services:
       # working with the same image.
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      # Where the docker CLI inside this container looks for the engine. It is
-      # always the container-side path of the bind above, whatever the host
-      # socket happens to be called -- the volume line is what varies, not
-      # this. Set explicitly rather than left to the CLI's default so the
-      # value is visible in `docker inspect` when an update fails, and so the
-      # updater and the CLI cannot disagree about which socket they mean.
-      DOCKER_HOST: unix:///var/run/docker.sock
+
     env_file:
       - path: ../.env
         required: false
+
+    # --- Liveness ----------------------------------------------------------
+    #
+    # A wedged-but-alive process is the failure `restart: unless-stopped`
+    # cannot see on its own, and the Dockerfile's HEALTHCHECK was never being
+    # acted on. start_period is long because a cold start loads torch and the
+    # EasyOCR weights before it serves.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+
+    # --- Resource ceilings -------------------------------------------------
+    #
+    # A leak in the container must not take the host down with it. Generous on
+    # purpose: torch plus the EasyOCR weights is ~2 GB resident before a frame
+    # is decoded, and an OOM kill mid-pulse is worse than swapping.
+    mem_limit: ${LPR_MEM_LIMIT:-6g}
+    pids_limit: 512
+
     # --- GPU passthrough ---------------------------------------------------
     #
     # Requires the NVIDIA Container Toolkit on the host:
@@ -95,28 +150,10 @@ services:
     #
     # This reservation is the Docker Engine spelling, and on Docker Engine it
     # is a hard requirement: with no nvidia runtime registered, `up` fails at
-    # container-create with 'could not select device driver "nvidia" with
-    # capabilities: [[gpu]]' rather than starting on CPU. That is the right
-    # default for the gate box, because a silent drop to CPU is a 10x slowdown
-    # nobody notices until the queue backs up.
-    #
-    # **It is not universal.** Podman's Docker-compatible API accepts this
-    # block and then ignores it -- no device, no error, container up, and
-    # `lpr.accel` logs "no CUDA device visible to torch ...; running on CPU".
-    # That is precisely the silent CPU fallback this block exists to prevent.
-    # Podman (and Docker Engine >= 25 with CDI enabled) wants the device named
-    # through CDI instead; see docker/docker-compose.cdi.yml, which is an
-    # overlay rather than the default because a host with no CDI spec would
-    # then fail to create the container:
-    #   docker compose -f docker/docker-compose.yml \
-    #                  -f docker/docker-compose.cdi.yml up -d
-    #
-    # A CPU-only host drops the block, most cleanly with an override file that
-    # is never committed:
-    #   # docker/docker-compose.override.yml
-    #   services: {lpr-api: {deploy: {resources: {reservations: {devices: []}}}}}
-    # The application itself degrades gracefully either way: lpr.accel resolves
-    # both detection.device and ocr.gpu to CPU when no GPU is usable.
+    # container-create rather than starting on CPU. That is the right default
+    # for a gate box, because a silent drop to CPU is a 10x slowdown that looks
+    # like a healthy service. On Podman it is accepted and silently ignored --
+    # use docker-compose.cdi.yml there.
     deploy:
       resources:
         reservations:

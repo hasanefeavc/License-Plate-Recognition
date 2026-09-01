@@ -1,0 +1,65 @@
+# In-app updates (OTA). OPT-IN, and read this before enabling it.
+#
+# What this overlay grants
+# ------------------------
+# Mounting the engine socket into a container is **host-root access**. Anything
+# that can talk to that socket can start a privileged container with the host
+# filesystem bind-mounted, which is root. That is not a flaw in this file --
+# it is what rebuilding your own stack from inside it requires, and there is no
+# version of the feature that does not need it.
+#
+# So the trade is explicit: the base compose file runs unprivileged with no
+# socket, and turning on OTA means accepting that a compromise of the API is a
+# compromise of the host. Two things bound it:
+#
+#   * system_update.enabled must ALSO be true in config.yaml. Neither half
+#     works alone, so neither can be turned on by accident.
+#   * Nothing from an HTTP request reaches a command. The remote, branch and
+#     compose files all come from configuration -- a stolen admin token can
+#     run the operator's own configured build, never arbitrary code.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.ota.yml up -d
+#
+# If you do not need remote updates, do not use this file. `git pull &&
+# docker compose up -d --build` over SSH does the same job with no standing
+# grant.
+
+services:
+  lpr-api:
+    volumes:
+      # The checkout the updater pulls into and rebuilds from.
+      - ..:/repo
+      # The engine socket. Parameterised because the path is not universal,
+      # and the default is the rootless-Podman one because that is what this
+      # deployment runs: /var/run/docker.sock there is a *different*,
+      # root-owned engine, so mounting it gives the container either
+      # "permission denied" or -- worse -- a working connection to an engine
+      # that is not running this service, rebuilding an image nothing uses.
+      #
+      # Check `echo $DOCKER_HOST` on the host. A Docker Engine host wants
+      #   LPR_DOCKER_SOCK=/var/run/docker.sock
+      #
+      # Read-write on purpose: the engine API is a bidirectional socket, and a
+      # read-only bind is refused at connect time, not at mount time.
+      - ${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}:/var/run/docker.sock:rw
+
+    environment:
+      LPR_SYSTEM_UPDATE__REPO_DIR: /repo
+      # Where the docker CLI inside this container looks for the engine. Always
+      # the container-side path of the bind above, whatever the host socket is
+      # called -- the volume line is what varies, not this. Set explicitly so
+      # the value is visible in `docker inspect` when an update fails, and so
+      # the updater and the CLI cannot disagree about which socket they mean.
+      DOCKER_HOST: unix:///var/run/docker.sock
+
+    # Talking to the engine socket needs the docker/podman group, which the
+    # unprivileged `lpr` user is not in by default. This adds it rather than
+    # reverting to `user: "0:0"` -- the container stays uid 1000 and gains one
+    # specific capability instead of all of them.
+    #
+    #   getent group docker   (or: stat -c '%g' $DOCKER_HOST)
+    group_add:
+      - "${LPR_VIDEO_GID:-44}"
+      - "${LPR_DOCKER_GID:-988}"

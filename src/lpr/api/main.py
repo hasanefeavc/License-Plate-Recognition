@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -295,6 +296,82 @@ def _start_nightly_update(app: FastAPI, settings: Settings) -> "asyncio.Task[Non
     )
 
 
+def _docs_urls() -> dict[str, str | None]:
+    """Where (or whether) the OpenAPI schema and its UIs are served.
+
+    ``LPR_API_DOCS=1`` turns them back on in production, for a site that wants
+    them behind its own authenticating proxy.
+    """
+    if not _is_production() or os.environ.get("LPR_API_DOCS", "").strip() in ("1", "true"):
+        return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+    logger.info("API dokümantasyonu üretimde kapalı (LPR_API_DOCS=1 ile açılır)")
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+def _is_production() -> bool:
+    return os.environ.get("LPR_ENV", "").strip().lower() == "production"
+
+
+def _install_cors(app: FastAPI, settings: Settings) -> None:
+    """Add the CORS middleware, refusing the wildcard-plus-credentials trap.
+
+    ``allow_origins=["*"]`` with ``allow_credentials=True`` is not a permissive
+    setting, it is a broken one: the spec forbids the combination, so browsers
+    reject every credentialed cross-origin request and the deployment appears
+    to have no CORS at all. It also documents a security model nobody meant --
+    and it constrains nothing for a non-browser client, which is what an
+    attacker uses.
+
+    So the two are separated. A wildcard origin drops credentials (correct, and
+    what the browser would have enforced anyway); a real origin list keeps
+    them. In production a wildcard is refused outright, because the only reason
+    to ship one to a site is that nobody configured it.
+    """
+    origins = [str(origin).strip() for origin in settings.api.cors_origins if str(origin).strip()]
+    wildcard = "*" in origins
+
+    if wildcard and _is_production():
+        raise RuntimeError(
+            "api.cors_origins is ['*'] with LPR_ENV=production. Set it to the "
+            "dashboard's real origin(s) -- e.g. https://gate.example.com -- or "
+            "to an empty list if the API is only reached same-origin through "
+            "the reverse proxy."
+        )
+
+    if not origins:
+        # Same-origin only. The dashboard is served by this app, so a site
+        # behind the shipped reverse proxy needs no CORS at all, and the safest
+        # configuration is the one that grants nothing.
+        logger.info("CORS: same-origin only (api.cors_origins is empty)")
+        return
+
+    if wildcard:
+        logger.warning(
+            "CORS: wildcard origin with credentials disabled. Browsers reject "
+            "credentialed cross-origin requests against '*' regardless, so this "
+            "is the honest form of that configuration. Set api.cors_origins to "
+            "the dashboard's real origin for a deployment that needs cookies "
+            "or Authorization headers cross-origin."
+        )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        return
+
+    logger.info("CORS: %s (credentials allowed)", ", ".join(origins))
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
 def _verify_update_health(app: FastAPI, phase: str) -> None:
     """Run the OTA rollback gate. Never raises into start-up.
 
@@ -430,9 +507,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
         version=app_version(),
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        # The schema is a map of every route, every role requirement and every
+        # request shape, served to anyone who asks. That is exactly what makes
+        # it useful in development and what makes it reconnaissance on a live
+        # site, so it is off in production unless an operator opts back in.
+        #
+        # Gating it behind an admin dependency instead was considered and
+        # rejected: FastAPI mounts these routes itself and the natural ways to
+        # wrap them are fragile across versions. "Absent" is a stronger and
+        # simpler guarantee than "protected", and the schema is available to
+        # whoever has the source.
+        **_docs_urls(),
     )
 
     # Everything shared lives on app.state -- see lpr.api.deps.
@@ -447,13 +532,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.license_guard = None
     app.state.web_dir = None
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(resolved.api.cors_origins),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    _install_cors(app, resolved)
 
     _install_exception_handlers(app)
     app.include_router(router)

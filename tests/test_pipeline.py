@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from lpr.contracts import Action, CameraStatus, PlateRead
+from lpr.contracts import Action, CameraStatus, LprEvent, PlateRead
 from lpr.db import LogRepository, PlateRepository, init_db
 from lpr.pipeline import orchestrator as orchestrator_module
 from lpr.pipeline.camera import CameraWorker
@@ -1380,3 +1380,243 @@ def test_the_fast_path_survives_a_database_wobble(db, frame, monkeypatch) -> Non
 
     assert recognizer.views == 3, "a lookup failure must not count as a hit"
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Anti-passback
+# ---------------------------------------------------------------------------
+
+
+def _passback_pipeline(db, **overrides):
+    """A pipeline with anti-passback armed, and no cooldown in the way.
+
+    `cooldown_s` is zeroed because the two mechanisms both suppress a repeated
+    plate and would otherwise be indistinguishable in an assertion -- the
+    cooldown would swallow the second entry before the rule ever saw it.
+    """
+    db.voting.cooldown_s = 0.0
+    db.anti_passback.enabled = True
+    for key, value in overrides.items():
+        setattr(db.anti_passback, key, value)
+    return _build_pipeline(db, relay=FakeRelay())
+
+
+def test_anti_passback_is_off_by_default(db) -> None:
+    """A single-camera site would refuse every second visit if it were on."""
+    from lpr.config import AntiPassbackConfig
+
+    assert AntiPassbackConfig().enabled is False
+    assert _build_pipeline(db)._passback is None
+
+
+def test_a_second_entry_without_an_exit_is_refused(db) -> None:
+    """The abuse this stops: a plate driven in, then handed back at the kerb.
+
+    Nothing in the plate list can see it -- the plate is genuinely registered
+    both times.
+    """
+    PlateRepository().upsert("34ABC123", owner="Ahmet")
+    pipeline = _passback_pipeline(db)
+
+    first = pipeline.decide("entry", "34ABC123")
+    second = pipeline.decide("entry", "34ABC123")
+
+    assert first.action == str(Action.GRANTED)
+    assert second.action == str(Action.DENIED)
+
+
+def test_an_exit_between_two_entries_restores_access(db) -> None:
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db)
+
+    pipeline.decide("entry", "34ABC123")
+    pipeline.decide("exit", "34ABC123")
+    again = pipeline.decide("entry", "34ABC123")
+
+    assert again.action == str(Action.GRANTED)
+
+
+def test_an_exit_is_never_refused(db) -> None:
+    """The safety rule the whole feature is built around.
+
+    A vehicle that cannot leave is a vehicle trapped behind a barrier, and in
+    a fire that is the failure that matters. Written as a guard inside the
+    rule, not as care at the call site, so a future edit to `decide` cannot
+    reach it from the exit path by accident.
+    """
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db)
+
+    pipeline.decide("entry", "34ABC123")
+    for _ in range(3):
+        leaving = pipeline.decide("exit", "34ABC123")
+        assert leaving.action == str(Action.GRANTED)
+
+
+def test_the_refusal_does_not_move_the_barrier(db) -> None:
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    db.voting.cooldown_s = 0.0
+    db.anti_passback.enabled = True
+    pipeline = _build_pipeline(db, relay=relay)
+
+    pipeline.decide("entry", "34ABC123")
+    assert relay.triggers == 1
+    pipeline.decide("entry", "34ABC123")
+    assert relay.triggers == 1, "the second entry pulsed the relay anyway"
+
+
+def test_the_state_expires_so_a_missed_exit_cannot_strand_a_resident(db) -> None:
+    """A plate obscured by a following car must not lock somebody out for ever.
+
+    The old entry is written with a backdated timestamp rather than produced
+    and then slept past: log timestamps have one-second resolution, so waiting
+    out even the shortest usable window would cost seconds of suite time for a
+    property that is really about the query's cutoff.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db, window_s=3600.0)
+
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+    LogRepository().write(
+        LprEvent(
+            ts=stale,
+            camera="entry",
+            plate="34ABC123",
+            action=str(Action.GRANTED),
+            confidence=0.9,
+        )
+    )
+
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.GRANTED)
+
+
+def test_an_entry_inside_the_window_is_still_refused(db) -> None:
+    """The other half of the cutoff, so the test above cannot pass vacuously."""
+    from datetime import datetime, timedelta, timezone
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db, window_s=3600.0)
+
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    LogRepository().write(
+        LprEvent(
+            ts=recent,
+            camera="entry",
+            plate="34ABC123",
+            action=str(Action.GRANTED),
+            confidence=0.9,
+        )
+    )
+
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.DENIED)
+
+
+def test_an_exempt_plate_is_never_refused(db) -> None:
+    """Service vehicles legitimately come and go without a clean pairing."""
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db, exempt_plates=[" 34 abc 123 "])
+
+    pipeline.decide("entry", "34ABC123")
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.GRANTED)
+
+
+def test_the_emergency_bypass_suspends_the_rule(db) -> None:
+    """An operator flipping this in a hurry must not have to remember the
+    site's settings in order to put them back."""
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db)
+
+    pipeline.decide("entry", "34ABC123")
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.DENIED)
+
+    pipeline._passback.emergency_bypass = True
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.GRANTED)
+
+
+def test_another_plate_is_unaffected(db) -> None:
+    PlateRepository().upsert("34ABC123")
+    PlateRepository().upsert("06AB456")
+    pipeline = _passback_pipeline(db)
+
+    pipeline.decide("entry", "34ABC123")
+    assert pipeline.decide("entry", "06AB456").action == str(Action.GRANTED)
+
+
+def test_the_rule_disables_itself_without_an_exit_camera(db, caplog) -> None:
+    """On a single-camera site no exit is ever recorded, so every vehicle
+    would look permanently inside and its second visit would be refused."""
+    import logging
+
+    db.anti_passback.enabled = True
+    db.cameras.exit.source = ""
+
+    with caplog.at_level(logging.WARNING, logger="lpr.pipeline.orchestrator"):
+        pipeline = _build_pipeline(db)
+
+    assert pipeline._passback is None
+    assert "no exit camera is fitted" in caplog.text
+
+
+def test_a_lookup_failure_lets_the_vehicle_in(db, monkeypatch) -> None:
+    """Fail open. The rule refines an already-granted plate, and letting a
+    lookup error close the barrier on a resident trades a rare abuse for a
+    common outage."""
+    from lpr.db import LogRepository
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db)
+    pipeline.decide("entry", "34ABC123")
+
+    def boom(_self, _plate, _since):
+        raise RuntimeError("database is busy")
+
+    monkeypatch.setattr(LogRepository, "last_granted_camera", boom)
+    assert pipeline.decide("entry", "34ABC123").action == str(Action.GRANTED)
+
+
+def test_an_unregistered_plate_is_still_denied_as_unknown(db, caplog) -> None:
+    """The rule only ever applies to a plate that was otherwise going to be
+    granted; it must not relabel an ordinary refusal."""
+    import logging
+
+    pipeline = _passback_pipeline(db)
+    with caplog.at_level(logging.INFO, logger="lpr.pipeline.orchestrator"):
+        event = pipeline.decide("entry", "99ZZZ99")
+
+    assert event.action == str(Action.DENIED)
+    assert "not registered" in caplog.text
+
+
+def test_a_refused_re_entry_raises_an_alert(db, frame) -> None:
+    """A registered vehicle refused for coming back in is worth an e-mail:
+    it is either an abuse or a missed exit read, and both need a person.
+
+    Driven through `process_frame` rather than `decide`, because the alert is
+    dispatched from the snapshot writer's completion callback -- so it carries
+    the very image that was written -- and `decide` never reaches that path.
+    """
+    PlateRepository().upsert("34ABC123")
+    notifier = RecordingNotifier()
+    db.voting.cooldown_s = 0.0
+    db.anti_passback.enabled = True
+    pipeline = _build_pipeline(db, relay=FakeRelay(), notifier=notifier)
+
+    pipeline.process_frame("entry", frame)
+    pipeline.process_frame("entry", frame)
+
+    assert notifier.reasons == ["unauthorized"]
+
+
+def test_a_refused_re_entry_is_recorded_as_a_denial(db) -> None:
+    """It has to be visible in the gate log an operator reviews afterwards."""
+    PlateRepository().upsert("34ABC123")
+    pipeline = _passback_pipeline(db)
+
+    pipeline.decide("entry", "34ABC123")
+    pipeline.decide("entry", "34ABC123")
+
+    rows = LogRepository().recent(limit=5)
+    assert [row.action for row in rows][:2] == [str(Action.DENIED), str(Action.GRANTED)]

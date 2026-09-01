@@ -461,6 +461,44 @@ class LogRepository:
         row = conn.execute(f"SELECT COUNT(*) AS n FROM logs{where}", params).fetchone()
         return int(row["n"])
 
+    def last_granted_camera(self, plate: str, since: str) -> str | None:
+        """Which camera last granted ``plate`` at or after ``since``.
+
+        The anti-passback question, asked of the same data the occupancy count
+        uses: a plate whose most recent grant was at the entry camera is
+        inside. ``None`` means no grant in the window, which is the normal
+        state for a car that has not been here today -- and, deliberately, also
+        the state a car falls back to once the window expires, so a missed exit
+        event cannot strand a vehicle for ever.
+
+        Ordered by ``id`` as well as ``ts``, and that tiebreak is load-bearing
+        rather than tidiness: ``ts`` is an ISO string with one-second
+        resolution, so a vehicle that drives in and straight back out -- or any
+        pair of events inside the same second -- leaves two rows SQLite is free
+        to return in either order. Without the rowid the answer would be a coin
+        toss, and the losing side of it refuses a resident at the barrier.
+
+        Served by ``idx_logs_plate`` and ``idx_logs_camera_ts``.
+        """
+        name = normalise_plate(plate)
+        if not name:
+            return None
+        try:
+            row = get_connection().execute(
+                """
+                SELECT camera
+                FROM logs
+                WHERE plate = ? AND action = ? AND ts >= ?
+                ORDER BY ts DESC, id DESC
+                LIMIT 1
+                """,
+                (name, str(Action.GRANTED), since),
+            ).fetchone()
+        except Exception:
+            logger.warning("Son geçiş yönü okunamadı: %s", name, exc_info=True)
+            return None
+        return None if row is None else str(row["camera"])
+
     def occupancy_since(self, ts: str) -> dict[str, int]:
         """How many vehicles are inside, counted from the log since ``ts``.
 

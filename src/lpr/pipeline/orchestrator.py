@@ -41,10 +41,12 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
 
 from lpr.contracts import (
     Action,
+    CameraRole,
     CameraStatus,
     Detector,
     Frame,
@@ -104,10 +106,16 @@ _FRAME_WAIT_S = 0.5
 #: table's ``action`` column is what ``stats_since`` totals and what the
 #: dashboard colours, so a fifth value would quietly stop expired cars being
 #: counted as denials and would render unlabelled in the live feed.
+#: Verdict for a vehicle the anti-passback rule refuses. Not a
+#: ``PlateRepository`` verdict -- the plate is perfectly valid, and that is the
+#: point of the rule -- so it is defined here, where the decision is made.
+PLATE_PASSBACK = "passback"
+
 _DENIAL_LOG = {
     PLATE_EXPIRED: "EXPIRED, gate kept closed",
     PLATE_BLOCKED: "blocked, denied",
     PLATE_UNKNOWN: "not registered, denied",
+    PLATE_PASSBACK: "already inside (anti-passback), denied",
 }
 
 #: Notification category per refusal, for :meth:`PipelineOrchestrator._notify_reason`.
@@ -122,6 +130,12 @@ _NOTIFY_REASON = {
     PLATE_EXPIRED: "unauthorized",
     PLATE_BLOCKED: "blacklisted",
     PLATE_UNKNOWN: "unauthorized",
+    # A registered vehicle refused for coming back in without leaving is not a
+    # stranger and not blacklisted. It alerts as `unauthorized` because that is
+    # the category the notifier knows and an operator filters on; minting a new
+    # one would silently send nothing, since `Notifier.wants` answers False for
+    # anything it does not recognise.
+    PLATE_PASSBACK: "unauthorized",
 }
 
 
@@ -303,6 +317,31 @@ class PipelineOrchestrator:
         #: Cap on OCR passes per frame. 0 = unlimited. See DetectionConfig.
         self._max_ocr_candidates = max(0, int(getattr(settings.detection, "max_ocr_candidates", 0)))
         self._cooldown_s = max(0.0, float(settings.voting.cooldown_s))
+
+        # Anti-passback. getattr so an older config.yaml without the section
+        # keeps the previous behaviour instead of failing to start.
+        self._passback = getattr(settings, "anti_passback", None)
+        if self._passback is not None and not getattr(self._passback, "enabled", False):
+            # One representation of "off", so nothing downstream has to ask the
+            # question twice and get two different answers.
+            self._passback = None
+        if self._passback is not None:
+            exit_fitted = bool(getattr(settings.cameras.exit, "enabled", False))
+            if not exit_fitted:
+                logger.warning(
+                    "anti_passback.enabled is on but no exit camera is fitted. "
+                    "No exit will ever be recorded, so every vehicle would look "
+                    "permanently inside and its second visit would be refused. "
+                    "The rule is being disabled; fit cameras.exit or turn it off."
+                )
+                self._passback = None
+            else:
+                logger.info(
+                    "Anti-passback active: a vehicle inside for less than %.0f min "
+                    "cannot re-enter without an exit (%d exempt plate(s))",
+                    float(getattr(self._passback, "window_s", 0)) / 60.0,
+                    len(getattr(self._passback, "exempt", ()) or ()),
+                )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1021,6 +1060,13 @@ class PipelineOrchestrator:
             logger.exception("Plate lookup failed for %s", plate)
             return self._record(camera, plate, Action.ERROR, confidence)
 
+        if verdict == PLATE_OK and self._passback_refuses(camera, plate):
+            # A registered vehicle, refused for coming back in without having
+            # left. Handled here rather than inside `authorization` because it
+            # is not a property of the plate record -- the same plate is
+            # perfectly welcome tomorrow, and at the exit camera right now.
+            verdict = PLATE_PASSBACK
+
         if verdict == PLATE_OK:
             try:
                 # Non-blocking by contract: the pulse happens on the relay's
@@ -1043,6 +1089,60 @@ class PipelineOrchestrator:
             "Camera %s: %s %s", camera, plate, _DENIAL_LOG.get(verdict, "denied")
         )
         return self._record(camera, plate, Action.DENIED, confidence)
+
+    def _passback_refuses(self, camera: str, plate: str) -> bool:
+        """Is this an entry by a vehicle the log says is already inside?
+
+        Four ways to answer no before the database is touched, in the order
+        that matters:
+
+        1. **The rule is off**, or an operator has raised the emergency bypass.
+        2. **This is not the entry camera.** The check never runs on an exit,
+           which is the safety rule the whole feature is built around: a
+           vehicle that cannot leave is a vehicle trapped behind a barrier, and
+           in a fire that is the failure that matters. Written as a guard here
+           rather than as care at the call site, so a future edit to
+           :meth:`decide` cannot reach it from the exit path by accident.
+        3. **The plate is exempt** -- a service vehicle, the site manager.
+        4. **Nothing granted in the window**, or the last grant was an exit.
+
+        A database failure answers *no*. The rule is a refinement on top of an
+        already-granted plate, and letting a lookup error close the barrier on
+        a resident would trade a rare abuse for a common outage.
+        """
+        config = self._passback
+        if config is None or not getattr(config, "enabled", False):
+            return False
+        if getattr(config, "emergency_bypass", False):
+            logger.debug("Anti-passback bypassed for %s (emergency_bypass)", plate)
+            return False
+        if str(camera) != CameraRole.ENTRY.value:
+            return False
+        if plate in (getattr(config, "exempt", frozenset()) or frozenset()):
+            logger.debug("Anti-passback: %s is exempt", plate)
+            return False
+
+        window = max(1.0, float(getattr(config, "window_s", 0.0)))
+        since = (
+            datetime.now(timezone.utc) - timedelta(seconds=window)
+        ).isoformat(timespec="seconds")
+
+        try:
+            last = self._logs.last_granted_camera(plate, since)
+        except Exception:
+            logger.exception("Anti-passback lookup failed for %s; allowing", plate)
+            return False
+
+        if last != CameraRole.ENTRY.value:
+            return False
+
+        logger.info(
+            "Anti-passback: %s was granted entry within the last %.0f min and has "
+            "no recorded exit; refusing re-entry",
+            plate,
+            window / 60.0,
+        )
+        return True
 
     def _record(
         self, camera: str, plate: str, action: Action, confidence: float

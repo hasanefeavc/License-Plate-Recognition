@@ -2999,3 +2999,180 @@ def test_the_auth_path_uses_the_overridden_repository(api_app: Any) -> None:
 
     assert response.status_code == 200
     assert seen == ["mudur"], "the override was bypassed"
+
+
+# ---------------------------------------------------------------------------
+# Viewer role: read everything, change nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def viewer_token() -> str:
+    return create_token("watcher", "viewer")
+
+
+VIEWER_READS = [
+    ("get", "/api/plates"),
+    ("get", "/api/stats"),
+    ("get", "/api/metrics"),
+    ("get", "/api/cameras"),
+    ("get", "/api/logs"),
+    # /api/parking is deliberately absent: FakeLogRepository has no
+    # occupancy_since, so the route 500s for every role. That is a gap in the
+    # test double, not in the viewer role, and asserting around it here would
+    # only hide it.
+]
+
+VIEWER_WRITES = [
+    ("post", "/api/relay/trigger", None),
+    ("post", "/api/plates", {"plate": "34ABC123"}),
+    ("delete", "/api/plates/34ABC123", None),
+    ("patch", "/api/plates/34ABC123", {"owner": "yeni"}),
+    ("put", "/api/parking", {"capacity": 50}),
+    ("post", "/api/pipeline/pause", None),
+    ("post", "/api/pipeline/resume", None),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), VIEWER_READS)
+def test_a_viewer_may_read(
+    api_client: TestClient, viewer_token: str, method: str, path: str
+) -> None:
+    """The role exists so a gatehouse attendant can watch the feed and look up
+    a pass without also being handed the gate-open button."""
+    response = getattr(api_client, method)(path, headers=auth(viewer_token))
+    assert response.status_code != 403, response.text
+    assert response.status_code < 500, response.text
+
+
+@pytest.mark.parametrize(("method", "path", "body"), VIEWER_WRITES)
+def test_a_viewer_may_not_write(
+    api_client: TestClient,
+    viewer_token: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+) -> None:
+    """Every mutation, refused at the dependency rather than per handler."""
+    kwargs: dict[str, Any] = {"headers": auth(viewer_token)}
+    if body is not None:
+        kwargs["json"] = body
+    response = getattr(api_client, method)(path, **kwargs)
+    assert response.status_code == 403, f"{method} {path} -> {response.status_code}"
+    assert "salt okunur" in response.json()["error"]["detail"]
+
+
+def test_a_viewer_may_not_open_the_barrier(
+    api_client: TestClient, viewer_token: str
+) -> None:
+    """Named on its own because it is the reason the role exists.
+
+    Before it, an attendant who needed to read the pass log had to be given
+    `operator`, which carries manual gate control.
+    """
+    response = api_client.post("/api/relay/trigger", headers=auth(viewer_token))
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("post", "/api/users", {"username": "x", "password": "y" * 12, "role": "viewer"}),
+        ("delete", "/api/users/someone", None),
+    ],
+)
+def test_a_viewer_may_not_manage_users(
+    api_client: TestClient,
+    viewer_token: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+) -> None:
+    kwargs: dict[str, Any] = {"headers": auth(viewer_token)}
+    if body is not None:
+        kwargs["json"] = body
+    assert getattr(api_client, method)(path, **kwargs).status_code == 403
+
+
+def test_an_operator_may_still_write(
+    api_client: TestClient, operator_token: str
+) -> None:
+    """The guard is a floor, not a narrowing: nothing an operator could do
+    before may have been taken away."""
+    response = api_client.post("/api/relay/trigger", headers=auth(operator_token))
+    assert response.status_code != 403, response.text
+
+
+def test_an_admin_may_still_write(api_client: TestClient, admin_token: str) -> None:
+    response = api_client.post("/api/relay/trigger", headers=auth(admin_token))
+    assert response.status_code != 403, response.text
+
+
+def test_a_token_with_an_unknown_role_gets_the_least_authority(
+    api_client: TestClient,
+) -> None:
+    """A role this build has never heard of -- a downgrade, a typo, a forged
+    claim -- must rank below everything, not above it."""
+    token = create_token("stranger", "superuser")
+    assert api_client.post("/api/relay/trigger", headers=auth(token)).status_code == 403
+
+
+def test_whoami_reports_the_viewer_role(
+    api_client: TestClient, viewer_token: str
+) -> None:
+    response = api_client.get("/api/auth/me", headers=auth(viewer_token))
+    assert response.status_code == 200
+    assert response.json()["role"] == "viewer"
+
+
+# ---------------------------------------------------------------------------
+# Login rate limiting
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_bad_logins_are_eventually_refused_with_429(
+    api_client: TestClient, api_app: Any
+) -> None:
+    """The endpoint had no limit at all; argon2 alone does not stop guessing."""
+    from lpr.api.ratelimit import LoginLimiter
+
+    api_app.state.login_limiter = LoginLimiter(lockout_after=3)
+    body = {"username": "admin", "password": "wrong"}
+
+    for _ in range(3):
+        assert api_client.post("/api/auth/login", json=body).status_code == 401
+
+    refused = api_client.post("/api/auth/login", json=body)
+    assert refused.status_code == 429
+    assert "Retry-After" in refused.headers
+
+
+def test_the_lockout_response_says_how_long_to_wait(
+    api_client: TestClient, api_app: Any
+) -> None:
+    from lpr.api.ratelimit import LoginLimiter
+
+    api_app.state.login_limiter = LoginLimiter(lockout_after=1)
+    body = {"username": "admin", "password": "wrong"}
+    api_client.post("/api/auth/login", json=body)
+
+    refused = api_client.post("/api/auth/login", json=body)
+    assert refused.status_code == 429
+    assert int(refused.headers["Retry-After"]) >= 1
+    assert "saniye" in refused.json()["error"]["detail"]
+
+
+def test_a_lockout_does_not_leak_whether_the_account_exists(
+    api_client: TestClient, api_app: Any
+) -> None:
+    """Both a real and an invented username must look the same before lockout.
+
+    Telling an attacker which usernames are real halves their work.
+    """
+    from lpr.api.ratelimit import LoginLimiter
+
+    api_app.state.login_limiter = LoginLimiter(lockout_after=10)
+    real = api_client.post("/api/auth/login", json={"username": "admin", "password": "x"})
+    fake = api_client.post("/api/auth/login", json={"username": "nobody", "password": "x"})
+    assert real.status_code == fake.status_code == 401
+    assert real.json()["error"]["detail"] == fake.json()["error"]["detail"]

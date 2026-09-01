@@ -836,7 +836,7 @@ def test_the_engine_socket_is_parameterised() -> None:
     the service, so the rebuild would replace an image nothing is using.
     """
     compose = (
-        Path(__file__).resolve().parents[1] / "docker" / "docker-compose.yml"
+        Path(__file__).resolve().parents[1] / "docker" / "docker-compose.ota.yml"
     ).read_text(encoding="utf-8")
     assert (
         "${LPR_DOCKER_SOCK:-/run/user/1000/podman/podman.sock}"

@@ -737,6 +737,58 @@ class SnapshotsConfig(BaseModel):
         return int(self.min_free_mb) * 1024 * 1024
 
 
+class AntiPassbackConfig(BaseModel):
+    """Refuse a second entry for a vehicle that never logged an exit.
+
+    The abuse this stops is the oldest one in access control: a resident drives
+    in, hands their car (or their plate) to somebody at the kerb, and a second
+    vehicle enters on the same permit. Nothing in the plate list can see it --
+    the plate is genuinely registered both times.
+
+    **This never blocks an exit.** Not as a policy choice, as a safety rule: a
+    vehicle that cannot leave is a vehicle trapped behind a barrier, and in a
+    fire that is the failure that matters. The rule is only ever consulted at
+    the entry camera, and :meth:`~lpr.pipeline.orchestrator.PipelineOrchestrator.decide`
+    is written so an exit cannot reach it.
+
+    It also needs both cameras to be fitted. On the single-camera site the
+    shipped config describes, no exit is ever recorded, so every vehicle would
+    look permanently inside and its second visit would be refused -- which is
+    why this is off by default and why the orchestrator says so at start-up
+    rather than silently doing nothing.
+    """
+
+    enabled: bool = False
+    #: How long a vehicle is considered inside without an exit.
+    #:
+    #: A missed exit read -- a plate obscured by a following car, a camera
+    #: cleaning its lens -- must not strand a resident for ever, so the state
+    #: expires. 12 hours covers a working day and clears overnight, which is
+    #: the shape of an office or residential site. A long-stay car park wants
+    #: this longer; a retail one wants it shorter.
+    window_s: float = Field(default=43_200.0, gt=0)
+    #: Master override. Turning this on suspends the rule without losing its
+    #: configuration -- for an event, an evacuation, or an operator working
+    #: through a queue of vehicles the system has got wrong.
+    #:
+    #: Separate from ``enabled`` on purpose: an operator flipping this in a
+    #: hurry must not have to remember what the site's settings were in order
+    #: to put them back.
+    emergency_bypass: bool = False
+    #: Plates the rule never applies to: service vehicles, the site manager,
+    #: anything that legitimately comes and goes without a clean pairing.
+    exempt_plates: list[str] = Field(default_factory=list)
+
+    @property
+    def exempt(self) -> frozenset[str]:
+        """``exempt_plates`` normalised the way the database stores plates."""
+        return frozenset(
+            "".join(str(plate).split()).upper()
+            for plate in self.exempt_plates
+            if str(plate).strip()
+        )
+
+
 class ParkingConfig(BaseModel):
     """Site capacity, used for the "vehicles inside / capacity" counter."""
 
@@ -916,6 +968,7 @@ class Settings(BaseSettings):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     snapshots: SnapshotsConfig = Field(default_factory=SnapshotsConfig)
     parking: ParkingConfig = Field(default_factory=ParkingConfig)
+    anti_passback: AntiPassbackConfig = Field(default_factory=AntiPassbackConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     #: HMAC secret for **per-operator** licence keys, from ``LPR_LICENSE_SECRET``.
     #:

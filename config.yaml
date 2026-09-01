@@ -238,6 +238,30 @@ snapshots:
 parking:
   capacity: 100
 
+# Refuse a second entry for a vehicle the log says never left. Stops the oldest
+# abuse in access control: a resident drives in and hands the car (or the
+# plate) to somebody at the kerb.
+#
+# OFF by default, and it must stay off on a single-camera site. With no exit
+# camera no exit is ever recorded, so every vehicle would look permanently
+# inside and its second visit would be refused -- the orchestrator detects that
+# and disables the rule with a warning rather than letting it happen.
+#
+# This NEVER blocks an exit. Not a policy choice: a vehicle that cannot leave
+# is a vehicle trapped behind a barrier, and in a fire that is the failure that
+# matters.
+anti_passback:
+  enabled: false
+  # How long a vehicle counts as inside without an exit. A missed exit read --
+  # a plate obscured by a following car -- must not strand a resident for ever,
+  # so the state expires. 12 h covers a working day and clears overnight.
+  window_s: 43200
+  # Master override, separate from `enabled` so an operator flipping it in a
+  # hurry does not have to remember the site's settings to put them back.
+  emergency_bypass: false
+  # Plates the rule never applies to: service vehicles, the site manager.
+  exempt_plates: []
+
 api:
   host: 0.0.0.0
   port: 8000

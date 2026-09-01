@@ -1,0 +1,20 @@
+# USB (V4L2) cameras.
+#
+# The base file passes no devices, so a site with no capture card -- an
+# RTSP-only installation, which is most of them -- starts cleanly. Compose
+# fails container-create on a device node that does not exist, so hard-coding
+# /dev/video0 and /dev/video1 there meant those sites could not start at all.
+#
+# List the nodes this site actually has:
+#   v4l2-ctl --list-devices
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.usb.yml up -d
+#
+# Access comes from the `video` supplementary group in the base file, not from
+# running as root. Set LPR_VIDEO_GID if the host's gid is not 44.
+services:
+  lpr-api:
+    devices:
+      - "/dev/video0:/dev/video0"

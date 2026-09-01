@@ -1,0 +1,83 @@
+# Reverse proxy for the LPR API.
+#
+# {$LPR_DOMAIN} decides how certificates are obtained, and the two cases need
+# no configuration switch:
+#
+#   a public hostname (gate.example.com)  -> Let's Encrypt, automatically
+#   a local name (gate.local, localhost)  -> Caddy's own CA, automatically
+#
+# For the local case, install the root certificate on each operator machine
+# once. Extract it with:
+#   docker compose ... exec proxy cat \
+#     /data/caddy/pki/authorities/local/root.crt > root.crt
+
+{
+	# Blank is fine: Caddy still issues certificates without an ACME account
+	# e-mail, it just cannot send expiry warnings.
+	email {$LPR_ACME_EMAIL}
+
+	# The API is behind this proxy, so its own access log is the only one that
+	# sees a client address. Keep both.
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$LPR_DOMAIN} {
+	encode gzip
+
+	header {
+		# One year, and only meaningful once the site is genuinely HTTPS-only:
+		# a browser that sees this header will refuse plain HTTP to this host
+		# for a year, including if you later turn TLS off. Deliberate --
+		# downgrade protection is the point -- but it is the one header here
+		# that is hard to walk back.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# The dashboard is self-contained: its own scripts, styles and MJPEG
+		# stream, no CDN. So the policy can be strict rather than the usual
+		# unsafe-inline soup.
+		#
+		# 'unsafe-inline' for style-src only: the live view sets element
+		# styles from JavaScript as frames arrive, and hashing those is not
+		# workable. Scripts get no such exemption, which is where injection
+		# actually matters.
+		Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+
+		# Clickjacking. frame-ancestors above is the modern spelling; this is
+		# for browsers that do not implement it.
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+
+		# The dashboard needs none of these. A gate controller has no business
+		# asking for a microphone.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+
+		# Do not advertise the stack to a scanner.
+		-Server
+		-X-Powered-By
+	}
+
+	reverse_proxy lpr-api:8000 {
+		# The MJPEG live view and the event WebSocket are both long-lived.
+		# Caddy streams by default; these keep an idle stream from being cut.
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+
+		# So the API's rate limiter sees the real client, not the proxy. It
+		# reads X-Forwarded-For; without this every request would come from
+		# one address and one brute-force attempt would lock out the site.
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

@@ -748,7 +748,7 @@ class RegisterIn(BaseModel):
 
     username: str = Field(min_length=3, max_length=64, examples=["operator1"])
     password: str = Field(min_length=4, max_length=256, examples=["s3cret!"])
-    role: Literal["admin", "operator"] = Field(default="operator", examples=["operator"])
+    role: Literal["admin", "operator", "viewer"] = Field(default="operator", examples=["operator"])
 
     @field_validator("username", mode="before")
     @classmethod
@@ -1002,7 +1002,7 @@ class UserCreateIn(BaseModel):
 
     username: str = Field(min_length=3, max_length=40, examples=["bekci"])
     password: str = Field(min_length=8, max_length=128)
-    role: Literal["admin", "operator"] = Field(default="operator")
+    role: Literal["admin", "operator", "viewer"] = Field(default="operator")
     #: Session length for this account, in minutes. ``None`` inherits the
     #: policy for the role (365 days for an admin, one 8-hour shift for an
     #: operator), which is what makes the policy retunable centrally.

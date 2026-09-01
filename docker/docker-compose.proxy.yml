@@ -1,0 +1,68 @@
+# TLS termination, security headers and the public port.
+#
+# The API speaks plain HTTP and issues bearer JWTs. Without something in front
+# of it, those tokens -- and every gate-open command -- cross the site LAN in
+# clear text, where any device on the same network can read one and open the
+# barrier. This overlay is the supported answer.
+#
+# Caddy rather than nginx because certificates are the part sites get wrong.
+# Caddy obtains and renews them itself: a public hostname gets Let's Encrypt
+# automatically, and an internal-only site gets a certificate from Caddy's own
+# CA (see proxy/Caddyfile) with no cron job and no expiry outage eighteen
+# months later.
+#
+# Usage:
+#   LPR_DOMAIN=gate.example.com LPR_ACME_EMAIL=ops@example.com \
+#     docker compose -f docker/docker-compose.yml \
+#                    -f docker/docker-compose.proxy.yml up -d
+#
+# Internal site with no public DNS -- Caddy issues its own certificate and you
+# install proxy/root.crt on the operator machines once:
+#   LPR_DOMAIN=gate.local docker compose ... up -d
+
+services:
+  lpr-api:
+    # Joins the proxy's network so Caddy can reach it by name.
+    #
+    # The base file's port stays as it is, and that is safe rather than an
+    # oversight: it publishes to 127.0.0.1 only, so it is reachable from the
+    # host shell and from nowhere on the LAN. Removing it would need Compose's
+    # `!reset` tag, which requires v2.24+ -- too narrow a floor for a product
+    # that ships to whatever the site already runs.
+    #
+    # If LPR_BIND was set to 0.0.0.0, unset it when using this overlay: a
+    # plaintext port on every interface beside the encrypted one is how a TLS
+    # deployment ends up serving both.
+    networks:
+      - lpr
+
+  proxy:
+    image: caddy:2-alpine
+    container_name: lpr-proxy
+    restart: unless-stopped
+    depends_on:
+      - lpr-api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      LPR_DOMAIN: ${LPR_DOMAIN:-localhost}
+      LPR_ACME_EMAIL: ${LPR_ACME_EMAIL:-}
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account keys. Losing this volume means
+      # re-issuing on every restart, which hits Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - lpr
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  lpr:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

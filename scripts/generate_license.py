@@ -34,6 +34,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -127,6 +128,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print only the token, nothing else (for piping).",
     )
     parser.add_argument(
+        "--bind",
+        default=None,
+        metavar="HWID_OR_JSON",
+        help="Bind this key to one machine. Takes the JSON the customer's "
+        "`lpr-hwid --json` prints. Without it the key works on any machine.",
+    )
+    parser.add_argument(
+        "--bind-here",
+        action="store_true",
+        help="Bind to the machine running this command. For a vendor-installed "
+        "box; on your own laptop it produces a key the customer cannot use.",
+    )
+    parser.add_argument(
         "--verify",
         metavar="TOKEN",
         default=None,
@@ -165,12 +179,20 @@ def generate(
     note: str,
     private_key: bytes | str,
     issued_at: datetime | None = None,
+    binding: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Sign one licence. Returns ``(token, claims)``.
 
     ``exp`` is the whole mechanism: it is what the offline verifier compares
     the system clock against, and it is inside the signature, so it cannot be
     edited without the private key -- which exists only on this machine.
+
+    ``binding`` carries the customer's machine fingerprint components. With
+    it the key is a site licence; without it the key is a bearer token that
+    works on every machine it is copied to, which is the right shape for an
+    evaluation and the wrong shape for a sale. The components are already
+    hashed by :mod:`lpr.machine` before they reach here, so a licence file
+    never carries a customer's MAC address or serial numbers in the clear.
     """
     now = issued_at or datetime.now(timezone.utc)
     expires = now + timedelta(days=days)
@@ -185,10 +207,72 @@ def generate(
         "nbf": int(now.timestamp()),
         "exp": int(expires.timestamp()),
     }
+    for name, value in (binding or {}).items():
+        if value:
+            claims[name] = str(value)
     token = jwt.encode(claims, private_key, algorithm=ALGORITHM)
     if isinstance(token, bytes):  # pragma: no cover - PyJWT 1.x
         token = token.decode("utf-8")
     return token, claims
+
+
+def resolve_binding(args: argparse.Namespace) -> dict[str, str] | None:
+    """Turn ``--bind`` / ``--bind-here`` into fingerprint claims.
+
+    ``--bind`` takes what the customer's ``lpr-hwid --json`` printed: an object
+    of already-hashed components. It is validated rather than trusted, because
+    a mistyped paste that silently produced an unbound key would be a licence
+    that works everywhere, and nothing downstream would ever complain.
+    """
+    if args.bind and args.bind_here:
+        raise ValueError("--bind and --bind-here are mutually exclusive.")
+
+    if args.bind_here:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        from lpr.machine import current_fingerprint
+
+        fingerprint = current_fingerprint()
+        if not fingerprint.bindable:
+            raise ValueError(
+                "This machine exposes too few fingerprint components to bind to "
+                f"({fingerprint.describe()}). Issue an unbound key instead."
+            )
+        print(f"[license] binding to this machine: {fingerprint.describe()}")
+        return fingerprint.to_claims()
+
+    if not args.bind:
+        return None
+
+    raw = args.bind.strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "--bind expects the JSON object from `lpr-hwid --json`, not a bare "
+            f"hwid string ({exc})."
+        ) from None
+
+    if not isinstance(parsed, dict):
+        raise ValueError("--bind JSON must be an object of fingerprint components.")
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from lpr.machine import COMPONENTS, MATCH_THRESHOLD
+
+    components = {
+        name: str(parsed[name]).strip()
+        for name in COMPONENTS
+        if parsed.get(name) and str(parsed[name]).strip()
+    }
+    if len(components) < MATCH_THRESHOLD:
+        raise ValueError(
+            f"--bind needs at least {MATCH_THRESHOLD} of {list(COMPONENTS)}; "
+            f"got {sorted(components) or 'none'}. A key bound to fewer could "
+            "never satisfy the match rule and would refuse to validate."
+        )
+    unknown = sorted(set(parsed) - set(COMPONENTS))
+    if unknown:
+        print(f"[license] ignoring unknown binding fields: {', '.join(unknown)}")
+    return components
 
 
 def token_fingerprint(token: str) -> str:
@@ -265,11 +349,18 @@ def main(argv: list[str] | None = None) -> int:
         print("[license] --client is required (the site this key is for).", file=sys.stderr)
         return 1
 
+    try:
+        binding = resolve_binding(args)
+    except ValueError as exc:
+        print(f"[license] {exc}", file=sys.stderr)
+        return 1
+
     token, claims = generate(
         days=args.days,
         client=args.client.strip(),
         note=args.note.strip(),
         private_key=private_key,
+        binding=binding,
     )
 
     if not args.no_history:

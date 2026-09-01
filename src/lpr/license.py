@@ -132,6 +132,11 @@ REASON_CLOCK_ROLLBACK: Final[str] = "clock_rollback"
 #: operator-facing meaning ("this install cannot verify licences") did not
 #: change with the key type.
 REASON_NO_KEY: Final[str] = "no_secret"
+#: The signature is good and the licence is in date, but it was issued for a
+#: different machine. Distinct from ``invalid`` on purpose: this is the one
+#: refusal with a remedy the customer can act on, and telling them "geçersiz"
+#: sends them looking for a typo in a key that is perfectly well-formed.
+REASON_MACHINE_MISMATCH: Final[str] = "machine_mismatch"
 
 _DETAILS: Final[dict[str, str]] = {
     REASON_OK: "Lisans geçerli.",
@@ -144,6 +149,10 @@ _DETAILS: Final[dict[str, str]] = {
     ),
     REASON_NO_KEY: (
         "Lisans doğrulama anahtarı (public_key.pem) bulunamadı veya okunamadı."
+    ),
+    REASON_MACHINE_MISMATCH: (
+        "Bu lisans anahtarı başka bir makine için verilmiş. Donanım değiştiyse "
+        "yeni makine kimliğinizle (hwid) yeniden bağlama talep edin."
     ),
 }
 
@@ -177,6 +186,13 @@ class LicenseStatus:
     issued_at: str | None = None
     expires_at: str | None = None
     seconds_remaining: float | None = None
+    #: This machine's id, so an operator can quote it in a rebind request
+    #: without running a separate tool. Present on every status, not only on a
+    #: mismatch: the moment somebody needs it is the moment the gate is down.
+    hwid: str | None = None
+    #: Components the licence names that do not match this machine. Empty for
+    #: an unbound licence and for one that matches.
+    machine_mismatch: tuple[str, ...] = ()
 
     @property
     def days_remaining(self) -> float | None:
@@ -194,6 +210,8 @@ class LicenseStatus:
             "expires_at": self.expires_at,
             "seconds_remaining": self.seconds_remaining,
             "days_remaining": self.days_remaining,
+            "hwid": self.hwid,
+            "machine_mismatch": list(self.machine_mismatch),
         }
 
     @classmethod
@@ -421,15 +439,90 @@ def validate_token(
             return LicenseStatus.failure(REASON_EXPIRED, seconds_remaining=0.0, **display)
 
     subject = verified.get("client") or verified.get("sub")
+    display = {
+        "client": str(subject) if subject else None,
+        "issued_at": _iso(verified.get("iat")),
+        "expires_at": _iso(expires),
+    }
+
+    # The binding is checked last, and only on a token that is otherwise good.
+    # A forged or expired key must not be told which machine it would have had
+    # to come from, and an operator must not be sent chasing a hardware
+    # problem when the real fault is an expired licence.
+    fingerprint = _machine_fingerprint()
+    claimed = {name: str(verified[name]) for name in _BINDING_CLAIMS if verified.get(name)}
+    matched, agreeing, mismatched = _machine_matches(claimed, fingerprint)
+    if not matched:
+        logger.warning(
+            "Lisans bu makine için değil: %d bileşen eşleşti, uyuşmayan: %s",
+            agreeing,
+            ", ".join(mismatched) or "-",
+        )
+        return LicenseStatus.failure(
+            REASON_MACHINE_MISMATCH,
+            seconds_remaining=remaining,
+            hwid=fingerprint.hwid if fingerprint else None,
+            machine_mismatch=tuple(mismatched),
+            **display,
+        )
+
     return LicenseStatus(
         valid=True,
         reason=REASON_OK,
         detail=_DETAILS[REASON_OK],
-        client=str(subject) if subject else None,
-        issued_at=_iso(verified.get("iat")),
-        expires_at=_iso(expires),
         seconds_remaining=remaining,
+        hwid=fingerprint.hwid if fingerprint else None,
+        **display,
     )
+
+
+#: Claim names carrying the hardware binding. Mirrors
+#: :data:`lpr.machine.COMPONENTS`; imported lazily so this module keeps
+#: importing on a host where the fingerprint readers cannot run at all.
+_BINDING_CLAIMS: Final[tuple[str, ...]] = ("machine_id", "mac", "board")
+
+
+def _machine_fingerprint() -> Any:
+    """This machine's fingerprint, or ``None`` when it cannot be read.
+
+    Never raises. Fingerprinting is a *refusal* mechanism, and one that could
+    take the service down by failing to read a sysfs file would be a worse
+    liability than the copying it prevents.
+    """
+    try:
+        from lpr.machine import current_fingerprint
+
+        return current_fingerprint()
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Makine parmak izi okunamadı", exc_info=True)
+        return None
+
+
+def _machine_matches(claimed: dict[str, str], fingerprint: Any) -> tuple[bool, int, list[str]]:
+    """Whether a licence's binding names this machine.
+
+    An unbound licence (no binding claims) matches everything -- the vendor
+    chose to issue it that way, and that decision belongs at issue time.
+
+    A bound licence on a host whose fingerprint cannot be read at all is
+    **accepted**, deliberately. The alternative is that an unreadable sysfs
+    after a kernel upgrade closes a customer's gate, and a fingerprint that
+    cannot be read is not evidence of a copy.
+    """
+    if not claimed:
+        return True, 0, []
+    if fingerprint is None:
+        logger.warning(
+            "Lisans makineye bağlı ama parmak izi okunamadı; bağ denetimi atlanıyor."
+        )
+        return True, 0, []
+    try:
+        from lpr.machine import fingerprint_matches
+
+        return fingerprint_matches(claimed, fingerprint)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Makine bağı denetlenemedi", exc_info=True)
+        return True, 0, []
 
 
 # ---------------------------------------------------------------------------

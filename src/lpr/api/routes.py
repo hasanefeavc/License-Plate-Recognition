@@ -36,6 +36,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
 from lpr.api import deps
+from lpr.api.ratelimit import client_address
 from lpr.api.schemas import (
     CameraSourceIn,
     CameraStatusOut,
@@ -81,6 +82,7 @@ from lpr.api.security import (
     license_forbidden,
     license_refusal,
     require_admin,
+    require_licensed_operator,
     require_license,
     token_ttl_seconds,
     user_from_token,
@@ -124,6 +126,11 @@ AdminUser = Annotated[AuthUser, Depends(require_admin)]
 #: Authenticated, and licensed if the role needs one. Everything that *operates*
 #: the site uses this; only account management stays admin-only.
 LicensedUser = Annotated[AuthUser, Depends(require_license)]
+#: A licensed account that may also *change* something. Everything that writes
+#: -- the plate list, the barrier, the pipeline's paused state, the site
+#: configuration -- takes this instead of LicensedUser, so a read-only viewer
+#: is refused at the dependency rather than at each handler's own discretion.
+WritingUser = Annotated[AuthUser, Depends(require_licensed_operator)]
 
 
 def app_version() -> str:
@@ -302,7 +309,7 @@ async def health(request: Request, user_repo: deps.UserRepo) -> HealthOut:
     tags=["auth"],
     summary="Giriş yap",
 )
-async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
+async def login(request: Request, payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
     """Exchange credentials for a bearer token.
 
     Two things have to be true, and they are different questions. The password
@@ -321,14 +328,49 @@ async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
     None of this touches the barrier: a resident's plate keeps working while
     the account it is recorded against cannot log in. See
     :meth:`lpr.db.repository.PlateRepository.authorization`.
+
+    Rate limited by address and locked out progressively by username -- see
+    :mod:`lpr.api.ratelimit`. The check happens *before* the password is
+    verified, so a locked account costs no argon2 hash: argon2 is expensive by
+    design, and making an attacker pay for it only helps while we are not
+    paying it too.
     """
+    limiter = deps.get_login_limiter(request)
+    address = client_address(request)
+
+    decision = limiter.check(address, payload.username)
+    if not decision.allowed:
+        _record_auth_event(
+            "login_throttled",
+            f"Giriş engellendi ({decision.reason}): {payload.username} / {address}",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                "Çok fazla başarısız giriş denemesi. "
+                f"{decision.retry_after_header} saniye sonra tekrar deneyin."
+            ),
+            headers={"Retry-After": decision.retry_after_header},
+        )
+
+    limiter.record_attempt(address)
     user = await _in_thread(authenticate_user, user_repo, payload.username, payload.password)
     if user is None:
+        locked = limiter.record_failure(address, payload.username)
+        if not locked.allowed:
+            _record_auth_event(
+                "login_lockout",
+                f"Hesap kilitlendi: {payload.username} "
+                f"({locked.retry_after_header} sn, kaynak {address})",
+                level="warning",
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Kullanıcı adı veya parola hatalı",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    limiter.record_success(address, payload.username)
 
     # Only after the password checked out. Activating on an unauthenticated
     # request would let anyone holding a key burn it against any username.
@@ -348,6 +390,22 @@ async def login(payload: LoginIn, user_repo: deps.UserRepo) -> TokenOut:
         username=user.username,
         role=user.role,
     )
+
+
+def _record_auth_event(source: str, message: str, level: str = "info") -> None:
+    """Write one authentication event to the admin trail. Never raises.
+
+    A brute-force attempt nobody can see afterwards is only half-defended, so
+    throttles and lockouts land in ``system_events`` where an admin reviews
+    them -- but the audit trail is not on the control path, and a database
+    hiccup must not turn a refused login into a 500.
+    """
+    try:
+        from lpr.db import SystemEventRepository
+
+        SystemEventRepository().write(source=source, message=message, level=level)
+    except Exception:  # pragma: no cover - the trail is never load-bearing
+        logger.debug("Kimlik doğrulama olayı kaydedilemedi", exc_info=True)
 
 
 async def _account_ttl(user_repo: Any, username: str) -> int | None:
@@ -654,7 +712,7 @@ def _plate_records(plate_repo: Any) -> list[dict[str, Any]]:
     tags=["plates"],
     summary="Plaka ekle",
 )
-async def add_plate(payload: PlateIn, _: LicensedUser, plate_repo: deps.PlateRepo) -> PlateOut:
+async def add_plate(payload: PlateIn, _: WritingUser, plate_repo: deps.PlateRepo) -> PlateOut:
     """Register one plate, with resident details when the caller supplied them.
 
     Still a 409 on a duplicate rather than a silent overwrite: adding a plate
@@ -700,7 +758,7 @@ async def add_plate(payload: PlateIn, _: LicensedUser, plate_repo: deps.PlateRep
 )
 async def update_plate(
     payload: PlateUpdateIn,
-    _: LicensedUser,
+    _: WritingUser,
     plate_repo: deps.PlateRepo,
     plate: Annotated[str, Path(min_length=1, max_length=32, examples=["34ABC123"])],
 ) -> PlateDetailOut:
@@ -747,7 +805,7 @@ async def update_plate(
     summary="Plaka sil",
 )
 async def delete_plate(
-    _: LicensedUser,
+    _: WritingUser,
     plate_repo: deps.PlateRepo,
     plate: Annotated[str, Path(min_length=1, max_length=32, examples=["34ABC123"])],
 ) -> PlateOut:
@@ -911,7 +969,7 @@ async def parking_state(
 )
 async def set_parking_capacity(
     payload: ParkingIn,
-    user: LicensedUser,
+    user: WritingUser,
     log_repo: deps.LogRepo,
     meta_repo: deps.MetaRepo,
     settings: deps.AdminSettings,
@@ -1036,7 +1094,7 @@ async def cameras(request: Request, _: LicensedUser) -> list[CameraStatusOut]:
 )
 async def set_camera_source(
     request: Request,
-    _: LicensedUser,
+    _: WritingUser,
     camera: Annotated[str, Path(examples=["entry"])],
     payload: Annotated[CameraSourceIn, Body()],
 ) -> CameraStatusOut:
@@ -1062,7 +1120,7 @@ async def set_camera_source(
     tags=["pipeline"],
     summary="İşlemeyi duraklat",
 )
-async def pause_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
+async def pause_pipeline(request: Request, _: WritingUser) -> PipelineStateOut:
     # Remembered so releasing a licence hold does not undo a deliberate pause.
     request.app.state.manual_paused = True
     paused = deps.set_paused(request.app, True)
@@ -1076,7 +1134,7 @@ async def pause_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
     tags=["pipeline"],
     summary="İşlemeye devam et",
 )
-async def resume_pipeline(request: Request, _: LicensedUser) -> PipelineStateOut:
+async def resume_pipeline(request: Request, _: WritingUser) -> PipelineStateOut:
     request.app.state.manual_paused = False
     # Deliberately not gated on the deployment licence any more: access control
     # is the per-user model, and an installation-wide expiry that leaves an
@@ -1165,7 +1223,7 @@ async def submit_license(
 )
 async def trigger_relay(
     request: Request,
-    user: LicensedUser,
+    user: WritingUser,
     log_repo: deps.LogRepo,
 ) -> RelayTriggerOut:
     """Open the gate by hand and record it as a ``granted`` event for plate
@@ -1397,7 +1455,7 @@ async def system_update_status(request: Request, _: LicensedUser) -> SystemUpdat
 )
 async def system_update(
     request: Request,
-    user: LicensedUser,
+    user: WritingUser,
     payload: SystemUpdateIn | None = None,
 ) -> SystemUpdateOut:
     """Pull from the configured remote and rebuild the stack. Admin only.
@@ -1499,7 +1557,7 @@ def _export_stamp() -> str:
     summary="Plakaları CSV ile içe aktar",
 )
 async def import_plates(
-    _: LicensedUser,
+    _: WritingUser,
     plate_repo: deps.PlateRepo,
     file: Annotated[
         UploadFile,

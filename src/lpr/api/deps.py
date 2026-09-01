@@ -250,3 +250,20 @@ SystemUpdaterDep = Annotated[Any, Depends(get_system_updater)]
 SystemEventRepo = Annotated[Any, Depends(get_system_event_repository)]
 Pipeline = Annotated[Any, Depends(get_pipeline)]
 OptionalPipeline = Annotated[Any, Depends(get_pipeline_optional)]
+
+
+def get_login_limiter(request: Any) -> Any:
+    """The process-wide login rate limiter, created on first use.
+
+    Held on ``app.state`` rather than as a module global so a test app and the
+    real one never share lockout state -- one test locking an account would
+    otherwise leak into every test after it.
+    """
+    from lpr.api.ratelimit import LoginLimiter
+
+    app = request.app
+    limiter = getattr(app.state, "login_limiter", None)
+    if limiter is None:
+        limiter = LoginLimiter()
+        app.state.login_limiter = limiter
+    return limiter

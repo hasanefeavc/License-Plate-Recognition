@@ -38,6 +38,22 @@ logger = logging.getLogger(__name__)
 ALGORITHM = "HS256"
 ADMIN_ROLE = "admin"
 OPERATOR_ROLE = "operator"
+#: Read-only. Sees the live view, the pass log and the occupancy count; may
+#: not touch the barrier, the plate list, the configuration or other accounts.
+#:
+#: This role exists because the alternative was worse. A gatehouse attendant
+#: who needs to watch the feed and look up "did that van come through" had no
+#: option but ``operator``, which also carries the manual gate-open button --
+#: so every site ended up handing barrier control to whoever needed to read a
+#: log.
+VIEWER_ROLE = "viewer"
+
+#: Every role the system knows, weakest first. Order is meaningful: it is what
+#: :func:`role_at_least` compares.
+ROLES: tuple[str, ...] = (VIEWER_ROLE, OPERATOR_ROLE, ADMIN_ROLE)
+
+#: Rank per role, for the comparison above.
+_ROLE_RANK = {name: index for index, name in enumerate(ROLES)}
 
 # auto_error=False so a missing header reaches our own handler and produces the
 # same JSON error envelope as everything else instead of FastAPI's default.
@@ -50,6 +66,11 @@ __all__ = [
     "AuthUser",
     "LICENSE_LAPSED_DETAIL",
     "OPERATOR_ROLE",
+    "ROLES",
+    "VIEWER_ROLE",
+    "require_licensed_operator",
+    "require_operator",
+    "role_at_least",
     "authenticate_user",
     "create_token",
     "current_user",
@@ -82,6 +103,31 @@ class AuthUser:
     @property
     def is_admin(self) -> bool:
         return self.role == ADMIN_ROLE
+
+    @property
+    def is_viewer(self) -> bool:
+        """Read-only. True only for the viewer role, never for admin.
+
+        Asked as "is this account restricted", not as "what rank is it", so it
+        stays correct if a role is ever inserted between viewer and operator.
+        """
+        return self.role == VIEWER_ROLE
+
+    @property
+    def can_write(self) -> bool:
+        """Whether this account may change anything at all."""
+        return role_at_least(self.role, OPERATOR_ROLE)
+
+
+def role_at_least(role: str | None, minimum: str) -> bool:
+    """Whether ``role`` is at least as privileged as ``minimum``.
+
+    An unknown role ranks below everything. That is the safe direction: a
+    token carrying a role this build has never heard of -- a downgrade, a
+    typo in a database row, a forged claim -- gets the least authority, not
+    the most.
+    """
+    return _ROLE_RANK.get(str(role or ""), -1) >= _ROLE_RANK.get(minimum, len(ROLES))
 
 
 def token_ttl_seconds(role: str | None = None, override_min: int | None = None) -> int:
@@ -281,6 +327,52 @@ async def require_admin(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Bu işlem için yönetici yetkisi gerekli",
+        )
+    return user
+
+
+async def require_licensed_operator(
+    user: Annotated[AuthUser, Depends(require_license)],
+) -> AuthUser:
+    """Holds a live licence **and** may write. The guard for every mutation.
+
+    Composed rather than duplicated: it depends on :func:`require_license`,
+    which depends on :func:`current_user`, so the licence check, the
+    revocation check and the role check happen in that order and each is
+    written once.
+
+    Order matters for the message the operator sees. A lapsed licence is
+    reported as a lapsed licence even for a viewer, because the dashboard
+    opens the licence dialog on that specific detail string -- telling a
+    viewer "you are read-only" when the real problem is an expired licence
+    would send them to the wrong place.
+    """
+    if not user.can_write:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bu hesap salt okunur (viewer); bu işlem için yetkisi yok",
+        )
+    return user
+
+
+async def require_operator(
+    user: Annotated[AuthUser, Depends(current_user)],
+) -> AuthUser:
+    """FastAPI dependency: 403 for a read-only viewer.
+
+    The guard on everything that *changes* something short of administration:
+    the plate list, the barrier, the pipeline's paused state. Admins pass it
+    too -- it is a floor, not an exact match.
+
+    Kept separate from :func:`require_admin` rather than folded into it,
+    because the two answer different questions. "May this account write" and
+    "may this account manage the installation" are the same for two roles out
+    of three and different for the one this exists for.
+    """
+    if not user.can_write:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bu hesap salt okunur (viewer); bu işlem için yetkisi yok",
         )
     return user
 
