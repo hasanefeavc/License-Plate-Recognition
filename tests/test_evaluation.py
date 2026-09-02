@@ -482,3 +482,50 @@ def test_the_summary_names_the_worst_pair() -> None:
 def test_a_clean_run_prints_no_confusion_block() -> None:
     metrics = score([EvalSample("a.jpg", "34ABC12", "34ABC12")])
     assert "character confusions" not in metrics.summary()
+
+
+def test_a_json_list_of_records_is_read_as_ground_truth(tmp_path: Path) -> None:
+    """The shape scripts/label_ocr_dataset.py writes.
+
+    A list rather than an object so the file stays ordered and a correction
+    diffs as one changed line rather than a reshuffled map.
+    """
+    from lpr.evaluation import load_ground_truth
+
+    path = tmp_path / "ocr_ground_truth.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"image_path": "data/snapshots/a.jpg", "plate": "34ABC123"},
+                {"image_path": "b.jpg", "plate": "06BZ1234"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert load_ground_truth(path) == {"a.jpg": "34ABC123", "b.jpg": "06BZ1234"}
+
+
+def test_a_null_plate_in_a_record_is_a_negative_not_the_string_none(tmp_path: Path) -> None:
+    from lpr.evaluation import load_ground_truth
+
+    path = tmp_path / "gt.json"
+    path.write_text(json.dumps([{"image_path": "a.jpg", "plate": None}]), encoding="utf-8")
+    assert load_ground_truth(path) == {"a.jpg": ""}
+
+
+def test_a_plate_written_with_spaces_still_matches_a_prediction(tmp_path: Path) -> None:
+    """Predictions are normalised, so a spaced label would score a total miss."""
+    from lpr.evaluation import load_ground_truth
+
+    path = tmp_path / "gt.json"
+    path.write_text(json.dumps([{"image_path": "a.jpg", "plate": "34 ABC 123"}]), encoding="utf-8")
+    assert load_ground_truth(path) == {"a.jpg": "34ABC123"}
+
+
+def test_the_object_form_of_a_json_truth_file_still_works(tmp_path: Path) -> None:
+    """The pre-existing shape must keep working; this is an addition, not a swap."""
+    from lpr.evaluation import load_ground_truth
+
+    path = tmp_path / "gt.json"
+    path.write_text(json.dumps({"a.jpg": "34ABC123", "b.jpg": ""}), encoding="utf-8")
+    assert load_ground_truth(path) == {"a.jpg": "34ABC123", "b.jpg": ""}

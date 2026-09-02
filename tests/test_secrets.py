@@ -130,7 +130,13 @@ REQUIRED_IGNORE_RULES = (
     "keys/",
     "*.pem",
     "*.key",
-    "data/",
+    # `data/*`, not `data/`. Git cannot re-include a path whose parent
+    # directory is excluded, and the hand-made OCR ground truth is the one file
+    # under data/ that belongs in the repository, so the rule has to be the
+    # glob form for the `!data/ocr_ground_truth.json` exception to bite. The
+    # two forms ignore exactly the same paths -- which the path-based test
+    # below asserts directly, on data/plates.db and data/public_key.pem.
+    "data/*",
     "models/",
     "*.pt",
     "*.pth",

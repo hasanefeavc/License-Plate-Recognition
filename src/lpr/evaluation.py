@@ -506,7 +506,10 @@ def load_ground_truth(path: str | Path) -> dict[str, str]:
     * ``CSV``/``TSV`` -- two columns, ``image`` and ``plate``. A header row is
       detected and skipped.
     * ``JSONL`` -- one ``{"image": ..., "plate": ...}`` object per line.
-    * ``JSON`` -- a single object mapping image name to plate.
+    * ``JSON`` -- either a single object mapping image name to plate, or a
+      list of ``{"image_path": ..., "plate": ...}`` records. The list form is
+      what ``scripts/label_ocr_dataset.py`` writes, and it is a list rather
+      than an object so the file stays ordered and diffs one line per image.
 
     An empty plate value marks a **negative** sample: an image with no plate,
     which is what makes the false-positive rate measurable. Only the basename
@@ -521,6 +524,13 @@ def load_ground_truth(path: str | Path) -> dict[str, str]:
         if isinstance(loaded, dict):
             for key, value in loaded.items():
                 mapping[Path(str(key)).name] = str(value or "").strip().upper()
+        elif isinstance(loaded, list):
+            for record in loaded:
+                if not isinstance(record, dict):
+                    continue
+                image = _record_image(record)
+                if image:
+                    mapping[Path(image).name] = _record_plate(record)
         return mapping
 
     for line in text.splitlines():
@@ -533,10 +543,9 @@ def load_ground_truth(path: str | Path) -> dict[str, str]:
                 record = json.loads(row)
             except json.JSONDecodeError:
                 continue
-            image = record.get("image") or record.get("file") or record.get("filename")
+            image = _record_image(record)
             if image:
-                plate = record.get("plate") or record.get("text") or ""
-                mapping[Path(str(image)).name] = str(plate).strip().upper()
+                mapping[Path(image).name] = _record_plate(record)
             continue
 
         parts = _split_row(row)
@@ -553,6 +562,38 @@ def load_ground_truth(path: str | Path) -> dict[str, str]:
         mapping[Path(image).name] = plate.strip().strip('"').upper()
 
     return mapping
+
+
+def _record_image(record: dict[str, object]) -> str:
+    """The image name a truth record refers to, or ``""``.
+
+    Several spellings because the same file gets written by this project's
+    labeller (``image_path``), by hand, and by exports from other tools.
+    """
+    for key in ("image_path", "image", "file", "filename", "path"):
+        value = record.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _record_plate(record: dict[str, object]) -> str:
+    """The plate a truth record asserts, uppercased. ``""`` marks a negative.
+
+    ``or ""`` rather than ``.get(key, "")`` on purpose: a record carrying
+    ``"plate": null`` means the same thing as one carrying ``""`` -- an image
+    with no plate on it -- and both must land as a negative rather than as the
+    string "None".
+    """
+    for key in ("plate", "text", "truth"):
+        if key in record:
+            # All whitespace removed, not just the ends. A plate written the
+            # way it is painted -- "34 ABC 123" -- denotes the same vehicle as
+            # "34ABC123", and every prediction it will be compared against has
+            # already been normalised, so keeping the spaces would score a
+            # correct label as a total miss and quietly report 0% accuracy.
+            return "".join(str(record.get(key) or "").split()).upper()
+    return ""
 
 
 def _split_row(row: str) -> list[str]:

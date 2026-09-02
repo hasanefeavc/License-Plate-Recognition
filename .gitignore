@@ -68,8 +68,21 @@ keys/
 # EasyOCR .pth weights sitting one directory down in models/easyocr/, which is
 # how they ended up in git without LFS. Fetch every weight with
 # scripts/fetch_models.py; nothing in models/ belongs in a commit.
-data/
+#
+# data/ is written as `data/*` rather than `data/` so a single file inside it
+# can be re-included below. Git cannot un-ignore a path whose *parent
+# directory* is excluded, so the directory form makes the negation silently do
+# nothing -- the file stays invisible and the exception looks like it works.
+data/*
 models/
+
+# The one exception. An OCR ground-truth set is hand-made: somebody looked at
+# every image and typed what the plate said. That is the most expensive and
+# least reproducible artefact in the project -- losing it means doing it again
+# -- and it is what every accuracy claim is measured against, so it belongs in
+# the repository with the code whose accuracy it defines. Written by
+# scripts/label_ocr_dataset.py; read by scripts/evaluate.py --truth.
+!data/ocr_ground_truth.json
 *.pt
 *.pt.bak
 *.pth
