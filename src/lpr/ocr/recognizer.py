@@ -426,6 +426,14 @@ class EasyOcrRecognizer(_BaseRecognizer):
         cfg = settings.ocr
         self.allowlist = cfg.allowlist
         self.width_ths = float(getattr(cfg, "width_ths", 0.5))
+        # getattr with a default throughout: a Settings built by an older
+        # config.yaml, or a test double, must not break the recogniser.
+        self.direct_recognize = bool(getattr(cfg, "direct_recognize", True))
+        self.decoder = str(getattr(cfg, "decoder", "beamsearch"))
+        self.beam_width = int(getattr(cfg, "beam_width", 5))
+        self.contrast_ths = float(getattr(cfg, "contrast_ths", 0.3))
+        self.adjust_contrast = float(getattr(cfg, "adjust_contrast", 0.5))
+        self.mag_ratio = float(getattr(cfg, "mag_ratio", 1.5))
         self.gpu = resolve_gpu_flag(getattr(cfg, "gpu", "auto"))
         self.model_dir = self._resolve_model_dir(settings)
 
@@ -554,22 +562,33 @@ class EasyOcrRecognizer(_BaseRecognizer):
             return dict(kwargs)
         return {name: value for name, value in kwargs.items() if name in parameters}
 
-    def _read_fragments(self, image: np.ndarray) -> list[tuple[str, float]]:
-        # width_ths controls how eagerly EasyOCR glues horizontally adjacent
-        # boxes into one before recognising them. Configurable because the
-        # right value depends on the plate format at the site; see
-        # ``OcrConfig.width_ths`` for which way it points.
-        results = self._reader.readtext(
-            image,
-            allowlist=self.allowlist,
-            detail=1,
-            paragraph=False,
-            width_ths=self.width_ths,
-        )
+    def _decoder_kwargs(self) -> dict[str, Any]:
+        """Arguments both read paths share."""
+        kwargs: dict[str, Any] = {
+            "allowlist": self.allowlist,
+            "detail": 1,
+            "paragraph": False,
+            "decoder": self.decoder,
+            "contrast_ths": self.contrast_ths,
+            "adjust_contrast": self.adjust_contrast,
+        }
+        # beamWidth is only consulted by the beam decoders; passing it with
+        # greedy is harmless but saying so is cheaper than explaining later.
+        if self.decoder != "greedy":
+            kwargs["beamWidth"] = self.beam_width
+        return kwargs
+
+    @staticmethod
+    def _fragments_from(results: Any) -> list[tuple[str, float]]:
+        """``(text, confidence)`` pairs from either EasyOCR result shape.
+
+        ``readtext`` yields ``(bbox, text, confidence)``; ``recognize`` yields
+        the same triple. Parsed defensively either way -- a malformed row is
+        skipped rather than allowed to take down a frame.
+        """
         fragments: list[tuple[str, float]] = []
         for item in results or []:
             try:
-                # (bbox, text, confidence)
                 text = str(item[1])
                 confidence = float(item[2]) if len(item) > 2 else 0.0
             except (IndexError, TypeError, ValueError):
@@ -577,6 +596,108 @@ class EasyOcrRecognizer(_BaseRecognizer):
             if text.strip():
                 fragments.append((text, confidence))
         return fragments
+
+    def _read_fragments(self, image: np.ndarray) -> list[tuple[str, float]]:
+        """Recognise one prepared view.
+
+        Tries the recognition head directly first. The crop was localised by
+        YOLO before it ever reached this class, so ``readtext`` would run
+        EasyOCR's CRAFT detector over an image that is already nothing but a
+        plate -- paying for a second localisation, and risking a box that clips
+        the leading or trailing glyph, which no downstream repair recovers.
+        ``recognize`` with no box list treats the whole image as a single line.
+
+        ``readtext`` stays as the fallback for the case the direct call comes
+        back empty: a crop with generous padding, or a rectified view with dark
+        borders, is sometimes genuinely better served by letting CRAFT find the
+        text inside it. The fallback means this change cannot lose a read --
+        the worst case is the old behaviour plus one cheap attempt.
+        """
+        if self.direct_recognize:
+            fragments = self._fragments_from(self._recognize_whole(image))
+            if fragments:
+                return fragments
+
+        # width_ths controls how eagerly EasyOCR glues horizontally adjacent
+        # boxes into one before recognising them. Configurable because the
+        # right value depends on the plate format at the site; see
+        # ``OcrConfig.width_ths`` for which way it points.
+        results = self._call_reader(
+            self._reader.readtext,
+            image,
+            width_ths=self.width_ths,
+            mag_ratio=self.mag_ratio,
+            **self._decoder_kwargs(),
+        )
+        return self._fragments_from(results)
+
+    def _recognize_whole(self, image: np.ndarray) -> Any:
+        """``reader.recognize`` over the entire crop, or ``[]`` if it refuses.
+
+        ``horizontal_list`` and ``free_list`` are left unset. EasyOCR's own
+        guard is ``if (horizontal_list==None) and (free_list==None)``, and only
+        that branch substitutes a single box covering the whole image -- pass
+        empty lists instead and it iterates over zero boxes and returns
+        nothing, silently, on every crop.
+
+        The magnification is applied here rather than handed to EasyOCR:
+        ``mag_ratio`` is a *detector* parameter, consulted while CRAFT resizes
+        the canvas, and the whole point of this path is that CRAFT does not
+        run. Upscaling the crop ourselves is what actually delivers it.
+        """
+        recognize = getattr(self._reader, "recognize", None)
+        if not callable(recognize):  # pragma: no cover - very old easyocr
+            return []
+        try:
+            return self._call_reader(recognize, self._magnify(image), **self._decoder_kwargs())
+        except Exception:
+            # A recognition head that rejects this view is not an error worth
+            # failing a frame over -- readtext gets its turn next.
+            logger.debug("Direct recognize() failed, falling back to readtext", exc_info=True)
+            return []
+
+    def _magnify(self, image: np.ndarray) -> np.ndarray:
+        """Upscale a crop before recognition, or return it unchanged.
+
+        Cubic rather than linear: the recognition head reads stroke *edges*,
+        and linear interpolation is the one that rounds them off. Guarded on
+        every side because a view arriving here can be any shape the
+        preprocessing stage produced.
+        """
+        if self.mag_ratio <= 1.0 or not isinstance(image, np.ndarray) or image.size == 0:
+            return image
+        try:
+            import cv2
+
+            height, width = image.shape[:2]
+            if height <= 0 or width <= 0:
+                return image
+            return cv2.resize(
+                image,
+                (int(width * self.mag_ratio), int(height * self.mag_ratio)),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Magnification failed, recognising at native size", exc_info=True)
+            return image
+
+    @staticmethod
+    def _call_reader(method: Callable[..., Any], image: np.ndarray, **kwargs: Any) -> Any:
+        """Call an EasyOCR method with only the keywords it actually accepts.
+
+        The same defence ``_supported`` applies to the ``Reader`` constructor:
+        requirements.txt pins ``easyocr>=1.7,<2`` and the keyword surface has
+        moved inside that range. Passing an unknown one raises ``TypeError``
+        out of a hot path, so they are filtered instead.
+        """
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):  # pragma: no cover - C extension / double
+            return method(image, **kwargs)
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            return method(image, **kwargs)
+        allowed = {name: value for name, value in kwargs.items() if name in parameters}
+        return method(image, **allowed)
 
 
 class PaddleOcrRecognizer(_BaseRecognizer):

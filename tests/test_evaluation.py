@@ -378,3 +378,107 @@ def test_a_metrics_object_is_constructible_empty() -> None:
     metrics = Metrics()
     assert metrics.to_dict()["total"] == 0
     assert metrics.summary()
+
+
+# ---------------------------------------------------------------------------
+# Character confusion
+# ---------------------------------------------------------------------------
+
+
+def test_alignment_pairs_characters_by_edit_script_not_position() -> None:
+    """A dropped leading zero is one deletion, not a shifted whole string.
+
+    This is the reason the table is aligned rather than zipped: a positional
+    pairing would report six substitutions here and bury the one real fault.
+    """
+    from lpr.evaluation import GAP, align
+
+    assert align("06BZ1234", "6BZ1234") == [
+        ("0", GAP),
+        ("6", "6"),
+        ("B", "B"),
+        ("Z", "Z"),
+        ("1", "1"),
+        ("2", "2"),
+        ("3", "3"),
+        ("4", "4"),
+    ]
+
+
+def test_alignment_of_two_empty_strings_is_empty() -> None:
+    from lpr.evaluation import align
+
+    assert align("", "") == []
+
+
+def test_a_substitution_is_recorded_in_the_truth_to_prediction_direction() -> None:
+    metrics = score([EvalSample("a.jpg", "34ABC12", "34A8C12")])
+    assert metrics.confusions[("B", "8")] == 1
+    assert ("8", "B") not in metrics.confusions
+
+
+def test_confusions_rank_by_frequency() -> None:
+    metrics = score(
+        [
+            EvalSample("a.jpg", "06BZ1234", "O6BZ1234"),
+            EvalSample("b.jpg", "06AB123", "O6AB123"),
+            EvalSample("c.jpg", "34ABC12", "34A8C12"),
+        ]
+    )
+    assert metrics.top_confusions(2) == [("0", "O", 2), ("B", "8", 1)]
+    assert metrics.confused_characters == 3
+
+
+def test_a_miss_contributes_no_confusions() -> None:
+    """A read that emitted nothing is not a glyph confusion.
+
+    Counting it would add one deletion per character and swamp the
+    substitutions the table exists to rank.
+    """
+    metrics = score([EvalSample("a.jpg", "34ABC12", "")])
+    assert metrics.confusions == {}
+    assert metrics.misses == 1
+
+
+def test_a_negative_sample_contributes_no_confusions() -> None:
+    """There is no truth string to align against."""
+    metrics = score([EvalSample("a.jpg", "", "34ZZ11")])
+    assert metrics.confusions == {}
+    assert metrics.false_positives == 1
+
+
+def test_a_correct_read_contributes_no_confusions() -> None:
+    metrics = score([EvalSample("a.jpg", "34ABC12", "34ABC12")])
+    assert metrics.confusions == {}
+    assert metrics.confused_characters == 0
+
+
+def test_confusions_are_capped_and_ordered_stably() -> None:
+    """Ties break on the pair, so two identical runs print identical reports."""
+    metrics = Metrics()
+    metrics.confusions.update({("0", "O"): 1, ("1", "I"): 1, ("8", "B"): 1})
+    assert metrics.top_confusions(2) == [("0", "O", 1), ("1", "I", 1)]
+
+
+def test_the_report_serialises_its_confusions() -> None:
+    metrics = score([EvalSample("a.jpg", "34ABC12", "34A8C12")])
+    payload = json.loads(json.dumps(metrics.to_dict()))
+    assert payload["confusions"] == [{"truth": "B", "predicted": "8", "count": 1}]
+    assert payload["confused_characters"] == 1
+
+
+def test_the_summary_names_the_worst_pair() -> None:
+    metrics = score(
+        [
+            EvalSample("a.jpg", "06BZ1234", "O6BZ1234"),
+            EvalSample("b.jpg", "06AB123", "O6AB123"),
+        ]
+    )
+    summary = metrics.summary()
+    assert "character confusions" in summary
+    assert "0 -> O" in summary
+
+
+def test_a_clean_run_prints_no_confusion_block() -> None:
+    metrics = score([EvalSample("a.jpg", "34ABC12", "34ABC12")])
+    assert "character confusions" not in metrics.summary()

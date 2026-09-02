@@ -254,3 +254,212 @@ def test_an_uninspectable_reader_gets_every_kwarg() -> None:
     """A C extension or a Mock has no signature; assume it takes what we send."""
     sentinel = {"gpu": False, "verbose": False}
     assert EasyOcrRecognizer._supported_kwargs(object(), sentinel) == sentinel
+
+
+# ---------------------------------------------------------------------------
+# Direct recognition (bypassing EasyOCR's own detector)
+# ---------------------------------------------------------------------------
+
+
+class RecordingReader(FakeReader):
+    """A reader that answers both read paths and records which ran.
+
+    ``recognize_result`` and ``readtext_result`` are set per test; ``seen``
+    names the methods called, in order, which is what the tests below assert
+    on -- the point of the change is *which* path runs, not only its output.
+    """
+
+    recognize_result: list[Any] = []
+    readtext_result: list[Any] = []
+    seen: list[str] = []
+    recognize_raises: Exception | None = None
+    recognize_kwargs: dict[str, Any] = {}
+    recognize_image: Any = None
+
+    def recognize(
+        self,
+        image: Any,
+        horizontal_list: Any = None,
+        free_list: Any = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        type(self).seen.append("recognize")
+        type(self).recognize_image = image
+        type(self).recognize_kwargs = {
+            "horizontal_list": horizontal_list,
+            "free_list": free_list,
+            **kwargs,
+        }
+        if type(self).recognize_raises is not None:
+            raise type(self).recognize_raises
+        return type(self).recognize_result
+
+    def readtext(self, image: Any, **kwargs: Any) -> list[Any]:
+        type(self).seen.append("readtext")
+        return type(self).readtext_result
+
+
+@pytest.fixture
+def recording_easyocr(monkeypatch: pytest.MonkeyPatch) -> Any:
+    RecordingReader.calls = []
+    RecordingReader.failure_hook = None
+    RecordingReader.seen = []
+    RecordingReader.recognize_result = []
+    RecordingReader.readtext_result = []
+    RecordingReader.recognize_raises = None
+    RecordingReader.recognize_kwargs = {}
+    RecordingReader.recognize_image = None
+    module = type(sys)("easyocr")
+    module.Reader = RecordingReader  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "easyocr", module)
+    return module
+
+
+def _crop() -> Any:
+    numpy = pytest.importorskip("numpy")
+    return numpy.full((64, 200, 3), 255, dtype=numpy.uint8)
+
+
+def test_the_crop_goes_straight_to_the_recognition_head(
+    tmp_path: Path, recording_easyocr: Any
+) -> None:
+    """YOLO already localised the plate; CRAFT must not run over it again."""
+    RecordingReader.recognize_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True))
+
+    assert recognizer._read_fragments(_crop()) == [("34ABC123", 0.9)]
+    assert RecordingReader.seen == ["recognize"]
+
+
+def test_an_empty_direct_read_falls_back_to_the_detector(
+    tmp_path: Path, recording_easyocr: Any
+) -> None:
+    """The bypass must not be able to lose a read the old path would have had."""
+    RecordingReader.recognize_result = []
+    RecordingReader.readtext_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "06BZ1234", 0.8)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True))
+
+    assert recognizer._read_fragments(_crop()) == [("06BZ1234", 0.8)]
+    assert RecordingReader.seen == ["recognize", "readtext"]
+
+
+def test_a_failing_direct_read_falls_back_rather_than_raising(
+    tmp_path: Path, recording_easyocr: Any
+) -> None:
+    """One view the recognition head refuses is not a reason to fail a frame."""
+    RecordingReader.recognize_raises = RuntimeError("no")
+    RecordingReader.readtext_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "35TR8801", 0.7)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True))
+
+    assert recognizer._read_fragments(_crop()) == [("35TR8801", 0.7)]
+    assert RecordingReader.seen == ["recognize", "readtext"]
+
+
+def test_the_bypass_can_be_switched_off(tmp_path: Path, recording_easyocr: Any) -> None:
+    RecordingReader.readtext_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC12", 0.6)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=False))
+
+    assert recognizer._read_fragments(_crop()) == [("34ABC12", 0.6)]
+    assert RecordingReader.seen == ["readtext"]
+
+
+def test_no_box_list_is_offered_so_the_whole_crop_is_one_line(
+    tmp_path: Path, recording_easyocr: Any
+) -> None:
+    """Both box lists must stay None.
+
+    EasyOCR's guard is ``if (horizontal_list==None) and (free_list==None)``,
+    and only that branch substitutes a single box covering the whole image.
+    Passing empty lists instead makes it iterate over zero boxes and return
+    nothing -- silently, on every crop, so the bypass looks like it works
+    while every read quietly comes from the fallback.
+    """
+    RecordingReader.recognize_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True))
+    recognizer._read_fragments(_crop())
+
+    assert RecordingReader.recognize_kwargs["horizontal_list"] is None
+    assert RecordingReader.recognize_kwargs["free_list"] is None
+
+
+def test_the_crop_is_magnified_before_direct_recognition(
+    tmp_path: Path, recording_easyocr: Any
+) -> None:
+    """mag_ratio is a CRAFT parameter, so this path has to apply it itself."""
+    RecordingReader.recognize_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True, mag_ratio=2.0))
+    recognizer._read_fragments(_crop())
+
+    height, width = RecordingReader.recognize_image.shape[:2]
+    assert (height, width) == (128, 400)
+
+
+def test_a_magnification_of_one_leaves_the_crop_alone(
+    tmp_path: Path, recording_easyocr: Any
+) -> None:
+    RecordingReader.recognize_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True, mag_ratio=1.0))
+    recognizer._read_fragments(_crop())
+
+    assert RecordingReader.recognize_image.shape[:2] == (64, 200)
+
+
+def test_the_tuning_parameters_reach_the_reader(tmp_path: Path, recording_easyocr: Any) -> None:
+    RecordingReader.recognize_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(
+        _settings(
+            tmp_path, direct_recognize=True, decoder="beamsearch", beam_width=7, contrast_ths=0.4
+        )
+    )
+    recognizer._read_fragments(_crop())
+
+    passed = RecordingReader.recognize_kwargs
+    assert passed["decoder"] == "beamsearch"
+    assert passed["beamWidth"] == 7
+    assert passed["contrast_ths"] == pytest.approx(0.4)
+    assert passed["allowlist"] == recognizer.allowlist
+
+
+def test_greedy_decoding_does_not_send_a_beam_width(tmp_path: Path, recording_easyocr: Any) -> None:
+    RecordingReader.recognize_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True, decoder="greedy"))
+    recognizer._read_fragments(_crop())
+
+    assert "beamWidth" not in RecordingReader.recognize_kwargs
+
+
+def test_keywords_a_reader_cannot_take_are_dropped(tmp_path: Path, recording_easyocr: Any) -> None:
+    """easyocr>=1.7,<2 moved this surface; an unknown keyword must not raise."""
+
+    class NarrowReader(RecordingReader):
+        def recognize(self, image: Any, horizontal_list: Any = None, **kwargs: Any) -> list[Any]:
+            # No free_list, and **kwargs still absorbs the rest -- the filter is
+            # exercised by the narrower signature on the readtext side below.
+            return super().recognize(image, horizontal_list, None, **kwargs)
+
+        def readtext(self, image: Any, allowlist: Any = None) -> list[Any]:
+            type(self).seen.append("readtext")
+            return type(self).readtext_result
+
+    recording_easyocr.Reader = NarrowReader
+    NarrowReader.recognize_result = []
+    NarrowReader.readtext_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "06AB123", 0.5)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path, direct_recognize=True))
+
+    # Would be a TypeError if decoder/mag_ratio/width_ths were passed blindly.
+    assert recognizer._read_fragments(_crop()) == [("06AB123", 0.5)]
+
+
+def test_the_bypass_ships_off(tmp_path: Path, recording_easyocr: Any) -> None:
+    """The default must reproduce the previous behaviour exactly.
+
+    The bypass measured 59% faster and materially less accurate on the only
+    sample available, so it is a capability to evaluate per site, not a new
+    default. See the note above OcrConfig.direct_recognize.
+    """
+    RecordingReader.readtext_result = [([[0, 0], [1, 0], [1, 1], [0, 1]], "34ABC123", 0.9)]
+    recognizer = EasyOcrRecognizer(_settings(tmp_path))
+
+    assert recognizer.direct_recognize is False
+    recognizer._read_fragments(_crop())
+    assert RecordingReader.seen == ["readtext"]

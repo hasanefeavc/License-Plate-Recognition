@@ -541,6 +541,62 @@ class OcrConfig(BaseModel):
     #: bind-mounted host volume, so pointing the cache there makes the download
     #: a once-per-machine cost instead of a once-per-container one.
     model_dir: str = ""
+    # NOTE ON THE DEFAULTS BELOW. Each of these knobs ships at the value that
+    # reproduces the previous behaviour exactly, because measuring them was the
+    # point and the measurement did not support turning any of them on:
+    #
+    #   direct_recognize=true   59% faster (606ms -> 246ms/crop on CPU) but
+    #                           plate accuracy fell 20% -> 7.5% and CER rose
+    #                           29.6% -> 54.6% on the sample available.
+    #   decoder=beamsearch      no latency cost, no accuracy gain.
+    #   contrast_ths=0.3        no change in either, +25ms.
+    #   mag_ratio=1.5           accuracy down, latency roughly doubled -- it
+    #                           magnifies the canvas CRAFT then works over.
+    #
+    # That sample was labelled by the pipeline's own historical reads under the
+    # current configuration, so it is biased *toward* these defaults and cannot
+    # be used to prove them optimal. It is enough to show the alternatives are
+    # not free, which is why they are opt-in: turn one on, run
+    # scripts/evaluate.py against ground truth for your site, and read the
+    # character-confusion table before adopting it.
+    #
+    #: Skip EasyOCR's own CRAFT text *detector* and recognise the crop whole.
+    #:
+    #: The crop reaching this layer has already been localised by YOLO, so
+    #: ``readtext()`` runs a second detector over a picture that is nothing but
+    #: a plate. That costs latency, and it can lose accuracy outright: CRAFT
+    #: draws its own boxes and a tight one clips the first or last glyph, which
+    #: no amount of downstream repair recovers. ``recognize()`` with no box
+    #: list treats the whole image as one line and goes straight to the
+    #: recognition head.
+    #:
+    #: ``readtext()`` remains the fallback whenever the direct call returns
+    #: nothing, so the worst case is the previous behaviour plus one cheap
+    #: attempt -- there is no read this can lose.
+    direct_recognize: bool = False
+    #: Decoder for the recognition head: ``greedy`` (EasyOCR's default) or
+    #: ``beamsearch``.
+    #:
+    #: Greedy commits to the most likely character at each step independently.
+    #: Beam search keeps ``beam_width`` partial strings alive and lets a
+    #: globally better one win, which is exactly the arbitration a plate needs
+    #: when one glyph is ambiguous -- ``8``/``B`` resolved by what the rest of
+    #: the block implies. Costs a few ms per crop.
+    decoder: Literal["greedy", "beamsearch", "wordbeamsearch"] = "greedy"
+    #: Beam width, when ``decoder`` is a beam search. Ignored for greedy.
+    beam_width: int = Field(default=5, ge=1, le=20)
+    #: Contrast below which EasyOCR re-runs a box with contrast adjustment
+    #: applied. Raising it makes that second pass more eager, which is the
+    #: knob that addresses glare and dusk crops; EasyOCR's own default is 0.1.
+    contrast_ths: float = Field(default=0.1, ge=0.0, le=1.0)
+    #: The contrast the retry is normalised to. EasyOCR's default is 0.5.
+    adjust_contrast: float = Field(default=0.5, ge=0.0, le=1.0)
+    #: Upscaling applied before recognition. Crops are normalised to
+    #: ``preprocess.TARGET_CROP_HEIGHT`` (64px), but a plate read at distance
+    #: arrives smaller than that and is the case motion blur hurts most, so
+    #: magnifying before the recognition head buys back stroke detail. 1.0 is
+    #: EasyOCR's default.
+    mag_ratio: float = Field(default=1.0, ge=1.0, le=4.0)
     #: Allow EasyOCR to fetch missing weights over the network at startup.
     #: Set false on a locked-down gate box: the service then fails fast with a
     #: message naming ``scripts/fetch_models.py`` instead of hanging on a

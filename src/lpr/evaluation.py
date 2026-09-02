@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -49,9 +50,11 @@ from pathlib import Path
 from lpr.ocr.normalize import validate
 
 __all__ = [
+    "GAP",
     "EvalSample",
     "Metrics",
     "Outcome",
+    "align",
     "cer",
     "levenshtein",
     "load_ground_truth",
@@ -103,6 +106,70 @@ def levenshtein(a: str, b: str) -> int:
             )
         previous = current
     return previous[-1]
+
+
+#: Stands in for "no character on this side" in an aligned pair: a deletion
+#: (a glyph in the truth the reader dropped) or an insertion (a glyph the
+#: reader invented). Safe as a sentinel because a normalised plate is only
+#: ``A-Z0-9`` -- see :data:`lpr.ocr.normalize.ALLOWLIST` -- so a hyphen can
+#: never be a real character on either side.
+GAP = "-"
+
+
+def align(truth: str, predicted: str) -> list[tuple[str, str]]:
+    """Character pairs from the cheapest edit script between the two strings.
+
+    Returns ``(truth_char, predicted_char)`` per aligned position, using
+    :data:`GAP` on whichever side has no character.
+
+    An edit-script alignment rather than a positional ``zip``, because the two
+    strings are routinely different lengths and a zip mis-pairs *everything*
+    after the first insertion or deletion: a read that dropped the leading
+    ``0`` of ``06BZ1234`` would score as six substitutions instead of the one
+    deletion it is, and the resulting confusion table would be noise. Here the
+    same read yields exactly ``("0", "-")``.
+
+    Plates are at most nine characters (:data:`lpr.ocr.normalize.MAX_PLATE_LEN`)
+    so the full DP table is a few dozen cells; there is no reason to reach for
+    the banded variant :func:`levenshtein` uses.
+    """
+    rows, columns = len(truth), len(predicted)
+    # cost[i][j] = edit distance between truth[:i] and predicted[:j]
+    cost = [[0] * (columns + 1) for _ in range(rows + 1)]
+    for i in range(1, rows + 1):
+        cost[i][0] = i
+    for j in range(1, columns + 1):
+        cost[0][j] = j
+    for i in range(1, rows + 1):
+        source = truth[i - 1]
+        for j in range(1, columns + 1):
+            cost[i][j] = min(
+                cost[i - 1][j - 1] + (source != predicted[j - 1]),
+                cost[i - 1][j] + 1,
+                cost[i][j - 1] + 1,
+            )
+
+    pairs: list[tuple[str, str]] = []
+    i, j = rows, columns
+    while i > 0 or j > 0:
+        # Substitution/match first, so an equal-cost path prefers pairing two
+        # real characters over reporting a deletion next to an insertion.
+        if (
+            i > 0
+            and j > 0
+            and cost[i][j] == cost[i - 1][j - 1] + (truth[i - 1] != predicted[j - 1])
+        ):
+            pairs.append((truth[i - 1], predicted[j - 1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and cost[i][j] == cost[i - 1][j] + 1:
+            pairs.append((truth[i - 1], GAP))
+            i -= 1
+        else:
+            pairs.append((GAP, predicted[j - 1]))
+            j -= 1
+    pairs.reverse()
+    return pairs
 
 
 def cer(predicted: str, truth: str) -> float:
@@ -196,6 +263,15 @@ class Metrics:
     cer_sum: float = 0.0
     latencies_ms: list[float] = field(default_factory=list)
     worst: list[EvalSample] = field(default_factory=list)
+    #: ``(truth_char, predicted_char) -> count`` over every misread character
+    #: in a positive sample that emitted something. Matches are not counted --
+    #: the table is a list of what goes wrong, not a full matrix -- and misses
+    #: are excluded entirely: a sample that emitted nothing would contribute
+    #: one deletion per character and bury the substitutions that this exists
+    #: to rank. Deletions and insertions inside a real read are kept, with
+    #: :data:`GAP` on the empty side, because "the reader drops the leading
+    #: zero" is a distinct and fixable failure from "the reader confuses O".
+    confusions: Counter[tuple[str, str]] = field(default_factory=Counter)
 
     # -- headline numbers ------------------------------------------------
 
@@ -259,6 +335,23 @@ class Metrics:
             return None
         return sum(self.latencies_ms) / len(self.latencies_ms)
 
+    # -- character confusion ---------------------------------------------
+
+    def top_confusions(self, limit: int = 20) -> list[tuple[str, str, int]]:
+        """The ``limit`` most frequent misreads, as ``(truth, predicted, count)``.
+
+        Ordered by count, then by the pair itself so a tie is stable across
+        runs -- a report that reshuffles its own rows between two identical
+        evaluations is unusable as a regression baseline.
+        """
+        ranked = sorted(self.confusions.items(), key=lambda item: (-item[1], item[0]))
+        return [(truth, predicted, n) for (truth, predicted), n in ranked[:limit]]
+
+    @property
+    def confused_characters(self) -> int:
+        """Total misread characters. The denominator for a pair's share."""
+        return sum(self.confusions.values())
+
     # -- output ----------------------------------------------------------
 
     def to_dict(self) -> dict[str, object]:
@@ -283,6 +376,11 @@ class Metrics:
                 "p95": self.latency_p95,
                 "samples": len(self.latencies_ms),
             },
+            "confusions": [
+                {"truth": truth, "predicted": predicted, "count": n}
+                for truth, predicted, n in self.top_confusions()
+            ],
+            "confused_characters": self.confused_characters,
         }
 
     def summary(self) -> str:
@@ -307,6 +405,15 @@ class Metrics:
             f"  latency ms      mean {ms(self.latency_mean)}  "
             f"p50 {ms(self.latency_p50)}  p95 {ms(self.latency_p95)}",
         ]
+
+        top = self.top_confusions()
+        if top:
+            total = self.confused_characters
+            lines.append("")
+            lines.append(f"  character confusions  (top {len(top)} of {total} misread)")
+            for truth, predicted, n in top:
+                share = n / total if total else 0.0
+                lines.append(f"    {truth} -> {predicted}   {n:5d}   {share * 100:5.1f}%")
         return "\n".join(lines)
 
 
@@ -339,6 +446,11 @@ def score(samples: Iterable[EvalSample], *, keep_worst: int = 15) -> Metrics:
         metrics.positives += 1
         error = cer(sample.predicted, sample.truth)
         metrics.cer_sum += error
+        if sample.emitted:
+            # Only reads that produced something: see Metrics.confusions.
+            for truth_char, predicted_char in align(sample.truth, sample.predicted):
+                if truth_char != predicted_char:
+                    metrics.confusions[(truth_char, predicted_char)] += 1
         if outcome is Outcome.HIT:
             metrics.hits += 1
         elif outcome is Outcome.WRONG:
