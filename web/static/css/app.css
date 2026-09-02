@@ -108,6 +108,68 @@ body { overflow: hidden; }
    attribute on the body, not by a class, so app.js toggles one property. */
 .tel-drawer[data-open="false"] { display: none; }
 
+/* --------------------------------------------------------------------------
+   Control metrics -- one height for everything you can click.
+
+   Every interactive control in a bar or a toolbar is exactly `--ctl` tall:
+   buttons, the search field, the select pills, the barrier lamp, the stats
+   well. Before this, height was *emergent* -- padding plus line-height plus
+   whatever the content happened to be -- which is why the action bar's buttons
+   never lined up. Compact table actions are the one other step, `--ctl-sm`,
+   deliberately chosen rather than drifted into.
+   -------------------------------------------------------------------------- */
+:root { --ctl: 40px; --ctl-sm: 30px; }
+
+.ctl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: var(--ctl);
+  padding: 0 14px;
+  line-height: 1;
+  white-space: nowrap;
+  border-radius: 8px;
+}
+/* A field or a select carries its own padding, so only the height is shared. */
+.ctl-icon { padding: 0; width: var(--ctl); }
+.ctl > svg { width: 16px; height: 16px; flex: none; }
+
+.ctl-sm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--ctl-sm);
+  height: var(--ctl-sm);
+  border-radius: 7px;
+  flex: none;
+}
+.ctl-sm > svg { width: 15px; height: 15px; }
+
+/* The stats well: a control-height container so the action bar has matching
+   caps at both ends instead of trailing off into loose text. */
+.statwell { display: flex; align-items: stretch; height: var(--ctl); overflow: hidden; }
+
+/* --------------------------------------------------------------------------
+   Inline add sheet.
+
+   `grid-template-rows: 0fr -> 1fr` animates a panel open to its *natural*
+   height. The alternatives both fail here: `height: auto` is not animatable,
+   and a hard-coded `max-height` has to over-estimate, which makes the close
+   look like it stalls before it starts. The child needs `min-height: 0` and
+   `overflow: hidden` or it refuses to be collapsed by the 0fr track.
+   -------------------------------------------------------------------------- */
+.sheet {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .26s cubic-bezier(.16, 1, .3, 1);
+}
+.sheet[data-open="true"] { grid-template-rows: 1fr; }
+.sheet-in { overflow: hidden; min-height: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .sheet { transition: none; }
+}
+
 @keyframes feed-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 .feed-in { animation: feed-in .18s ease-out; }
 @keyframes pulse-full { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
@@ -132,7 +194,7 @@ body { overflow: hidden; }
 .relative { position: relative; }
 .sticky { position: sticky; }
 .inset-0 { top: 0px; right: 0px; bottom: 0px; left: 0px; }
-.left-3 { left: 0.75rem; }
+.right-3 { right: 0.75rem; }
 .top-0 { top: 0px; }
 .top-1\/2 { top: 50%; }
 .z-10 { z-index: 10; }
@@ -142,7 +204,8 @@ body { overflow: hidden; }
 .overflow-hidden { overflow: hidden; }
 .overflow-y-auto { overflow-y: auto; }
 .aspect-video { aspect-ratio: 16 / 9; }
-.object-contain { object-fit: contain; }
+.appearance-none { -webkit-appearance: none; appearance: none; }
+.object-contain { -webkit-appearance: none; appearance: none; }
 .flex-col { flex-direction: column; }
 .flex-wrap { flex-wrap: wrap; }
 .flex-1 { flex: 1 1 0%; }
@@ -154,16 +217,20 @@ body { overflow: hidden; }
 .justify-between { justify-content: space-between; }
 .justify-center { justify-content: center; }
 .justify-end { justify-content: flex-end; }
+.justify-start { justify-content: flex-start; }
 .order-last { order: 9999; }
 .grid-cols-1 { grid-template-columns: repeat(1, minmax(0, 1fr)); }
 .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .col-span-2 { grid-column: span 2 / span 2; }
+.gap-0 { gap: 0px; }
+.gap-0\.5 { gap: 0.125rem; }
 .gap-1 { gap: 0.25rem; }
 .gap-1\.5 { gap: 0.375rem; }
 .gap-2 { gap: 0.5rem; }
 .gap-2\.5 { gap: 0.625rem; }
 .gap-3 { gap: 0.75rem; }
 .gap-4 { gap: 1rem; }
+.gap-px { gap: 1px; }
 .gap-x-2 { column-gap: 0.5rem; }
 .gap-x-3 { column-gap: 0.75rem; }
 .gap-x-4 { column-gap: 1rem; }
@@ -187,13 +254,16 @@ body { overflow: hidden; }
 .mt-2\.5 { margin-top: 0.625rem; }
 .mt-3 { margin-top: 0.75rem; }
 .mt-7 { margin-top: 1.75rem; }
+.p-1 { padding: 0.25rem; }
 .p-2 { padding: 0.5rem; }
 .p-2\.5 { padding: 0.625rem; }
 .p-4 { padding: 1rem; }
 .p-6 { padding: 1.5rem; }
-.pl-10 { padding-left: 2.5rem; }
-.pr-3 { padding-right: 0.75rem; }
+.pl-3 { padding-left: 0.75rem; }
+.pl-3\.5 { padding-left: 0.875rem; }
+.pr-8 { padding-right: 2rem; }
 .pt-1 { padding-top: 0.25rem; }
+.px-0 { padding-left: 0px; padding-right: 0px; }
 .px-1 { padding-left: 0.25rem; padding-right: 0.25rem; }
 .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
 .px-2\.5 { padding-left: 0.625rem; padding-right: 0.625rem; }
@@ -202,7 +272,6 @@ body { overflow: hidden; }
 .px-4 { padding-left: 1rem; padding-right: 1rem; }
 .px-5 { padding-left: 1.25rem; padding-right: 1.25rem; }
 .px-6 { padding-left: 1.5rem; padding-right: 1.5rem; }
-.px-8 { padding-left: 2rem; padding-right: 2rem; }
 .py-0\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
 .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
 .py-10 { padding-top: 2.5rem; padding-bottom: 2.5rem; }
@@ -228,18 +297,22 @@ body { overflow: hidden; }
 .w-px { width: 1px; }
 .h-2\.5 { height: 0.625rem; }
 .h-4 { height: 1rem; }
+.h-5 { height: 1.25rem; }
 .h-8 { height: 2rem; }
+.h-\[52px\] { height: 52px; }
 .h-full { height: 100%; }
 .h-px { height: 1px; }
+.min-w-0 { min-width: 0px; }
+.min-w-\[180px\] { min-width: 180px; }
 .min-w-\[34rem\] { min-width: 34rem; }
 .min-w-\[40rem\] { min-width: 40rem; }
 .min-w-\[44px\] { min-width: 44px; }
 .min-w-\[46rem\] { min-width: 46rem; }
+.min-w-\[74px\] { min-width: 74px; }
 .min-h-0 { min-height: 0px; }
 .min-h-\[1\.25rem\] { min-height: 1.25rem; }
 .min-h-\[44px\] { min-height: 44px; }
 .min-h-\[48px\] { min-height: 48px; }
-.min-h-\[52px\] { min-height: 52px; }
 .max-w-md { max-width: 28rem; }
 .max-w-sm { max-width: 24rem; }
 .max-h-32 { max-height: 8rem; }
@@ -253,6 +326,7 @@ body { overflow: hidden; }
 .text-4xl { font-size: 2.25rem; line-height: 2.5rem; }
 .text-\[10px\] { font-size: 10px; }
 .text-\[11px\] { font-size: 11px; }
+.text-\[9\.5px\] { font-size: 9.5px; }
 .text-accent { color: #818cf8; }
 .text-bad { color: #fb7185; }
 .text-base { font-size: 1rem; line-height: 1.5rem; }
@@ -289,7 +363,6 @@ body { overflow: hidden; }
 .antialiased { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }
 .resize-none { resize: none; }
-.bg-accent { background-color: #818cf8; }
 .bg-accent\/10 { background-color: rgb(129 140 248 / 0.1); }
 .bg-bad { background-color: #fb7185; }
 .bg-bad\/10 { background-color: rgb(251 113 133 / 0.1); }
@@ -297,6 +370,7 @@ body { overflow: hidden; }
 .bg-card { background-color: #111113; }
 .bg-chrome { background-color: #111113; }
 .bg-ground { background-color: #09090b; }
+.bg-ink { background-color: #fafafa; }
 .bg-ink\/5 { background-color: rgb(250 250 250 / 0.05); }
 .bg-line { background-color: #27272a; }
 .bg-ok { background-color: #34d399; }
@@ -304,6 +378,7 @@ body { overflow: hidden; }
 .bg-purple-400\/10 { background-color: rgb(192 132 252 / 0.1); }
 .bg-row { background-color: #18181b; }
 .bg-teal-400\/10 { background-color: rgb(45 212 191 / 0.1); }
+.bg-transparent { background-color: transparent; }
 .bg-void { background-color: #0b0b0d; }
 .bg-warn { background-color: #fbbf24; }
 .bg-warn\/10 { background-color: rgb(251 191 36 / 0.1); }
@@ -318,20 +393,25 @@ body { overflow: hidden; }
 .border { border-width: 1px; }
 .border-2 { border-width: 2px; }
 .border-b { border-bottom-width: 1px; }
+.border-l { border-left-width: 1px; }
 .border-l-4 { border-left-width: 4px; }
 .border-r-4 { border-right-width: 4px; }
 .border-t { border-top-width: 1px; }
 .border-accent { border-color: #818cf8; }
+.border-accent\/40 { border-color: rgb(129 140 248 / 0.4); }
 .border-accent\/50 { border-color: rgb(129 140 248 / 0.5); }
 .border-bad { border-color: #fb7185; }
+.border-bad\/40 { border-color: rgb(251 113 133 / 0.4); }
 .border-bad\/50 { border-color: rgb(251 113 133 / 0.5); }
 .border-ink\/70 { border-color: rgb(250 250 250 / 0.7); }
 .border-line { border-color: #27272a; }
 .border-ok { border-color: #34d399; }
+.border-ok\/40 { border-color: rgb(52 211 153 / 0.4); }
 .border-ok\/50 { border-color: rgb(52 211 153 / 0.5); }
 .border-purple-400\/50 { border-color: rgb(192 132 252 / 0.5); }
 .border-teal-400\/50 { border-color: rgb(45 212 191 / 0.5); }
 .border-warn { border-color: #fbbf24; }
+.border-warn\/40 { border-color: rgb(251 191 36 / 0.4); }
 .border-warn\/50 { border-color: rgb(251 191 36 / 0.5); }
 .divide-y > * + * { border-top-width: 1px; border-bottom-width: 0; }
 .divide-line\/60 > * + * { border-color: rgb(39 39 42 / 0.6); }
@@ -349,24 +429,27 @@ body { overflow: hidden; }
 
 /* --- hover: --- */
 .hover\:text-accent:hover { color: #818cf8; }
+.hover\:text-bad:hover { color: #fb7185; }
 .hover\:text-ground:hover { color: #09090b; }
 .hover\:text-ink:hover { color: #fafafa; }
 .hover\:text-white:hover { color: #ffffff; }
 .hover\:bg-accent:hover { background-color: #818cf8; }
 .hover\:bg-bad:hover { background-color: #fb7185; }
+.hover\:bg-bad\/10:hover { background-color: rgb(251 113 133 / 0.1); }
 .hover\:bg-ok:hover { background-color: #34d399; }
+.hover\:bg-raise:hover { background-color: #1f1f23; }
 .hover\:bg-row:hover { background-color: #18181b; }
 .hover\:bg-warn:hover { background-color: #fbbf24; }
+.hover\:bg-white:hover { background-color: #ffffff; }
 .hover\:border-accent:hover { border-color: #818cf8; }
+.hover\:border-bad\/40:hover { border-color: rgb(251 113 133 / 0.4); }
 .hover\:border-edge:hover { border-color: #3f3f46; }
 .hover\:brightness-110:hover { filter: brightness(1.1); }
 .hover\:brightness-125:hover { filter: brightness(1.25); }
 
 /* --- focus: --- */
 .focus\:border-accent:focus { border-color: #818cf8; }
-
-/* --- active: --- */
-.active\:scale-\[\.98\]:active { --tw-scale: .98; transform: translate(var(--tw-translate-x, 0), var(--tw-translate-y, 0)) scale(var(--tw-scale, 1)); }
+.focus\:border-edge:focus { border-color: #3f3f46; }
 
 /* --- disabled: --- */
 .disabled\:opacity-40:disabled { opacity: 0.4; }
@@ -398,18 +481,16 @@ body { overflow: hidden; }
   .sm\:p-4 { padding: 1rem; }
   .sm\:p-6 { padding: 1.5rem; }
   .sm\:p-8 { padding: 2rem; }
-  .sm\:px-3\.5 { padding-left: 0.875rem; padding-right: 0.875rem; }
   .sm\:px-4 { padding-left: 1rem; padding-right: 1rem; }
   .sm\:px-5 { padding-left: 1.25rem; padding-right: 1.25rem; }
   .sm\:px-6 { padding-left: 1.5rem; padding-right: 1.5rem; }
-  .sm\:py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
-  .sm\:py-4 { padding-top: 1rem; padding-bottom: 1rem; }
   .sm\:w-48 { width: 12rem; }
   .sm\:w-56 { width: 14rem; }
   .sm\:w-auto { width: auto; }
   .sm\:h-auto { height: auto; }
   .sm\:max-w-2xl { max-width: 42rem; }
   .sm\:max-w-4xl { max-width: 56rem; }
+  .sm\:max-w-\[20rem\] { max-width: 20rem; }
   .sm\:max-w-lg { max-width: 32rem; }
   .sm\:max-h-\[85vh\] { max-height: 85vh; }
   .sm\:text-base { font-size: 1rem; line-height: 1.5rem; }

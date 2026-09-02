@@ -159,6 +159,55 @@
     quality: DEFAULT_QUALITY,
   };
 
+  /** One 24-grid stroke set, so every glyph in the UI shares a weight and a
+   *  size instead of being a per-button decision. Paths live here rather than
+   *  in the stylesheet because a stroke icon that inherits `currentColor`
+   *  cannot be expressed as a background image without a mask, and a mask
+   *  would cost a data URI per icon and lose the colour inheritance that makes
+   *  one definition work on a light button and a dark one alike. */
+  const ICONS = {
+    gate: "M12 20V4M6 10l6-6 6 6M4 20h16",
+    pause: "M10 4v16M14 4v16",
+    play: "M7 4l13 8-13 8z",
+    plates: "M3 7h18v10H3zM3 11h18M7 14h3M14 14h3",
+    history: "M12 8v4l3 2M3.05 11a9 9 0 1 1 .5 4M3 4v5h5",
+    users: "M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19"
+      + "M10 10.5a3.25 3.25 0 1 0 0-6.5 3.25 3.25 0 0 0 0 6.5"
+      + "M20 19v-1.5a3.5 3.5 0 0 0-2.6-3.38M15.5 4.22a3.25 3.25 0 0 1 0 6.06",
+    settings: "M4 21v-6M4 11V3M12 21v-9M12 8V3M20 21v-4M20 13V3M1.5 15h5M9.5 8h5M17.5 17h5",
+    logout: "M15 17l5-5-5-5M20 12H9M12 3H6a1.5 1.5 0 0 0-1.5 1.5v15A1.5 1.5 0 0 0 6 21h6",
+    search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20.5 20.5 16 16",
+    plus: "M12 5v14M5 12h14",
+    check: "M20 6 9 17l-5-5",
+    x: "M18 6 6 18M6 6l12 12",
+    chevron: "M6 9.5 12 15.5l6-6",
+  };
+
+  /** The markup for one glyph. `currentColor` throughout, so a button's own
+   *  colour rules apply to its icon without a second declaration. */
+  function iconMarkup(name) {
+    const path = ICONS[name];
+    if (!path) return "";
+    return (
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" ' +
+      'style="width:16px;height:16px;flex:none">' +
+      `<path d="${path}"></path></svg>`
+    );
+  }
+
+  /** Fill every `data-icon` in a subtree, once. Idempotent, so it is safe to
+   *  call again after a table re-render. */
+  function paintIcons(root) {
+    (root || document).querySelectorAll("[data-icon]").forEach((node) => {
+      if (node.dataset.painted === "1") return;
+      const markup = iconMarkup(node.dataset.icon);
+      if (!markup) return;
+      node.insertAdjacentHTML("afterbegin", markup);
+      node.dataset.painted = "1";
+    });
+  }
+
   const $ = (id) => document.getElementById(id);
   const el = {};
   [
@@ -174,6 +223,7 @@
     "toast", "cam-entry", "cam-exit",
     // Plate-management modal
     "modal-plates", "btn-plates", "plate-form", "plate-input", "note-input",
+    "plate-status", "plate-sheet", "plate-sheet-label", "plate-sheet-wrap", "user-role-seg",
     "plate-form", "plate-add", "plate-rows", "plates-empty", "plates-count", "plates-status",
     "owner-input", "apartment-input", "expires-input", "blocked-input", "plate-search",
     "plates-io", "plate-import-file", "plate-import-overwrite", "plate-export",
@@ -892,7 +942,15 @@
     if (el["tel-bar"]) el["tel-bar"].hidden = !isAdmin;
     if (el["btn-pause"]) {
       el["btn-pause"].disabled = false;
-      el["btn-pause"].textContent = state.paused ? "Devam Et" : "Duraklat";
+      // Rebuilt rather than assigned, so the glyph tracks the state the label
+      // is describing instead of being stranded as a pause icon on "Devam Et".
+      el["btn-pause"].textContent = "";
+      el["btn-pause"].insertAdjacentHTML(
+        "afterbegin", iconMarkup(state.paused ? "play" : "pause")
+      );
+      el["btn-pause"].append(
+        document.createTextNode(state.paused ? "Devam Et" : "Duraklat")
+      );
     }
   }
 
@@ -1595,7 +1653,7 @@
       const status = String(record.status || "active");
 
       const row = document.createElement("tr");
-      row.className = "text-sm";
+      row.className = "h-[52px] text-sm";
 
       const plateCell = document.createElement("td");
       plateCell.className = "px-4 py-2.5 sm:px-6";
@@ -1649,10 +1707,14 @@
    *  typing "34ABC" finds a plate the table shows as "34 ABC 123". */
   function filterPlates() {
     const needle = (el["plate-search"] ? el["plate-search"].value : "").trim().toLowerCase();
-    if (!needle) return state.plateRecords;
-
+    // `status` is the field the API already returns on each record; the pill
+    // narrows by it rather than by anything this page derives for itself.
+    const status = el["plate-status"] ? el["plate-status"].value : "";
     const bare = needle.replace(/\s+/g, "");
+
     return state.plateRecords.filter((record) => {
+      if (status && String(record.status || "active") !== status) return false;
+      if (!needle) return true;
       const plate = String(record.plate || "").toLowerCase();
       if (plate.includes(bare)) return true;
       return [record.owner, record.apartment, record.note].some(
@@ -1663,6 +1725,51 @@
 
   function refreshPlateTable() {
     renderPlates(filterPlates());
+  }
+
+  /** Open or close the inline add sheet.
+   *
+   *  A sheet rather than a second dialog: registering a plate is a step inside
+   *  plate management, and a modal stacked on a modal hides the list the admin
+   *  was reading in order to decide what to add. The trigger doubles as the
+   *  cancel, so one control owns one panel.
+   */
+  function setPlateSheet(open) {
+    const wrap = el["plate-sheet-wrap"];
+    const button = el["plate-sheet"];
+    if (!wrap || !button) return;
+    wrap.dataset.open = String(open);
+    button.setAttribute("aria-expanded", String(open));
+    button.className = open
+      ? "ctl rounded-lg border border-line bg-row px-4 text-sm font-medium text-muted "
+        + "transition hover:border-edge hover:bg-raise hover:text-ink"
+      : "ctl rounded-lg bg-ink px-4 text-sm font-semibold text-ground transition hover:bg-white";
+    button.textContent = "";
+    button.insertAdjacentHTML("afterbegin", iconMarkup(open ? "x" : "plus"));
+    const label = document.createElement("span");
+    label.id = "plate-sheet-label";
+    label.textContent = open ? "Vazgeç" : "Yeni Plaka Ekle";
+    button.append(label);
+    el["plate-sheet-label"] = label;
+    if (open && el["plate-input"]) el["plate-input"].focus();
+  }
+
+  /** Mirror the segmented role control onto the <select> that holds the value.
+   *
+   *  The select stays authoritative -- addUser() reads `user-role.value` and
+   *  `user-form.reset()` restores it -- so this only paints the buttons and
+   *  writes back. Replacing the select outright would have broken both. */
+  function syncRoleSegment() {
+    const select = el["user-role"];
+    const group = el["user-role-seg"];
+    if (!select || !group) return;
+    group.querySelectorAll("button[data-role]").forEach((button) => {
+      const on = button.dataset.role === select.value;
+      button.setAttribute("aria-checked", String(on));
+      button.className = on
+        ? "h-full flex-1 rounded-md bg-row text-xs font-semibold text-ink transition"
+        : "h-full flex-1 rounded-md text-xs font-semibold text-muted transition hover:text-ink";
+    });
   }
 
   async function loadPlates() {
@@ -1704,13 +1811,20 @@
     try {
       const result = await api("/api/plates", { method: "POST", body: JSON.stringify(body) });
       clearPlateForm();
+      // The plate is registered; put the list back in front of the admin.
+      setPlateSheet(false);
       await loadPlates();
       modalStatus(el["plates-status"], `${formatPlate(result.plate)} eklendi.`, "ok");
     } catch (err) {
       modalStatus(el["plates-status"], err.message, "bad");
     } finally {
       applyPlatePermissions();
-      el["plate-input"].focus();
+      // Only when the sheet is still open -- on success it has closed, and
+      // focusing a field inside a collapsed panel scrolls it back into view.
+      const sheet = el["plate-sheet-wrap"];
+      if (el["plate-input"] && (!sheet || sheet.dataset.open === "true")) {
+        el["plate-input"].focus();
+      }
     }
   }
 
@@ -1759,6 +1873,11 @@
   function openPlates() {
     openModal("modal-plates");
     if (el["plate-search"]) el["plate-search"].value = "";
+    if (el["plate-status"]) el["plate-status"].value = "";
+    // Always open on the list. Looking a plate up is the common task; the
+    // sheet is one click away when it is not, and a form left open from the
+    // last visit hides the rows the admin came to read.
+    setPlateSheet(false);
     loadPlates();
   }
 
@@ -1773,7 +1892,7 @@
       const action = String(row.action || "");
       const tone = ACTION_COLORS[action] || "accent";
       const tr = document.createElement("tr");
-      tr.className = "text-sm";
+      tr.className = "h-[52px] text-sm";
 
       const cell = (text, className) => {
         const td = document.createElement("td");
@@ -2146,7 +2265,7 @@
       const isSelf = username === state.username;
 
       const tr = document.createElement("tr");
-      tr.className = "text-sm";
+      tr.className = "h-[52px] text-sm";
 
       const name = document.createElement("td");
       name.className = "px-4 py-2.5 font-semibold text-ink sm:px-6";
@@ -2227,6 +2346,26 @@
   }
 
   /** Licence state for one row, with the key exposed for copying. */
+  /** Whole days from now until `iso`, or null when there is no date to read.
+   *  Rounded up, so "expires in four hours" reads as one day left rather than
+   *  zero -- the operator still has today. */
+  function daysUntil(iso) {
+    if (!iso) return null;
+    const when = Date.parse(iso);
+    if (!Number.isFinite(when)) return null;
+    return Math.ceil((when - Date.now()) / 86400000);
+  }
+
+  /** Chip colours for a licence countdown. The thresholds are a month and a
+   *  quarter: a month is the window in which somebody has to act, a quarter is
+   *  far enough out to be information rather than a task. */
+  function licenseTone(days, spec) {
+    if (days === null) return spec.classes;
+    if (days <= 30) return "border-bad/40 bg-bad/10 text-bad";
+    if (days <= 90) return "border-warn/40 bg-warn/10 text-warn";
+    return "border-ok/40 bg-ok/10 text-ok";
+  }
+
   function licenseCell(row, role) {
     const wrap = document.createElement("div");
     const status = String(
@@ -2234,10 +2373,25 @@
     );
     const spec = LICENSE_BADGES[status] || LICENSE_BADGES.pending_activation;
 
+    // An admin holds no licence at all -- a licence governs application
+    // access, and the account that issues them cannot be gated by one -- so
+    // the chip reads "Sınırsız" rather than a number that would imply an
+    // expiry. For everyone else the chip is the countdown, and its colour is
+    // the urgency: a row that needs attention this month should be findable
+    // without reading a single date.
+    const unlimited = role === "admin";
+    const days = unlimited ? null : daysUntil(row.license_expires_at);
+    // The tone is resolved before the assignment, not inside it: the CSS
+    // builder scans `className = ...` expressions for class names, and a role
+    // string compared inline there is picked up as one. See extract_classes().
+    const tone = unlimited ? "border-accent/40 bg-accent/10 text-accent" : licenseTone(days, spec);
     const badge = document.createElement("span");
-    badge.className =
-      `inline-block rounded-full border px-2.5 py-0.5 text-xs font-bold ${spec.classes}`;
-    badge.textContent = role === "admin" ? "Sınırsız" : spec.label;
+    badge.className = "inline-block rounded-full border px-2.5 py-0.5 text-xs font-bold " + tone;
+    badge.textContent =
+      unlimited ? "Sınırsız"
+      : days === null ? spec.label
+      : days <= 0 ? "Süresi doldu"
+      : `${days} gün kaldı`;
     wrap.append(badge);
 
     if (role !== "admin" && row.license_expires_at) {
@@ -2596,6 +2750,11 @@
       .trim();
     if (!styled && el["style-warning"]) el["style-warning"].hidden = false;
 
+    // Fill every data-icon once the manifest is resolved, and paint the role
+    // segment from the select it mirrors.
+    paintIcons();
+    syncRoleSegment();
+
     el["login-form"].addEventListener("submit", (event) => {
       event.preventDefault();
       submitCredentials(false);
@@ -2647,6 +2806,27 @@
     });
 
     if (el["plate-search"]) el["plate-search"].addEventListener("input", refreshPlateTable);
+    if (el["plate-status"]) el["plate-status"].addEventListener("change", refreshPlateTable);
+    if (el["plate-sheet"]) {
+      el["plate-sheet"].addEventListener("click", () => {
+        setPlateSheet(el["plate-sheet-wrap"].dataset.open !== "true");
+      });
+    }
+    if (el["user-role-seg"]) {
+      el["user-role-seg"].addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-role]");
+        if (!button || !el["user-role"]) return;
+        el["user-role"].value = button.dataset.role;
+        // Fire `change` so anything already listening to the select -- now or
+        // later -- sees the same event it would from a real selection.
+        el["user-role"].dispatchEvent(new Event("change", { bubbles: true }));
+        syncRoleSegment();
+      });
+    }
+    // `reset()` restores the select's default; the buttons have to follow it.
+    if (el["user-form"]) el["user-form"].addEventListener("reset", () => {
+      setTimeout(syncRoleSegment, 0);
+    });
 
     if (el["user-form"]) el["user-form"].addEventListener("submit", addUser);
     if (el["license-form"]) el["license-form"].addEventListener("submit", activateLicense);

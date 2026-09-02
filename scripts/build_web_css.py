@@ -306,6 +306,13 @@ def _aspect(m: re.Match[str]) -> Decls:
 
 
 @rule(r"object-(contain|cover|fill|none|scale-down)")
+@rule(r"appearance-none")
+def _appearance(m: re.Match[str]) -> Decls:
+    """Strips a native control's platform chrome so a <select> can take the
+    shared control metrics and draw its own chevron."""
+    return _kv(**{"-webkit-appearance": "none", "appearance": "none"})
+
+
 def _object_fit(m: re.Match[str]) -> Decls:
     return f"object-fit: {m.group(1)}"
 
@@ -736,7 +743,21 @@ def _user_select(m: re.Match[str]) -> Decls:
 
 #: Classes styled by hand in ``index.html`` (animations, scrollbars). They are
 #: not utilities and must not be reported as missing.
-HAND_WRITTEN = frozenset({"scroll-thin", "feed-in", "pulse-full", "lock-screen", "tel-drawer"})
+HAND_WRITTEN = frozenset(
+    {
+        "scroll-thin",
+        "feed-in",
+        "pulse-full",
+        "lock-screen",
+        "tel-drawer",
+        "ctl",
+        "ctl-sm",
+        "ctl-icon",
+        "sheet",
+        "sheet-in",
+        "statwell",
+    }
+)
 
 #: Characters a Tailwind class can contain. Anything else in a string literal
 #: is not a class name and is discarded before the rule table ever sees it.
@@ -927,6 +948,68 @@ body {{ overflow: hidden; }}
 /* The admin telemetry drawer. Collapsed height is driven by the `hidden`
    attribute on the body, not by a class, so app.js toggles one property. */
 .tel-drawer[data-open="false"] {{ display: none; }}
+
+/* --------------------------------------------------------------------------
+   Control metrics -- one height for everything you can click.
+
+   Every interactive control in a bar or a toolbar is exactly `--ctl` tall:
+   buttons, the search field, the select pills, the barrier lamp, the stats
+   well. Before this, height was *emergent* -- padding plus line-height plus
+   whatever the content happened to be -- which is why the action bar's buttons
+   never lined up. Compact table actions are the one other step, `--ctl-sm`,
+   deliberately chosen rather than drifted into.
+   -------------------------------------------------------------------------- */
+:root {{ --ctl: 40px; --ctl-sm: 30px; }}
+
+.ctl {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: var(--ctl);
+  padding: 0 14px;
+  line-height: 1;
+  white-space: nowrap;
+  border-radius: 8px;
+}}
+/* A field or a select carries its own padding, so only the height is shared. */
+.ctl-icon {{ padding: 0; width: var(--ctl); }}
+.ctl > svg {{ width: 16px; height: 16px; flex: none; }}
+
+.ctl-sm {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--ctl-sm);
+  height: var(--ctl-sm);
+  border-radius: 7px;
+  flex: none;
+}}
+.ctl-sm > svg {{ width: 15px; height: 15px; }}
+
+/* The stats well: a control-height container so the action bar has matching
+   caps at both ends instead of trailing off into loose text. */
+.statwell {{ display: flex; align-items: stretch; height: var(--ctl); overflow: hidden; }}
+
+/* --------------------------------------------------------------------------
+   Inline add sheet.
+
+   `grid-template-rows: 0fr -> 1fr` animates a panel open to its *natural*
+   height. The alternatives both fail here: `height: auto` is not animatable,
+   and a hard-coded `max-height` has to over-estimate, which makes the close
+   look like it stalls before it starts. The child needs `min-height: 0` and
+   `overflow: hidden` or it refuses to be collapsed by the 0fr track.
+   -------------------------------------------------------------------------- */
+.sheet {{
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .26s cubic-bezier(.16, 1, .3, 1);
+}}
+.sheet[data-open="true"] {{ grid-template-rows: 1fr; }}
+.sheet-in {{ overflow: hidden; min-height: 0; }}
+@media (prefers-reduced-motion: reduce) {{
+  .sheet {{ transition: none; }}
+}}
 
 @keyframes feed-in {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: none; }} }}
 .feed-in {{ animation: feed-in .18s ease-out; }}

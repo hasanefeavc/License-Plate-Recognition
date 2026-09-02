@@ -318,20 +318,6 @@
   <!-- Telemetry --------------------------------------------------------- -->
   <div class="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 px-1">
     <span id="activity" class="order-last w-full truncate font-mono text-xs text-muted sm:order-none sm:w-auto sm:flex-1"></span>
-    <div class="flex items-center gap-2">
-      <div class="rounded-md border border-line bg-chrome px-3 py-1 text-center sm:px-3.5">
-        <div id="stat-read" class="font-mono text-base font-bold text-accent tabular-nums">0</div>
-        <div class="text-[10px] font-bold tracking-widest text-muted">OKUNAN</div>
-      </div>
-      <div class="rounded-md border border-line bg-chrome px-3 py-1 text-center sm:px-3.5">
-        <div id="stat-grant" class="font-mono text-base font-bold text-ok tabular-nums">0</div>
-        <div class="text-[10px] font-bold tracking-widest text-muted">İZİN</div>
-      </div>
-      <div class="rounded-md border border-line bg-chrome px-3 py-1 text-center sm:px-3.5">
-        <div id="stat-deny" class="font-mono text-base font-bold text-bad tabular-nums">0</div>
-        <div class="text-[10px] font-bold tracking-widest text-muted">RET</div>
-      </div>
-    </div>
     <!-- The deployment-licence ticker used to live here. It is gone: the
          header now shows only the *user's own* licence, in #license-badge next
          to the username. The installation-wide licence is still readable at
@@ -344,40 +330,68 @@
          Aç" because this drives a sliding gate, not an arm barrier, and the
          button stays busy for the motor's travel time so nobody presses it
          twice and stops the gate halfway. -->
+    <!-- One control height for the whole bar. `ctl` fixes it at 40px, so a
+         button's height is a token rather than an emergent sum of padding,
+         line-height and whatever the label happens to be -- which is what left
+         these six controls at four different heights. -->
     <button id="btn-gate" type="button"
-            class="flex min-h-[52px] w-full items-center justify-center gap-2 rounded-lg bg-ok px-8 text-lg font-bold text-ground transition hover:brightness-110 active:scale-[.98] disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto sm:py-4">
+            class="ctl gap-2 rounded-lg bg-ink px-5 text-sm font-semibold text-ground transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40">
       <svg id="gate-spinner" hidden class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
       </svg>
+      <span data-icon="gate"></span>
       <span id="btn-gate-label">Kapıyı Aç</span>
     </button>
-    <button id="btn-pause" type="button"
-            class="min-h-[44px] flex-1 rounded-lg border-2 border-warn px-4 font-bold text-warn transition hover:bg-warn hover:text-ground disabled:cursor-not-allowed disabled:opacity-40 sm:flex-none sm:px-5 sm:py-3">
+
+    <span class="h-5 w-px shrink-0 bg-line"></span>
+
+    <!-- Secondary actions share one styling, exactly. Differentiating them by
+         colour made the bar read as five competing primaries; the icon and the
+         label carry the difference now. -->
+    <button id="btn-pause" type="button" data-icon="pause"
+            class="ctl rounded-lg border border-line bg-row text-sm font-medium text-muted transition hover:border-edge hover:bg-raise hover:text-ink disabled:cursor-not-allowed disabled:opacity-40">
       Duraklat
     </button>
-    <button id="btn-plates" type="button"
-            class="min-h-[44px] flex-1 rounded-lg bg-accent px-4 font-bold text-ground transition hover:brightness-110 sm:flex-none sm:px-5 sm:py-3">
-      Plaka Yönetimi
+    <button id="btn-plates" type="button" data-icon="plates"
+            class="ctl rounded-lg border border-line bg-row text-sm font-medium text-muted transition hover:border-edge hover:bg-raise hover:text-ink">
+      Plakalar
     </button>
-    <button id="btn-history" type="button"
-            class="min-h-[44px] flex-1 rounded-lg bg-line px-4 font-bold text-ink transition hover:brightness-125 sm:flex-none sm:px-5 sm:py-3">
-      Geçmiş Kayıtlar
+    <button id="btn-history" type="button" data-icon="history"
+            class="ctl rounded-lg border border-line bg-row text-sm font-medium text-muted transition hover:border-edge hover:bg-raise hover:text-ink">
+      Geçmiş
     </button>
     <!-- Admin-only; revealed by updateControls(). -->
-    <button id="btn-users" type="button" hidden
-            class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none sm:px-5 sm:py-3">
+    <button id="btn-users" type="button" hidden data-icon="users"
+            class="ctl rounded-lg border border-line bg-row text-sm font-medium text-muted transition hover:border-edge hover:bg-raise hover:text-ink">
       Kullanıcılar
     </button>
-    <button id="btn-settings" type="button"
-            class="min-h-[44px] flex-1 rounded-lg border-2 border-line px-4 font-bold text-muted transition hover:border-accent hover:text-accent sm:flex-none sm:px-5 sm:py-3">
+    <button id="btn-settings" type="button" data-icon="settings"
+            class="ctl rounded-lg border border-line bg-row text-sm font-medium text-muted transition hover:border-edge hover:bg-raise hover:text-ink">
       Ayarlar
     </button>
-    <span id="toast" class="order-last w-full text-sm font-bold sm:order-none sm:w-auto" role="status" aria-live="polite"></span>
-    <button id="btn-logout" type="button"
-            class="min-h-[44px] flex-1 rounded-lg border-2 border-bad px-4 font-bold text-bad transition hover:bg-bad hover:text-white sm:ml-auto sm:flex-none sm:px-5 sm:py-3">
+    <button id="btn-logout" type="button" data-icon="logout"
+            class="ctl rounded-lg border border-line bg-row text-sm font-medium text-muted transition hover:border-bad/40 hover:bg-bad/10 hover:text-bad">
       Çıkış Yap
     </button>
+    <span id="toast" class="text-sm font-medium text-muted" role="status" aria-live="polite"></span>
+
+    <!-- The counters, at control height, so the bar reads as one band of 40px
+         objects rather than a row of buttons with loose text beside it. -->
+    <div class="statwell ml-auto rounded-lg border border-line bg-row">
+      <div class="flex min-w-[74px] flex-col justify-center gap-px px-3.5">
+        <span class="text-[9.5px] font-bold uppercase tracking-widest text-faint">Okunan</span>
+        <span id="stat-read" class="font-mono text-sm font-bold tabular-nums text-ink">0</span>
+      </div>
+      <div class="flex min-w-[74px] flex-col justify-center gap-px border-l border-line px-3.5">
+        <span class="text-[9.5px] font-bold uppercase tracking-widest text-faint">İzin</span>
+        <span id="stat-grant" class="font-mono text-sm font-bold tabular-nums text-ok">0</span>
+      </div>
+      <div class="flex min-w-[74px] flex-col justify-center gap-px border-l border-line px-3.5">
+        <span class="text-[9.5px] font-bold uppercase tracking-widest text-faint">Ret</span>
+        <span id="stat-deny" class="font-mono text-sm font-bold tabular-nums text-bad">0</span>
+      </div>
+    </div>
   </footer>
 </div>
 
@@ -414,7 +428,11 @@
 
     <!-- Add form. Collapsed to plate + owner on a phone; the rest wraps onto
          its own row rather than shrinking below a usable tap target. -->
-    <form id="plate-form" class="shrink-0 border-b border-line px-4 py-4 sm:px-6">
+    <!-- The sheet animates 0fr -> 1fr, so it opens to its natural height
+         without a hard-coded max-height that would have to over-estimate. -->
+    <div class="sheet shrink-0" id="plate-sheet-wrap" data-open="false">
+      <div class="sheet-in">
+    <form id="plate-form" class="border-b border-line bg-row px-4 py-4 sm:px-6">
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <div class="col-span-2 sm:col-span-1">
           <label for="plate-input" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">PLAKA *</label>
@@ -451,28 +469,53 @@
                    class="h-4 w-4 rounded border-line bg-void accent-bad">
             Engelli
           </label>
-          <button id="plate-add" type="submit"
-                  class="ml-auto min-h-[44px] rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
-            Ekle
+          <button id="plate-add" type="submit" data-icon="check"
+                  class="ctl ml-auto rounded-lg bg-ink px-5 text-sm font-semibold text-ground transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40">
+            Kaydet
           </button>
         </div>
       </div>
     </form>
+      </div>
+    </div>
 
-    <!-- Instant filter. Client-side over the already-loaded list: a resident
-         list is hundreds of rows, not thousands, so a round trip per keystroke
-         would be slower and less reliable than filtering what is in hand. -->
-    <div class="shrink-0 border-b border-line px-4 py-3 sm:px-6">
+    <!-- Toolbar. Instant filter, client-side over the already-loaded list: a
+         resident list is hundreds of rows, not thousands, so a round trip per
+         keystroke would be slower and less reliable than filtering what is in
+         hand. Search, the status pill and the add trigger share one control
+         height, so the row aligns without per-element tuning. -->
+    <div class="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-4 py-3 sm:px-6">
       <label for="plate-search" class="sr-only">Ara</label>
-      <div class="relative">
-        <svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted"
-             viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-          <circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path>
-        </svg>
+      <div class="ctl relative min-w-[180px] flex-1 justify-start gap-0 rounded-lg border border-line bg-void px-0 sm:max-w-[20rem]">
+        <span data-icon="search" class="pointer-events-none pl-3 text-muted"></span>
         <input id="plate-search" type="search" autocomplete="off"
                placeholder="Plaka, sahibi, daire veya notta ara..."
-               class="min-h-[44px] w-full rounded-lg border border-line bg-void pl-10 pr-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
+               class="h-full w-full min-w-0 bg-transparent px-2.5 text-sm text-ink outline-none placeholder:text-muted/60">
       </div>
+
+      <!-- Status is derived from the record the API already returns
+           (blocked / expires_at), not a new field: no schema, no round trip. -->
+      <div class="relative">
+        <label for="plate-status" class="sr-only">Duruma göre süz</label>
+        <select id="plate-status"
+                class="ctl w-full appearance-none rounded-lg border border-line bg-row pl-3.5 pr-8 text-sm font-medium text-muted outline-none transition hover:border-edge hover:text-ink focus:border-edge">
+          <option value="">Tüm durumlar</option>
+          <option value="active">Aktif</option>
+          <option value="blocked">Engelli</option>
+          <option value="expired">Süresi dolmuş</option>
+        </select>
+        <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted" data-icon="chevron"></span>
+      </div>
+
+      <span class="flex-1"></span>
+
+      <!-- Opens the add sheet below rather than a second dialog on top of this
+           one: registering a plate is a step inside plate management, not a
+           separate task, and a stacked modal loses the list you were reading. -->
+      <button id="plate-sheet" type="button" data-icon="plus" aria-expanded="false" aria-controls="plate-form"
+              class="ctl rounded-lg bg-ink px-4 text-sm font-semibold text-ground transition hover:bg-white">
+        <span id="plate-sheet-label">Yeni Plaka Ekle</span>
+      </button>
     </div>
 
     <div class="scroll-thin min-h-0 flex-1 overflow-auto">
@@ -686,12 +729,24 @@
                  class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 py-2.5 text-base text-ink outline-none transition placeholder:text-muted/60 focus:border-accent">
         </div>
         <div>
-          <label for="user-role" class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">ROL</label>
-          <select id="user-role" name="role"
-                  class="min-h-[44px] w-full rounded-lg border border-line bg-void px-3 text-ink outline-none transition focus:border-accent">
+          <span class="mb-1.5 block text-[11px] font-bold tracking-wider text-muted">ROL</span>
+          <!-- The <select> stays and remains the value: app.js reads
+               `el["user-role"].value` and `user-form.reset()` restores it, and
+               both would break against a group of buttons. It is mirrored by
+               the segmented control below, which writes to it and fires
+               `change`, so there is still exactly one source of truth. -->
+          <select id="user-role" name="role" tabindex="-1" aria-hidden="true"
+                  class="sr-only">
             <option value="operator">Operatör</option>
             <option value="admin">Yönetici</option>
           </select>
+          <div id="user-role-seg" role="radiogroup" aria-label="Rol"
+               class="ctl w-full gap-0.5 rounded-lg border border-line bg-void p-1">
+            <button type="button" role="radio" aria-checked="true" data-role="operator"
+                    class="h-full flex-1 rounded-md text-xs font-semibold transition">Operatör</button>
+            <button type="button" role="radio" aria-checked="false" data-role="admin"
+                    class="h-full flex-1 rounded-md text-xs font-semibold transition">Yönetici</button>
+          </div>
         </div>
         <div class="flex items-end gap-3">
           <div class="flex-1">
@@ -706,9 +761,9 @@
               <option value="525600">1 yıl</option>
             </select>
           </div>
-          <button id="user-add" type="submit"
-                  class="min-h-[44px] rounded-lg bg-ok px-6 font-bold text-ground transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
-            Ekle
+          <button id="user-add" type="submit" data-icon="check"
+                  class="ctl rounded-lg bg-ink px-5 text-sm font-semibold text-ground transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40">
+            Kaydet
           </button>
         </div>
       </div>
