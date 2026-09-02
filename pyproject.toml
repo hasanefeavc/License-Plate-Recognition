@@ -117,5 +117,5 @@ namespace_packages = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["cv2", "cv2.*", "easyocr", "easyocr.*", "ultralytics", "ultralytics.*", "serial", "serial.*"]
+module = ["cv2", "cv2.*", "easyocr", "easyocr.*", "paddleocr", "paddleocr.*", "ultralytics", "ultralytics.*", "serial", "serial.*"]
 ignore_missing_imports = true

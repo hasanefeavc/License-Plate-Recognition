@@ -23,6 +23,21 @@ lap>=0.5.12,<1
 # onnxruntime-gpu build whenever torch reports a CUDA device, so on a GPU host
 # install that variant explicitly instead of letting it AutoUpdate.
 onnxruntime>=1.17,<2
+# The default recognition engine, and by a wide margin: measured on 47
+# hand-labelled frames from a live installation it read 89.4% of plates
+# exactly against EasyOCR's 25.5%, at a comparable latency. See
+# scripts/evaluate.py --compare-backends to re-measure on your own site.
+#
+# Capped below 3.0 deliberately. PaddleOCR 3.x moved to PIR-format model files
+# through paddlex, and a paddlepaddle that cannot execute them fails at
+# *inference* with "ConvertPirAttribute2RuntimeAttribute not support" -- every
+# read comes back empty, which looks exactly like a model that cannot see the
+# plates. 2.10 with paddlepaddle 3.0 is the pair this was validated on.
+paddleocr>=2.10,<3
+paddlepaddle>=3.0,<3.1
+# Kept alongside: it is the fallback backend for a box where paddle will not
+# install, the second opinion for ocr.ensemble_backends, and it needs no
+# system libraries of its own.
 easyocr>=1.7,<2
 torch>=2.2,<3
 torchvision>=0.17,<1

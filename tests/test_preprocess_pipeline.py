@@ -665,3 +665,103 @@ def test_enhance_plate_strips_the_band_before_it_reads_anything() -> None:
     banded = enhance_plate(_plate_crop(0.12))
     plain = enhance_plate(_plate_crop(0.0))
     assert banded.gray.shape[1] < plain.gray.shape[1]
+
+
+# ---------------------------------------------------------------------------
+# Dark left-margin trim
+# ---------------------------------------------------------------------------
+
+
+def _crop_with_dark_margin(margin_fraction: float = 0.15) -> Any:
+    """A white plate preceded by dark bodywork, as a detector box captures it."""
+    import cv2
+
+    width, height = 240, 60
+    image = np.full((height, width, 3), 30, np.uint8)
+    start = int(width * margin_fraction)
+    image[:, start:] = 235
+    cv2.putText(
+        image, "34AB123", (start + 4, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20,) * 3, 2
+    )
+    return image
+
+
+def test_a_dark_left_margin_is_trimmed_to_the_plate() -> None:
+    """Where the phantom leading digits came from.
+
+    Three of the five errors remaining at 89% accuracy were a fabricated digit
+    in front of an otherwise perfect read -- 34HB4082 returned as 13AHB4082 --
+    produced by the frame and bodywork inside the detector box.
+    """
+    from lpr.detect.preprocess import trim_dark_margin
+
+    crop = _crop_with_dark_margin(0.15)
+    trimmed = trim_dark_margin(crop)
+    removed = 1 - trimmed.shape[1] / crop.shape[1]
+    assert 0.10 < removed < 0.20
+
+
+def test_a_crop_that_starts_at_the_plate_is_untouched() -> None:
+    from lpr.detect.preprocess import trim_dark_margin
+
+    crop = _crop_with_dark_margin(0.0)
+    assert trim_dark_margin(crop) is crop
+
+
+def test_a_flat_crop_is_untouched() -> None:
+    """No dynamic range, no transition -- only noise to trip over."""
+    from lpr.detect.preprocess import trim_dark_margin
+
+    crop = np.full((60, 240, 3), 128, np.uint8)
+    assert trim_dark_margin(crop) is crop
+
+
+def test_an_all_dark_crop_is_untouched() -> None:
+    from lpr.detect.preprocess import trim_dark_margin
+
+    crop = np.full((60, 240, 3), 20, np.uint8)
+    assert trim_dark_margin(crop) is crop
+
+
+def test_a_single_bright_column_is_not_the_plate_edge() -> None:
+    """A specular highlight on a bumper must not be read as the plate."""
+    from lpr.detect.preprocess import trim_dark_margin
+
+    crop = _crop_with_dark_margin(0.15)
+    crop[:, 4] = 240  # one blown-out column inside the dark margin
+    trimmed = trim_dark_margin(crop)
+    assert trimmed.shape[1] < crop.shape[1]
+    assert 1 - trimmed.shape[1] / crop.shape[1] > 0.10
+
+
+def test_a_tiny_margin_is_not_worth_the_risk() -> None:
+    from lpr.detect.preprocess import trim_dark_margin
+
+    crop = _crop_with_dark_margin(0.01)
+    assert trim_dark_margin(crop) is crop
+
+
+def test_never_more_than_the_cap_is_trimmed() -> None:
+    from lpr.detect.preprocess import DARK_MARGIN_MAX_FRACTION, trim_dark_margin
+
+    crop = _crop_with_dark_margin(0.40)
+    trimmed = trim_dark_margin(crop)
+    assert 1 - trimmed.shape[1] / crop.shape[1] <= DARK_MARGIN_MAX_FRACTION + 0.01
+
+
+def test_a_grayscale_crop_is_handled() -> None:
+    """Luminance needs no colour, unlike the euroband detector."""
+    import cv2
+
+    from lpr.detect.preprocess import trim_dark_margin
+
+    gray = cv2.cvtColor(_crop_with_dark_margin(0.15), cv2.COLOR_BGR2GRAY)
+    assert trim_dark_margin(gray).shape[1] < gray.shape[1]
+
+
+def test_enhance_plate_trims_the_margin() -> None:
+    from lpr.detect.preprocess import enhance_plate
+
+    margined = enhance_plate(_crop_with_dark_margin(0.15))
+    clean = enhance_plate(_crop_with_dark_margin(0.0))
+    assert margined.gray.shape[1] < clean.gray.shape[1]

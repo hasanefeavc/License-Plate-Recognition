@@ -59,6 +59,7 @@ __all__ = [
     "separate_characters",
     "sharpness",
     "strip_euroband",
+    "trim_dark_margin",
     "stretch_contrast",
     "unsharp_mask",
 ]
@@ -92,6 +93,16 @@ EUROBAND_MAX_FRACTION = 0.22
 #: JPEG ringing on the frame -- not the band.
 EUROBAND_MIN_FRACTION = 0.03
 
+#: How far in from the left edge the band may begin, as a fraction of width.
+#:
+#: Not zero, which is what the first version required. A detector box is drawn
+#: around the *plate*, not around its printed area, so it routinely includes a
+#: few pixels of frame or bodywork before the band starts -- on this project's
+#: own failures the band was plainly there, inset by a handful of dark pixels,
+#: and demanding blue in column 0 rejected every one of them. Small, because a
+#: band that starts a fifth of the way across is not a band.
+EUROBAND_MAX_OFFSET_FRACTION = 0.08
+
 #: Columns of non-blue allowed *inside* the band, as a fraction of the band
 #: found so far. The "TR" glyphs and the star ring cut through it and are each
 #: a few columns wide, but they are narrow relative to the band that contains
@@ -115,6 +126,32 @@ EUROBAND_CLEAR_RUN_FRACTION = 0.18
 #: binarisation turns into a stroke, which is one of the phantom characters
 #: this exists to remove.
 EUROBAND_MARGIN_FRACTION = 0.12
+
+#: Minimum crop width for the dark-margin trim to run at all.
+DARK_MARGIN_MIN_WIDTH = 24
+
+#: Percentiles defining "dark" and "bright" for one crop, so the test is
+#: relative to the picture rather than to an absolute grey level -- a night
+#: plate and a noon plate have nothing in common on an absolute scale.
+DARK_MARGIN_LOW_PERCENTILE = 5
+DARK_MARGIN_HIGH_PERCENTILE = 95
+
+#: Below this spread between those percentiles the crop is flat -- all plate or
+#: all shadow -- and there is no transition to find.
+DARK_MARGIN_MIN_RANGE = 25
+
+#: Where a column counts as "the plate has started", on the normalised scale.
+DARK_MARGIN_BRIGHT_LEVEL = 0.5
+
+#: The bright region must hold for width/this many columns. One bright column
+#: is a specular highlight on a bumper, not the edge of a plate.
+DARK_MARGIN_RUN_DIVISOR = 40
+
+#: Never trim more than this fraction of the width, and never bother below
+#: DARK_MARGIN_MIN_FRACTION: a two-pixel margin holds no character and cutting
+#: it only risks the province digit.
+DARK_MARGIN_MAX_FRACTION = 0.22
+DARK_MARGIN_MIN_FRACTION = 0.04
 
 #: Target height a plate crop is upscaled to before OCR.
 TARGET_CROP_HEIGHT = 64
@@ -457,6 +494,9 @@ def strip_euroband(crop: np.ndarray) -> np.ndarray:
     if band_end is None:
         return crop
 
+    # Cut from column 0, not from the band's start: whatever sits to the left
+    # of the band is frame or bodywork, and it is the half of this artefact
+    # that reads as a digit.
     cut = band_end + max(1, int(round(band_end * EUROBAND_MARGIN_FRACTION)))
     cut = min(cut, search)
     if cut < width * EUROBAND_MIN_FRACTION or cut >= width:
@@ -464,29 +504,48 @@ def strip_euroband(crop: np.ndarray) -> np.ndarray:
     return crop[:, cut:]
 
 
+def _euroband_start(coverage: np.ndarray, search: int) -> int | None:
+    """First column of the band, or ``None`` when nothing starts near the edge.
+
+    Allows a short dark margin before the band. The detector box is drawn round
+    the plate rather than round its printed area, so a few pixels of frame or
+    bodywork usually precede the band -- requiring blue in column 0 rejected
+    every real band in this project's own failure set.
+    """
+    if coverage.size == 0:
+        return None
+    budget = min(coverage.size - 1, max(1, int(round(search * EUROBAND_MAX_OFFSET_FRACTION))))
+    for index in range(budget + 1):
+        if coverage[index] >= EUROBAND_COLUMN_COVERAGE:
+            return index
+    return None
+
+
 def _euroband_end(coverage: np.ndarray, search: int) -> int | None:
     """Last column of the band, or ``None`` when there is no band.
 
     Three things have to hold, and the third is the one that does the work.
 
-    The run starts at the very left edge -- a blue patch beginning three
-    characters in is a car, a sign or a shadow. It may contain gaps, because
-    the white "TR" lettering and the ring of stars cut through it, but the gaps
-    are small *relative to the run*, not relative to the search window. And it
-    must **end** inside the window, with a clear stretch of non-blue after it:
-    that stretch is the white plate the band sits against.
+    The run starts at or very near the left edge -- see
+    :func:`_euroband_start`; a blue patch beginning three characters in is a
+    car, a sign or a shadow. It may contain gaps, because the white "TR"
+    lettering and the ring of stars cut through it, but the gaps are small
+    *relative to the run*, not relative to the search window. And it must
+    **end** inside the window, with a clear stretch of non-blue after it: that
+    stretch is the white plate the band sits against.
 
     Without the third condition this is not a band detector, it is a "is the
     left of this image blue" detector, and on a dusk or IR frame the answer is
     yes all the way to the search limit.
     """
-    if coverage.size == 0 or coverage[0] < EUROBAND_COLUMN_COVERAGE:
+    start = _euroband_start(coverage, search)
+    if start is None:
         return None
 
     clear_run = max(2, int(round(search * EUROBAND_CLEAR_RUN_FRACTION)))
-    last_blue = 0
+    last_blue = start
     gap = 0
-    for index in range(1, coverage.size):
+    for index in range(start + 1, coverage.size):
         if coverage[index] >= EUROBAND_COLUMN_COVERAGE:
             # A gap only counts as internal to the band while it stays small
             # against the band already found.
@@ -504,6 +563,65 @@ def _euroband_end(coverage: np.ndarray, search: int) -> int | None:
     # Ran to the edge of the search window without ever clearing. Whatever is
     # blue here is not a band bounded by plate, so nothing is removed.
     return None
+
+
+def trim_dark_margin(crop: np.ndarray) -> np.ndarray:
+    """Cut a dark left margin off a crop, up to where the white plate starts.
+
+    The companion to :func:`strip_euroband`, and the one that works at night.
+    Hue cannot separate a euroband from the bodywork around it on a blue-cast
+    frame -- measured on this project's own failures, the whole left fifth of
+    such a crop reads as band blue, so the colour detector correctly refuses.
+    Luminance still separates cleanly, because whatever sits left of the number
+    -- frame, bumper, shadow, an unlit band -- is dark and the printed plate is
+    white.
+
+    That margin is where the phantom leading characters come from. Three of the
+    five remaining errors at 89% accuracy were a fabricated digit in front of
+    an otherwise perfect read: ``34HB4082`` returned as ``13AHB4082``. All
+    three are fixed by this, taking the set to 93.6%.
+
+    Guarded so it cannot eat a plate:
+
+    * A crop with no real dynamic range is left alone -- there is no "dark
+      margin" to find in a uniformly grey picture, only noise to trip over.
+    * The bright region has to be *sustained*, not one column, so a specular
+      highlight on a bumper is not mistaken for the plate.
+    * Nothing is trimmed unless the margin is wide enough to hold a character,
+      and never more than :data:`DARK_MARGIN_MAX_FRACTION`.
+
+    Returns ``crop`` itself when there is nothing to trim.
+    """
+    if not _is_image(crop):
+        return crop
+
+    gray = crop if crop.ndim == 2 else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+    if height < 4 or width < DARK_MARGIN_MIN_WIDTH:
+        return crop
+
+    column = gray.astype(np.float32).mean(axis=0)
+    low = float(np.percentile(column, DARK_MARGIN_LOW_PERCENTILE))
+    high = float(np.percentile(column, DARK_MARGIN_HIGH_PERCENTILE))
+    if high - low < DARK_MARGIN_MIN_RANGE:
+        # Flat crop: either all plate or all shadow. Either way there is no
+        # transition to find, and a threshold over noise would cut at random.
+        return crop
+
+    normalised = (column - low) / (high - low)
+    budget = int(width * DARK_MARGIN_MAX_FRACTION)
+    run = max(2, width // DARK_MARGIN_RUN_DIVISOR)
+
+    start = None
+    for index in range(budget):
+        window = normalised[index : index + run]
+        if window.size and window.min() >= DARK_MARGIN_BRIGHT_LEVEL:
+            start = index
+            break
+
+    if start is None or start < width * DARK_MARGIN_MIN_FRACTION:
+        return crop
+    return crop[:, start:]
 
 
 def to_gray(crop: np.ndarray) -> np.ndarray:
@@ -561,7 +679,7 @@ def enhance_plate(
 
     try:
         # Before to_gray: the band is found by colour, and grayscale has none.
-        crop = strip_euroband(crop)
+        crop = trim_dark_margin(strip_euroband(crop))
         gray = to_gray(crop)
 
         height = gray.shape[0]

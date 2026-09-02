@@ -501,7 +501,17 @@ class PreprocessConfig(BaseModel):
 
 
 class OcrConfig(BaseModel):
-    backend: str = "easyocr"
+    #: Recognition engine. PaddleOCR by default since it was measured against
+    #: EasyOCR on 47 hand-labelled frames from this installation and was not
+    #: close: 89.4% plate accuracy against 25.5%, and 2.7% CER against 18.7%.
+    #: EasyOCR remains fully supported and is one config line away -- it needs
+    #: no extra system packages, which is why it was the original default.
+    #:
+    #: Re-measure before trusting this on another site:
+    #:
+    #:     python scripts/evaluate.py --images data/snapshots \
+    #:         --truth data/ocr_ground_truth.json --compare-backends
+    backend: str = "paddleocr"
     #: ``true``, ``false``, or ``"auto"`` (the default): probe for a usable
     #: CUDA device and use it when there is one.
     #:

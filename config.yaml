@@ -119,7 +119,14 @@ preprocess:
   tight_font_kernel: [1, 3]
 
 ocr:
-  backend: easyocr
+  # PaddleOCR by default. Measured against EasyOCR on 47 hand-labelled frames
+  # from this installation: 89.4% plate accuracy against 25.5%, CER 2.7%
+  # against 18.7%. EasyOCR needs no extra system packages and stays supported
+  # -- switch this one line back if paddle cannot be installed on a box.
+  # Re-measure per site:
+  #   python scripts/evaluate.py --images data/snapshots \
+  #       --truth data/ocr_ground_truth.json --compare-backends
+  backend: paddleocr
   # true / false / auto. Same probe as detection.device above, so one config
   # file serves the GPU gate box, a CPU-only spare and CI. An explicit "true"
   # without a usable GPU is downgraded with a warning rather than obeyed --
