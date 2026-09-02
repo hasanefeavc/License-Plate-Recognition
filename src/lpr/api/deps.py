@@ -192,7 +192,15 @@ def apply_license_state(app: Starlette, valid: bool) -> bool:
     than a hunt through the lifespan and the routes.
     """
     app.state.license_halted = False
-    if not valid:
+    # Edge-triggered. The watchdog re-checks every minute, so logging the
+    # *state* rather than the transition buries the log of an installation
+    # deliberately running without a deployment licence -- which, now that
+    # this no longer halts anything, is a supported way to run.
+    warned = bool(getattr(app.state, "license_warned", False))
+    if valid:
+        app.state.license_warned = False
+    elif not warned:
+        app.state.license_warned = True
         logger.warning(
             "Dağıtım lisansı geçersiz (görüntü işleme etkilenmiyor; "
             "erişim kontrolü kullanıcı lisanslarında)"

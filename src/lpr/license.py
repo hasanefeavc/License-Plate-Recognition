@@ -54,6 +54,7 @@ Typical use::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -367,6 +368,51 @@ def _unverified_claims(token: str) -> dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
+#: Digest of the last token whose rejection was logged, paired with the reason.
+#: The deployment licence is re-checked every minute, so without this a site
+#: running on a bad key writes the same warning 1440 times a day.
+_last_rejection: tuple[str, str] | None = None
+_rejection_lock = threading.Lock()
+
+
+def _shadowing_keys_hint() -> str:
+    """Names the active verifying key when more than one candidate exists.
+
+    A signature failure on a well-formed token is almost always a key
+    mismatch, and the mismatch is almost always a stale ``public_key.pem`` in
+    the data directory shadowing the current one in ``keys/`` -- the data
+    directory is searched first, by design, because that is where an installer
+    drops the file. Saying which file is actually being used turns a puzzling
+    "Signature verification failed" into a one-line fix.
+    """
+    present = [path for path in public_key_candidates() if path.is_file()]
+    if len(present) < 2:
+        return ""
+    shadowed = ", ".join(str(path) for path in present[1:])
+    return f" (doğrulama anahtarı: {present[0]}; gölgelenen: {shadowed})"
+
+
+def _log_rejection(token: str, exc: Exception) -> None:
+    """Warn on a newly seen rejection; log identical repeats at debug.
+
+    The first sight of a bad key still warns -- that is the line an operator
+    needs when they have just pasted one in. It is only the *repetition* by
+    the minute-by-minute watchdog that is noise, and dropping the repeats to
+    debug keeps a development box readable without hiding anything a site
+    running on a bad key needs to see.
+    """
+    global _last_rejection
+    reason = str(exc)
+    fingerprint = (hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], reason)
+    with _rejection_lock:
+        repeated = _last_rejection == fingerprint
+        _last_rejection = fingerprint
+    if repeated:
+        logger.debug("Lisans anahtarı yeniden reddedildi: %s", reason)
+    else:
+        logger.warning("Lisans anahtarı reddedildi: %s%s", reason, _shadowing_keys_hint())
+
+
 def validate_token(
     token: str,
     *,
@@ -418,7 +464,7 @@ def validate_token(
         # Bad signature, wrong issuer, malformed, missing claims. The reason
         # is logged but never shown: telling a forger *which* check failed is
         # free help.
-        logger.warning("Lisans anahtarı reddedildi: %s", exc)
+        _log_rejection(raw, exc)
         return LicenseStatus.failure(REASON_INVALID)
 
     expires = verified.get("exp")
