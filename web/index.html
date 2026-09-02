@@ -20,33 +20,27 @@
      is hosted (see lpr.api.main._mount_web_ui). -->
 <link rel="stylesheet" href="static/css/app.css">
 
-<!-- Fonts are OS stacks (Segoe UI / Helvetica / Arial, Consolas / DejaVu Sans
-     Mono) and every icon in the page is a Unicode glyph or an inline <svg>, so
-     nothing here needs a webfont or an icon CDN either. -->
+<!-- Fonts are stacks, not downloads. `Geist` is named first and is not
+     bundled: a gate box has no route to a font CDN, and a webfont would add a
+     megabyte to a page that must paint on a cold, offline start. Where the
+     machine happens to have Geist installed the dashboard uses it; everywhere
+     else the stack falls through to the platform UI face. Every icon on the
+     page is a Unicode glyph or an inline <svg>, so no icon CDN either. -->
 <style>
-  /* Floor under a missing/failed stylesheet: dark ground, readable text,
-     no flash of white before app.css paints. */
+  /* Floor under a missing or failed stylesheet: dark ground, readable text,
+     no flash of white before app.css paints. Everything else -- the viewport
+     lock, .scroll-thin, .feed-in, .pulse-full -- lives in app.css so there is
+     exactly one definition of each; see PREFLIGHT in scripts/build_web_css.py. */
   :root { color-scheme: dark; }
   html, body { height: 100%; }
   body {
     margin: 0;
-    background: #10141b;
-    color: #e8ecf3;
-    font-family: 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: #09090b;
+    color: #fafafa;
+    font-family: Geist, ui-sans-serif, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif;
     /* Phones: keep content clear of the notch and the home indicator. */
     padding: env(safe-area-inset-top) env(safe-area-inset-right)
              env(safe-area-inset-bottom) env(safe-area-inset-left);
-  }
-  .scroll-thin { scrollbar-width: thin; scrollbar-color: #2c3542 transparent; }
-  .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
-  .scroll-thin::-webkit-scrollbar-track { background: transparent; }
-  .scroll-thin::-webkit-scrollbar-thumb { background: #2c3542; border-radius: 4px; }
-  @keyframes feed-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
-  .feed-in { animation: feed-in .18s ease-out; }
-  @keyframes pulse-full { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
-  .pulse-full { animation: pulse-full 1.8s ease-in-out infinite; }
-  @media (prefers-reduced-motion: reduce) {
-    .feed-in, .pulse-full { animation: none; }
   }
   [hidden] { display: none !important; }
   /* Every interactive control clears the 44px touch target on a phone. */
@@ -123,10 +117,10 @@
   left of the viewport. From `lg` up it becomes a fixed-height control-room
   layout that never scrolls as a whole.
 -->
-<div id="dashboard" hidden class="flex min-h-full flex-col gap-2.5 p-2 sm:p-2.5 lg:h-full">
+<div id="dashboard" hidden class="flex min-h-0 flex-col gap-2 p-2 sm:p-2.5 lg:h-full lg:overflow-hidden">
 
   <!-- Header ------------------------------------------------------------ -->
-  <header class="grid shrink-0 grid-cols-2 items-center gap-y-3 rounded-lg border border-line bg-chrome px-3 py-2.5 sm:px-4 lg:grid-cols-3">
+  <header class="grid shrink-0 grid-cols-2 items-center gap-y-3 rounded-xl border border-line bg-chrome px-3 py-2 sm:px-4 lg:grid-cols-3">
     <div class="flex items-center gap-2.5">
       <span class="text-xl text-accent">◉</span>
       <div class="leading-tight">
@@ -180,19 +174,107 @@
     Stil dosyası yüklenemedi (static/css/app.css). Panel sade görünümde çalışıyor.
   </div>
 
+  <!-- System telemetry (admin only) -------------------------------------
+       Every value here comes from GET /api/stats, which refreshStats() already
+       polls for the counters and the camera list -- the drawer costs no extra
+       request. It deliberately reports only what the API actually measures:
+       there is no GPU, relay or disk telemetry on this bar because the server
+       does not expose any, and a hardware panel that invents its numbers is
+       worse than no hardware panel at all.
+
+       Hidden for an operator by updateControls(), for the same reason the user
+       management button is: a distraction-free console for the role that
+       cannot act on any of it. -->
+  <section id="tel-bar" hidden
+           class="shrink-0 overflow-hidden rounded-xl border border-line bg-chrome">
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-3 py-1.5 sm:px-4">
+      <span class="text-[10px] font-bold uppercase tracking-widest text-faint">Sistem telemetrisi</span>
+      <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+        <span class="text-xs text-faint">Durum <b id="tel-q-state" class="font-mono font-medium text-muted">—</b></span>
+        <span class="text-xs text-faint">Kamera <b id="tel-q-cams" class="font-mono font-medium text-muted">—</b></span>
+        <span class="text-xs text-faint">Kare <b id="tel-q-fps" class="font-mono font-medium text-muted">—</b></span>
+        <span class="text-xs text-faint">Lisans <b id="tel-q-license" class="font-mono font-medium text-muted">—</b></span>
+      </div>
+      <button id="tel-toggle" type="button" aria-expanded="false" aria-controls="tel-body"
+              class="ml-auto rounded-md border border-line px-2.5 py-1 text-xs font-medium text-muted transition hover:border-edge hover:text-ink">
+        <span id="tel-word">Göster</span>
+      </button>
+    </div>
+
+    <div id="tel-body" data-open="false" class="tel-drawer border-t border-line px-3 py-2.5 sm:px-4">
+      <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+
+        <div class="rounded-lg border border-line bg-row p-2.5">
+          <h3 class="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-faint">Ardışık düzen</h3>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Durum</span><span id="tel-state" class="font-mono font-medium">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Çalışma</span><span id="tel-uptime" class="font-mono font-medium tabular-nums">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Okuma</span><span id="tel-read" class="font-mono font-medium tabular-nums">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Hızlı yol</span><span id="tel-fast" class="font-mono font-medium tabular-nums text-warn">—</span>
+          </div>
+        </div>
+
+        <div class="rounded-lg border border-line bg-row p-2.5">
+          <h3 class="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-faint">Görüntü işleme</h3>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Kare okundu</span><span id="tel-frames" class="font-mono font-medium tabular-nums">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Kare düştü</span><span id="tel-dropped" class="font-mono font-medium tabular-nums">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Hareketsiz atlanan</span><span id="tel-motion" class="font-mono font-medium tabular-nums">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">OCR atlanan</span><span id="tel-ocr" class="font-mono font-medium tabular-nums">—</span>
+          </div>
+        </div>
+
+        <div class="rounded-lg border border-line bg-row p-2.5">
+          <h3 class="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-faint">Kameralar</h3>
+          <div id="tel-cams" class="flex flex-col gap-1"></div>
+          <p id="tel-cams-empty" class="py-2 text-xs text-faint">Kamera bildirilmedi.</p>
+        </div>
+
+        <div class="rounded-lg border border-line bg-row p-2.5">
+          <h3 class="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-faint">Dağıtım lisansı</h3>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Durum</span><span id="tel-license" class="font-mono font-medium">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Müşteri</span><span id="tel-client" class="font-mono font-medium text-muted">—</span>
+          </div>
+          <div class="flex items-baseline justify-between py-0.5 text-xs">
+            <span class="text-muted">Bitiş</span><span id="tel-expiry" class="font-mono font-medium text-muted">—</span>
+          </div>
+          <p class="mt-1.5 text-[10px] leading-snug text-faint">
+            Erişim denetimi kullanıcı lisanslarındadır; bu lisans bariyeri etkilemez.
+          </p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
   <!-- Body: cameras | live feed ----------------------------------------- -->
-  <main class="grid min-h-0 flex-1 grid-cols-1 gap-2.5 lg:grid-cols-[3fr_minmax(320px,1fr)]">
+  <main class="grid min-h-0 flex-1 grid-cols-1 gap-2 lg:grid-cols-[3fr_minmax(320px,1fr)]">
 
     <!-- Cameras stack on a phone, sit side by side from `md` up. -->
-    <section class="grid min-h-0 grid-cols-1 gap-2.5 md:grid-cols-2">
-      <figure class="flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-card">
-        <figcaption class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2.5">
+    <section class="grid min-h-0 grid-cols-1 gap-2 md:grid-cols-2">
+      <figure class="flex min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-card">
+        <figcaption class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-line px-3 py-2">
           <span id="dot-entry" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
           <span class="text-sm font-bold tracking-wide">GİRİŞ</span>
           <span id="fps-entry" class="ml-auto font-mono text-xs text-muted"></span>
           <span id="badge-entry" class="text-xs font-bold text-bad">Bağlı Değil</span>
         </figcaption>
-        <div class="relative mx-3 mb-3 aspect-video min-h-0 overflow-hidden rounded border border-line bg-void lg:aspect-auto lg:flex-1">
+        <div class="relative aspect-video min-h-0 overflow-hidden bg-void lg:aspect-auto lg:flex-1">
           <!-- Hidden until the first frame arrives: a broken <img> paints its
                alt text over the placeholder, which reads as a bug. -->
           <img id="cam-entry" alt="Giriş kamerası canlı görüntü" hidden
@@ -203,14 +285,14 @@
         </div>
       </figure>
 
-      <figure class="flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-card">
-        <figcaption class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2.5">
+      <figure class="flex min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-card">
+        <figcaption class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-line px-3 py-2">
           <span id="dot-exit" class="h-2.5 w-2.5 shrink-0 rounded-full bg-bad transition-colors"></span>
           <span class="text-sm font-bold tracking-wide">ÇIKIŞ</span>
           <span id="fps-exit" class="ml-auto font-mono text-xs text-muted"></span>
           <span id="badge-exit" class="text-xs font-bold text-bad">Bağlı Değil</span>
         </figcaption>
-        <div class="relative mx-3 mb-3 aspect-video min-h-0 overflow-hidden rounded border border-line bg-void lg:aspect-auto lg:flex-1">
+        <div class="relative aspect-video min-h-0 overflow-hidden bg-void lg:aspect-auto lg:flex-1">
           <img id="cam-exit" alt="Çıkış kamerası canlı görüntü" hidden
                class="absolute inset-0 h-full w-full object-contain">
           <div id="ph-exit" class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-muted">
@@ -222,8 +304,8 @@
 
     <!-- Live plate feed. Bounded on a phone so it scrolls itself instead of
          pushing the control panel off the bottom of a long page. -->
-    <section class="flex max-h-[60vh] min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-card lg:max-h-none">
-      <div class="flex shrink-0 items-center justify-between border-b border-line px-3.5 py-2.5">
+    <section class="flex max-h-[60vh] min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-card lg:max-h-none">
+      <div class="flex shrink-0 items-center justify-between border-b border-line px-3.5 py-2">
         <h2 class="text-sm font-bold tracking-wide">CANLI KAYIT</h2>
         <span id="feed-count" class="font-mono text-sm font-bold text-accent">0</span>
       </div>

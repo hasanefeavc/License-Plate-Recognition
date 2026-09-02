@@ -40,18 +40,26 @@ from pathlib import Path
 #: Named colours. Keep in sync with the ``:root`` custom properties emitted
 #: into PREFLIGHT, which is what the hand-written rules in index.html read.
 COLORS: dict[str, str] = {
-    "ground": "#10141b",  # window surface
-    "chrome": "#161c26",  # header / control panel
-    "card": "#1a2029",  # card body
-    "row": "#212936",  # one row inside a card
-    "void": "#0a0d12",  # video area, no signal
-    "line": "#2c3542",
-    "ink": "#e8ecf3",
-    "muted": "#78859a",
-    "ok": "#2ecc71",
-    "bad": "#ff5c5c",
-    "warn": "#f0ad4e",
-    "accent": "#4c9aff",
+    # "Quiet Gate" palette: Tailwind's zinc scale for every neutral, and the
+    # 400-weight of each accent hue rather than the 500. The 400s are what let
+    # a status read as a tinted chip -- `bg-ok/10 text-ok border-ok/20` -- at a
+    # contrast that survives on a near-black ground; the 500s are too dark to
+    # sit on their own 10% tint and had to be used as solid blocks instead.
+    "ground": "#09090b",  # zinc-950, window surface
+    "chrome": "#111113",  # header / control panel; one step above the ground
+    "card": "#111113",  # card body -- same step, so panels read as one plane
+    "row": "#18181b",  # zinc-900, one row inside a card
+    "raise": "#1f1f23",  # hover lift on a row or a button
+    "void": "#0b0b0d",  # video area, no signal
+    "line": "#27272a",  # zinc-800, hairline borders
+    "edge": "#3f3f46",  # zinc-700, the border of a control that must be found
+    "ink": "#fafafa",  # zinc-50
+    "muted": "#71717a",  # zinc-500, secondary text
+    "faint": "#52525b",  # zinc-600, labels and disabled text
+    "ok": "#34d399",  # emerald-400
+    "bad": "#fb7185",  # rose-400
+    "warn": "#fbbf24",  # amber-400
+    "accent": "#818cf8",  # indigo-400
     # Straight from Tailwind's default palette, kept because the role chips in
     # app.js use them and nothing in the custom scale reads as "a role".
     "purple-300": "#d8b4fe",
@@ -64,8 +72,16 @@ COLORS: dict[str, str] = {
     "current": "currentColor",
 }
 
-FONT_SANS = "'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
-FONT_MONO = "Consolas, 'DejaVu Sans Mono', Menlo, monospace"
+# Geist is named first and is *not* bundled: a gate box has no route to a font
+# CDN, and shipping a webfont would add a megabyte to a page that must paint on
+# a cold, offline start. Where the operator's machine happens to have Geist
+# installed the dashboard picks it up; everywhere else the stack falls through
+# to the platform UI face, which is what the page was always drawn against.
+FONT_SANS = (
+    "Geist, 'Geist Sans', ui-sans-serif, system-ui, -apple-system, "
+    "'Segoe UI', Roboto, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+)
+FONT_MONO = "'Geist Mono', ui-monospace, 'SF Mono', Consolas, 'DejaVu Sans Mono', Menlo, monospace"
 
 #: Tailwind's default border colour. Preflight applies it to every element,
 #: which is what lets `border` on its own draw a visible line.
@@ -720,7 +736,7 @@ def _user_select(m: re.Match[str]) -> Decls:
 
 #: Classes styled by hand in ``index.html`` (animations, scrollbars). They are
 #: not utilities and must not be reported as missing.
-HAND_WRITTEN = frozenset({"scroll-thin", "feed-in", "pulse-full"})
+HAND_WRITTEN = frozenset({"scroll-thin", "feed-in", "pulse-full", "lock-screen", "tel-drawer"})
 
 #: Characters a Tailwind class can contain. Anything else in a string literal
 #: is not a class name and is discarded before the rule table ever sees it.
@@ -869,6 +885,56 @@ input::placeholder, textarea::placeholder {{ opacity: 1; color: {COLORS["muted"]
 :root {{ color-scheme: dark; }}
 
 @keyframes lpr-spin {{ to {{ transform: rotate(360deg); }} }}
+
+/* --------------------------------------------------------------------------
+   Viewport lock -- the console occupies exactly one screen and never scrolls.
+
+   `100dvh` rather than `100vh`: on mobile browsers `vh` is measured against
+   the viewport with the URL bar *retracted*, so a `100vh` page is taller than
+   the screen it is on and scrolls by exactly the height of that bar. `dvh`
+   tracks the bar as it collapses. `vh` stays as the fallback for engines that
+   do not know the dynamic units.
+
+   The lock lives here rather than on a utility class because it has to hold
+   for `html` and `body` together -- an `overflow: hidden` on one of them alone
+   is propagated to the viewport rather than clipping, and the page scrolls
+   anyway.
+   -------------------------------------------------------------------------- */
+html, body {{ height: 100vh; height: 100dvh; }}
+body {{ overflow: hidden; }}
+
+/* The escape hatch. A single-screen lock is right for the console it was
+   designed for -- a gatehouse monitor or a desk. On a phone, or a window too
+   short to hold two camera panes and the feed at a usable size, honouring it
+   would shrink the video to a letterbox, so below these thresholds the page
+   reverts to its natural height and scrolls. */
+@media (max-width: 1023px), (max-height: 560px) {{
+  html, body {{ height: auto; min-height: 100%; }}
+  body {{ overflow: visible; }}
+}}
+
+/* Thin scrollbar for every bounded, internally-scrolling region: the plate
+   feed and each modal body. 6px, zinc-700 thumb, no track. */
+.scroll-thin {{ scrollbar-width: thin; scrollbar-color: {COLORS["edge"]} transparent; }}
+.scroll-thin::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+.scroll-thin::-webkit-scrollbar-track {{ background: transparent; }}
+.scroll-thin::-webkit-scrollbar-thumb {{
+  background: {COLORS["edge"]};
+  border-radius: 999px;
+}}
+.scroll-thin::-webkit-scrollbar-thumb:hover {{ background: {COLORS["muted"]}; }}
+
+/* The admin telemetry drawer. Collapsed height is driven by the `hidden`
+   attribute on the body, not by a class, so app.js toggles one property. */
+.tel-drawer[data-open="false"] {{ display: none; }}
+
+@keyframes feed-in {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: none; }} }}
+.feed-in {{ animation: feed-in .18s ease-out; }}
+@keyframes pulse-full {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: .55; }} }}
+.pulse-full {{ animation: pulse-full 1.8s ease-in-out infinite; }}
+@media (prefers-reduced-motion: reduce) {{
+  .feed-in, .pulse-full {{ animation: none; }}
+}}
 
 /* Read by init() in app.js to prove this stylesheet actually loaded. */
 :root {{ --lpr-css: 1; }}

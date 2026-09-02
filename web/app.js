@@ -193,6 +193,12 @@
     "settings-status", "capacity-input", "capacity-hint", "quality-select",
     "capacity-section", "capacity-divider",
     "occupancy", "capacity", "full-banner",
+    // System telemetry drawer (admin only)
+    "tel-bar", "tel-toggle", "tel-word", "tel-body",
+    "tel-q-state", "tel-q-cams", "tel-q-fps", "tel-q-license",
+    "tel-state", "tel-uptime", "tel-read", "tel-fast",
+    "tel-frames", "tel-dropped", "tel-motion", "tel-ocr",
+    "tel-cams", "tel-cams-empty", "tel-license", "tel-client", "tel-expiry",
     // System update (inside the settings modal)
     "settings-ota-section", "update-version", "update-branch", "update-dirty-row",
     "update-run", "update-check", "update-run-label", "update-spinner", "update-status",
@@ -701,10 +707,96 @@
    *  dropping the message here is clearer than removing the plumbing on both
    *  sides at once. The header badge is `renderLicenseBadge`, and it reads the
    *  *user's* licence. */
-  function applyLicense(_license) {
-    // Nothing to display, and nothing to block: `state.licenceValid` stays
-    // true so no control is disabled on the deployment licence's account.
+  function applyLicense(license) {
+    // Nothing to block: `state.licenceValid` stays true so no control is
+    // disabled on the deployment licence's account. The payload is kept only
+    // so the admin telemetry drawer can *report* it -- reporting a licence and
+    // gating on one are different things, and this stays firmly the former.
     state.licenceValid = true;
+    state.deployLicense = license || {};
+    renderLicenseTelemetry();
+  }
+
+  // -----------------------------------------------------------------------
+  // Admin telemetry drawer
+  // -----------------------------------------------------------------------
+
+  /** Thousands-separated, in the page's locale. */
+  function count(value) { return (Number(value) || 0).toLocaleString("tr-TR"); }
+
+  /** Paint the drawer from a /api/stats payload.
+   *
+   *  Every row is something the server measures. There is deliberately no GPU,
+   *  relay or disk row: the API exposes none of them, and a hardware health
+   *  panel is read as authoritative -- one that invents its numbers is worse
+   *  than no panel at all. Add the rows when there is an endpoint behind them.
+   */
+  function renderTelemetry(stats) {
+    if (!el["tel-bar"] || !stats) return;
+    const cameras = Array.isArray(stats.cameras) ? stats.cameras : [];
+    const connected = cameras.filter((camera) => camera && camera.connected).length;
+    const sum = (key) =>
+      cameras.reduce((total, camera) => total + (Number(camera && camera[key]) || 0), 0);
+    const fps = cameras.reduce((best, camera) => Math.max(best, Number(camera.fps) || 0), 0);
+    const running = Boolean(stats.running);
+
+    setText(el["tel-q-state"], running ? "çalışıyor" : "durdu");
+    setText(el["tel-q-cams"], `${connected}/${cameras.length}`);
+    setText(el["tel-q-fps"], cameras.length ? `${fps.toFixed(1)} FPS` : "—");
+
+    setText(el["tel-state"], running ? "Çalışıyor" : "Durdu");
+    if (el["tel-state"]) {
+      el["tel-state"].className =
+        `font-mono font-medium ${running ? TEXT_CLASSES.ok : TEXT_CLASSES.bad}`;
+    }
+    setText(el["tel-uptime"], state.uptimeKnown ? formatUptime(state.uptimeSeconds) : "--:--:--");
+    setText(el["tel-read"], count(stats.plates_read));
+    setText(el["tel-fast"], count(stats.fast_path_hits));
+    setText(el["tel-frames"], count(sum("frames_read")));
+    setText(el["tel-dropped"], count(sum("frames_dropped")));
+    setText(el["tel-motion"], count(sum("motion_skipped")));
+    setText(el["tel-ocr"], count(stats.ocr_skipped));
+
+    const host = el["tel-cams"];
+    if (!host) return;
+    host.textContent = "";
+    cameras.forEach((camera) => {
+      const row = document.createElement("div");
+      row.className = "flex items-baseline justify-between gap-2 py-0.5 text-xs";
+
+      const name = document.createElement("span");
+      name.className = "truncate text-muted";
+      const source = String(camera.source || "kaynak atanmadı");
+      name.title = source;
+      name.textContent = `${CAMERA_LABELS[camera.role] || camera.role} · ${source}`;
+
+      const value = document.createElement("span");
+      value.className =
+        `shrink-0 font-mono font-medium ${camera.connected ? TEXT_CLASSES.ok : TEXT_CLASSES.bad}`;
+      value.textContent = camera.connected
+        ? `${(Number(camera.fps) || 0).toFixed(1)} FPS`
+        : "bağlı değil";
+
+      row.append(name, value);
+      host.append(row);
+    });
+    if (el["tel-cams-empty"]) el["tel-cams-empty"].hidden = cameras.length > 0;
+  }
+
+  /** The drawer's deployment-licence card. Reporting only -- see applyLicense. */
+  function renderLicenseTelemetry() {
+    const info = state.deployLicense || {};
+    const known = Object.keys(info).length > 0;
+    const valid = Boolean(info.valid);
+    if (el["tel-license"]) {
+      el["tel-license"].textContent = known ? (valid ? "Geçerli" : "Geçersiz") : "—";
+      el["tel-license"].className =
+        `font-mono font-medium ${valid ? TEXT_CLASSES.ok : TEXT_CLASSES.warn}`;
+    }
+    setText(el["tel-client"], info.client || "—");
+    setText(el["tel-expiry"], String(info.expires_at || "—").slice(0, 10));
+    const days = Number(info.days_remaining);
+    setText(el["tel-q-license"], Number.isFinite(days) ? `${Math.floor(days)}g` : (known ? "—" : "—"));
   }
 
   // -----------------------------------------------------------------------
@@ -721,6 +813,7 @@
       state.uptimeKnown = true;
       setText(el.uptime, formatUptime(state.uptimeSeconds));
       setCameraStatus(stats.cameras);
+      renderTelemetry(stats);
     } catch (err) {
       state.uptimeKnown = false;
       setText(el.uptime, "--:--:--");
@@ -793,6 +886,10 @@
     // User management is admin-only server-side; hide the entry point rather
     // than opening a modal whose every request returns 403.
     if (el["btn-users"]) el["btn-users"].hidden = !isAdmin;
+    // Same reasoning for the telemetry drawer, plus one of its own: an
+    // operator cannot act on a dropped-frame count or a licence expiry, and a
+    // gatehouse console is easier to read without them.
+    if (el["tel-bar"]) el["tel-bar"].hidden = !isAdmin;
     if (el["btn-pause"]) {
       el["btn-pause"].disabled = false;
       el["btn-pause"].textContent = state.paused ? "Devam Et" : "Duraklat";
@@ -2509,6 +2606,16 @@
     el["btn-plates"].addEventListener("click", openPlates);
     el["btn-history"].addEventListener("click", openHistory);
     if (el["btn-users"]) el["btn-users"].addEventListener("click", openUsers);
+    if (el["tel-toggle"]) {
+      el["tel-toggle"].addEventListener("click", () => {
+        const body = el["tel-body"];
+        if (!body) return;
+        const open = body.dataset.open !== "true";
+        body.dataset.open = String(open);
+        el["tel-toggle"].setAttribute("aria-expanded", String(open));
+        setText(el["tel-word"], open ? "Gizle" : "Göster");
+      });
+    }
     el["btn-settings"].addEventListener("click", openSettings);
     if (el["update-run"]) el["update-run"].addEventListener("click", () => runUpdate(false));
     if (el["update-force"]) {
