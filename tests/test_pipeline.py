@@ -1171,12 +1171,12 @@ def _ladder(text: str = "34ABC123", confidence: float = 0.95) -> LadderRecognize
     return LadderRecognizer([_read(text, confidence)] * 3)
 
 
-def test_a_registered_plate_opens_the_gate_on_its_first_view(db, frame, caplog) -> None:
+def test_the_fast_path_still_stops_the_ladder_early(db, frame, caplog) -> None:
     """The saving, asserted where it happens: two OCR passes never run.
 
-    The voter here confirms *nothing* — so an event at all proves the decision
-    did not come through the multi-frame path, and `views == 1` proves the
-    enhanced views were never computed.
+    This is the half of the fast path that survives by default. It is pure
+    latency inside the recogniser and has no bearing on the barrier, so it
+    still runs -- but the read now goes to the voter like any other.
     """
     import logging
 
@@ -1190,11 +1190,45 @@ def test_a_registered_plate_opens_the_gate_on_its_first_view(db, frame, caplog) 
         events = pipeline.process_frame("entry", frame)
 
     assert recognizer.views == 1, "the escalation ladder should have stopped at view 1"
+    assert pipeline.stats().fast_path_hits == 1, "the hit is still recorded"
+    assert voter.submissions, "the read must reach the voter"
+    assert events == [], "an unconfirmed plate must not move the barrier"
+    assert relay.triggers == 0
+
+
+def test_a_confident_registered_read_does_not_open_the_gate_on_one_frame(db, frame) -> None:
+    """The safety property, stated directly.
+
+    Measured on 47 labelled frames from a live site, correct reads score 0.905
+    to 0.999 and the wrong ones score 0.949 and 0.955 -- the distributions
+    overlap, so a confident read is not evidence of a correct one. Nothing may
+    move the barrier on a single unvetted frame by default.
+    """
+    PlateRepository().upsert("34ABC123", owner="Ahmet")
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    pipeline = _build_pipeline(db, voter=voter, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert events == []
+    assert relay.triggers == 0
+    assert voter.submissions, "the decision must go through the multi-frame vote"
+
+
+def test_the_single_frame_bypass_can_be_opted_into(db, frame) -> None:
+    """Still available for a site that has measured its own risk and wants it."""
+    db.voting.fast_path_opens_gate = True
+    PlateRepository().upsert("34ABC123", owner="Ahmet")
+    relay = FakeRelay()
+    voter = FakeVoter(confirm=False)
+    pipeline = _build_pipeline(db, voter=voter, relay=relay)
+
+    events = pipeline.process_frame("entry", frame)
+
     assert [e.action for e in events] == [str(Action.GRANTED)]
     assert relay.triggers == 1
-    assert voter.submissions == [], "the fast path must not go through the voter"
-    assert pipeline.stats().fast_path_hits == 1
-    assert "34ABC123 registered, gate opened" in caplog.text
+    assert voter.submissions == [], "the opt-in path skips the voter"
 
 
 def test_an_unregistered_plate_still_pays_for_the_whole_ladder(db, frame) -> None:
@@ -1286,21 +1320,19 @@ def test_a_recogniser_that_never_heard_of_the_fast_path_still_works(db, frame) -
 
     `FakeRecognizer.recognize` takes only a crop, so the orchestrator must not
     call it with a keyword it cannot accept. It loses the *ladder* half of the
-    fast path -- there is no predicate to stop the escalation early -- but not
-    the half that matters at the barrier: the finished read is still checked
-    against the whitelist and still opens the gate on its own frame.
+    fast path -- there is no predicate to stop the escalation early -- but the
+    finished read is still checked against the whitelist, so the hit is still
+    recorded and the plate still reaches the voter.
     """
     PlateRepository().upsert("34ABC123")
     relay = FakeRelay()
     voter = FakeVoter(confirm=False)
     pipeline = _build_pipeline(db, voter=voter, relay=relay)  # plain FakeRecognizer
 
-    events = pipeline.process_frame("entry", frame)
+    pipeline.process_frame("entry", frame)
 
-    assert [e.action for e in events] == [str(Action.GRANTED)]
-    assert relay.triggers == 1
     assert pipeline.stats().fast_path_hits == 1
-    assert voter.submissions == [], "a fast-path hit does not go through the voter"
+    assert voter.submissions, "the read still goes through the voter"
 
 
 def test_the_fast_path_still_needs_the_whitelist_without_a_predicate(db, frame) -> None:
@@ -1328,8 +1360,8 @@ def test_the_fast_path_fires_on_a_confident_read_the_ladder_never_probed(db, fra
 
     `accept` is consulted *during* escalation, so a recogniser whose last view
     is the one that finally reads the plate has already spent its passes by the
-    time the answer exists. The gate must still open on this frame rather than
-    waiting for `voting.min_votes` more of them.
+    time the answer exists. The hit is still recognised and recorded at the
+    finish; what it no longer does by default is move the barrier.
     """
     PlateRepository().upsert("34ABC123")
     relay = FakeRelay()
@@ -1347,9 +1379,9 @@ def test_the_fast_path_fires_on_a_confident_read_the_ladder_never_probed(db, fra
     events = pipeline.process_frame("entry", frame)
 
     assert recognizer.views == 3, "the ladder had to run; there was nothing to accept"
-    assert [e.action for e in events] == [str(Action.GRANTED)]
-    assert relay.triggers == 1
     assert pipeline.stats().fast_path_hits == 1
+    assert events == [], "confirmation is the voter's to give"
+    assert relay.triggers == 0
 
 
 def test_the_fast_path_survives_a_database_wobble(db, frame, monkeypatch) -> None:

@@ -188,6 +188,12 @@ voting:
   # risk stays bounded by the whitelist check -- a wrong string has to spell a
   # plate that is actually registered at this site before anything moves.
   fast_path_confidence: 0.82
+  # Whether a fast-path hit may open the barrier on a SINGLE frame,
+  # skipping the multi-frame vote. Off: measured on 47 labelled frames,
+  # correct reads scored 0.905-0.999 and the wrong ones 0.949/0.955, so
+  # no confidence threshold separates them. The OCR early-exit half of
+  # the fast path still runs either way.
+  fast_path_opens_gate: false
 
 relay:
   enabled: true

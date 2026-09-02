@@ -739,6 +739,36 @@ class VotingConfig(BaseModel):
     #: would discard would be a downgrade in accuracy wearing the word
     #: "optimisation".
     fast_path_confidence: float = Field(default=0.82, ge=0.0, le=1.0)
+    #: Whether a fast-path hit may open the barrier on a **single frame**,
+    #: skipping the multi-frame vote entirely.
+    #:
+    #: Off. This is a safety default, and it is the one setting here that can
+    #: move a barrier on evidence nothing corroborated.
+    #:
+    #: The fast path was built when a per-frame read was often wrong in
+    #: *obvious* ways -- a low-confidence read was a bad read, so a confident
+    #: one was worth acting on. Measured against 47 hand-labelled frames from a
+    #: live site, that premise no longer holds: correct reads score 0.905 to
+    #: 0.999 (median 0.989) and the two wrong ones score 0.949 and 0.955. The
+    #: distributions overlap, and the wrong reads sit *above* the 5th
+    #: percentile of the right ones. A modern recogniser that misreads a glyph
+    #: is not hesitant about it -- it is confidently wrong, every frame, in the
+    #: same way. No confidence threshold separates those cases, and raising one
+    #: until it excludes the two known failures is fitting a barrier's safety
+    #: policy to a sample of two.
+    #:
+    #: Multi-frame voting is not much protection against a *systematic* misread
+    #: either -- the same wrong plate repeats and confirms itself -- but it is
+    #: the only protection there is against a one-off, and it costs almost
+    #: nothing: two votes at 15 FPS is about 130 ms in front of a barrier that
+    #: takes seconds to physically open. The fast path was trading the entire
+    #: corroboration property for a rounding error on a mechanical operation.
+    #:
+    #: Turning this off does **not** disable the fast path. Its other job --
+    #: letting the recogniser stop escalating through enhanced views once a
+    #: registered plate has been read cleanly -- is pure latency with no
+    #: bearing on the gate, and still runs. Only the vote bypass is gone.
+    fast_path_opens_gate: bool = False
 
 
 class RelayConfig(BaseModel):

@@ -258,6 +258,11 @@ class PipelineOrchestrator:
         # does not, and must keep working unchanged -- it simply reads the crop
         # to the end and gets the whitelist check afterwards instead, which is
         # the half of the fast path that actually opens the gate early.
+        # Whether a fast-path hit may skip the vote and move the barrier on one
+        # frame. Off by default -- see VotingConfig.fast_path_opens_gate. The
+        # probe still runs either way; only its authority over the gate is
+        # gated by this.
+        self._fast_path_opens_gate = bool(getattr(voting, "fast_path_opens_gate", False))
         self._fast_path_probes = self._fast_path_enabled and _accepts_predicate(recognizer)
         if self._fast_path_enabled:
             logger.info(
@@ -856,15 +861,9 @@ class PipelineOrchestrator:
 
             confirmed: str | None
             if fast_plate:
-                # The multi-frame vote is skipped, not merely won early: this
-                # plate is on the list and was read cleanly, so the frames the
-                # voter would spend agreeing with itself are latency at a
-                # barrier with a car sitting in front of it. `probe.plate` is
-                # the exact string that was authorised -- identical to
-                # `read.text` by construction, since the vote it accepted is
-                # the vote the recogniser then returned, but acting on the
-                # string that actually cleared the whitelist keeps that
-                # equivalence from being load-bearing.
+                # The hit is recorded either way: it is what the ladder used to
+                # stop early, and the ratio against `grants` is the metric that
+                # says whether the fast path is earning its keep.
                 with self._stats_lock:
                     self._stats.fast_path_hits += 1
                 logger.debug(
@@ -873,8 +872,20 @@ class PipelineOrchestrator:
                     fast_plate,
                     read.confidence,
                 )
+
+            if fast_plate and self._fast_path_opens_gate:
+                # Opt-in, and off by default. This skips the multi-frame vote
+                # outright, so the barrier moves on a single unvetted frame.
+                # `probe.plate` is the exact string that cleared the whitelist
+                # -- identical to `read.text` by construction, but acting on the
+                # authorised string keeps that equivalence from being
+                # load-bearing.
                 confirmed = fast_plate
             else:
+                # Everything else -- including a fast-path hit -- goes through
+                # the voter. A confidently wrong read is still wrong, and two
+                # frames at 15 FPS cost about 130 ms in front of a barrier that
+                # takes seconds to open.
                 confirmed = self._submit(camera, read, track_id)
             if not confirmed:
                 continue
