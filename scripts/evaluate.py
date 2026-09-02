@@ -94,20 +94,27 @@ def find_images(root: Path) -> tuple[list[Path], list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def build_stack(device: str, settings: object) -> tuple[object, object]:
-    """A detector and a recogniser pinned to ``device``.
+def build_stack(device: str, settings: object, backend: str | None = None) -> tuple[object, object]:
+    """A detector and a recogniser pinned to ``device`` and ``backend``.
 
     Built per device rather than once and moved: ultralytics and EasyOCR both
     decide their execution provider at construction, and mutating that
     afterwards is the kind of thing that appears to work and silently runs on
     the wrong hardware -- which is precisely what a latency benchmark must not
-    do.
+    do. The same argument applies to the OCR backend, which is why it is set
+    here and not swapped on a live recogniser.
     """
     from lpr.detect import build_detector
     from lpr.ocr import build_recognizer
 
     settings.detection.device = device  # type: ignore[attr-defined]
     settings.ocr.gpu = "true" if device not in ("cpu", "") else "false"  # type: ignore[attr-defined]
+    if backend:
+        settings.ocr.backend = backend  # type: ignore[attr-defined]
+        # An ensemble would pool this backend with whatever config.yaml names,
+        # which is the opposite of a comparison: clear it so each run measures
+        # exactly one engine.
+        settings.ocr.ensemble_backends = []  # type: ignore[attr-defined]
 
     detector = build_detector(settings)
     recognizer = build_recognizer(settings)
@@ -173,9 +180,10 @@ def run_pass(
     settings: object,
     min_confidence: float,
     warmup: int,
+    backend: str | None = None,
 ) -> Metrics:
-    """Evaluate every image on one device."""
-    detector, recognizer = build_stack(device, settings)
+    """Evaluate every image on one device with one OCR backend."""
+    detector, recognizer = build_stack(device, settings, backend)
 
     # Warm-up frames are timed and thrown away. The first inference of a
     # session pays for lazy CUDA context creation, cuDNN autotuning and the
@@ -203,6 +211,61 @@ def run_pass(
 # ---------------------------------------------------------------------------
 # Devices
 # ---------------------------------------------------------------------------
+
+
+def resolve_backends(args: argparse.Namespace) -> list[str]:
+    """Which OCR engines to measure, in order.
+
+    ``--compare-backends`` is the whole point of the flag: the PaddleOCR
+    backend has been wired into this project for a while with no way to answer
+    "is it better here", which is a question only this script can settle.
+    """
+    if getattr(args, "compare_backends", False):
+        from lpr.ocr import BACKENDS
+
+        return list(BACKENDS)
+    return [args.backend] if getattr(args, "backend", "") else [""]
+
+
+def print_comparison(comparison: dict[str, dict[str, Metrics]]) -> None:
+    """A side-by-side table, so a comparison run does not have to be read twice.
+
+    Prints nothing rather than a header with no rows: a run where every extra
+    engine was skipped for being uninstalled has compared nothing, and saying
+    so with an empty table would look like a result.
+    """
+    rows = [
+        (backend, device, metrics)
+        for backend, per_device in comparison.items()
+        for device, metrics in per_device.items()
+    ]
+    if len(rows) < 2:
+        return
+
+    def pct(value: float | None) -> str:
+        return "   n/a" if value is None else f"{value * 100:5.2f}%"
+
+    def ms(value: float | None) -> str:
+        return "   n/a" if value is None else f"{value:6.1f}"
+
+    print()
+    print("[eval] ===== BACKEND COMPARISON =====")
+    print(
+        f"  {'backend':<12} {'device':<6} {'accuracy':>9} {'CER':>8} "
+        f"{'wrong':>8} {'p50 ms':>8} {'p95 ms':>8}"
+    )
+    for backend, device, metrics in rows:
+        print(
+            f"  {backend or 'configured':<12} {device:<6} {pct(metrics.plate_accuracy):>9} "
+            f"{pct(metrics.cer):>8} {pct(metrics.wrong_plate_rate):>8} "
+            f"{ms(metrics.latency_p50):>8} {ms(metrics.latency_p95):>8}"
+        )
+
+    best = max(rows, key=lambda row: row[2].plate_accuracy or 0.0)
+    print(
+        f"\n  highest plate accuracy: {best[0]} on {best[1]} "
+        f"({pct(best[2].plate_accuracy).strip()})"
+    )
 
 
 def resolve_devices(requested: str) -> list[str]:
@@ -320,6 +383,17 @@ def build_parser() -> argparse.ArgumentParser:
         "filenames. Entries here win over filenames.",
     )
     parser.add_argument(
+        "--backend",
+        default="",
+        help="OCR backend to measure (easyocr, paddleocr). Blank uses config.yaml.",
+    )
+    parser.add_argument(
+        "--compare-backends",
+        action="store_true",
+        help="Measure every supported OCR backend against the same images and "
+        "print a side-by-side table. Overrides --backend.",
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         choices=("cpu", "cuda", "both"),
@@ -424,41 +498,66 @@ def main(argv: list[str] | None = None) -> int:
     }
     failures: list[str] = []
 
+    backends = resolve_backends(args)
+    #: backend -> device -> Metrics, for the side-by-side table at the end.
+    comparison: dict[str, dict[str, Metrics]] = {}
     for device in devices:
-        print()
-        print(f"[eval] ===== {device.upper()} =====")
-        try:
-            metrics = run_pass(labelled, truth_map, device, settings, min_confidence, args.warmup)
-        except ImportError as exc:
-            print(f"[eval] ERROR: a required package is missing ({exc}).", file=sys.stderr)
-            return 2
+        for backend in backends:
+            label = device.upper() if len(backends) == 1 else f"{device.upper()} / {backend}"
+            print()
+            print(f"[eval] ===== {label} =====")
+            try:
+                metrics = run_pass(
+                    labelled, truth_map, device, settings, min_confidence, args.warmup, backend
+                )
+            except ImportError as exc:
+                if len(backends) > 1:
+                    # One engine missing must not lose the run for the other:
+                    # comparing to nothing is still worth more than comparing
+                    # to a traceback.
+                    print(f"[eval] SKIP {backend}: not installed ({exc}).", file=sys.stderr)
+                    continue
+                print(f"[eval] ERROR: a required package is missing ({exc}).", file=sys.stderr)
+                return 2
+            except RuntimeError as exc:
+                if len(backends) > 1:
+                    print(f"[eval] SKIP {backend}: {exc}", file=sys.stderr)
+                    continue
+                raise
+            comparison.setdefault(backend, {})[device] = metrics
+            key = device if len(backends) == 1 else f"{device}/{backend}"
 
-        print(metrics.summary())
-        report["devices"][device] = metrics.to_dict()  # type: ignore[index]
+            print(metrics.summary())
+            report["devices"][key] = metrics.to_dict()  # type: ignore[index]
 
-        if args.show_failures and metrics.worst:
-            print(f"[eval]   worst {min(args.show_failures, len(metrics.worst))}:")
-            for sample in metrics.worst[: args.show_failures]:
-                got = sample.predicted or "(nothing)"
-                print(
-                    f"[eval]     {sample.image:<32} want {sample.truth or '(none)':<10} "
-                    f"got {got:<10} conf {sample.confidence:.2f} "
-                    f"boxes {sample.detections}"
+            if args.show_failures and metrics.worst:
+                print(f"[eval]   worst {min(args.show_failures, len(metrics.worst))}:")
+                for sample in metrics.worst[: args.show_failures]:
+                    got = sample.predicted or "(nothing)"
+                    print(
+                        f"[eval]     {sample.image:<32} want {sample.truth or '(none)':<10} "
+                        f"got {got:<10} conf {sample.confidence:.2f} "
+                        f"boxes {sample.detections}"
+                    )
+
+            # Accuracy gates apply once, on the first device and the first
+            # backend: accuracy is a property of the model, not of the hardware,
+            # and gating every combination would fail a comparison run for the
+            # engine it was run to evaluate. Only latency is judged per device.
+            if device == devices[0] and backend == backends[0]:
+                failures.extend(check_thresholds(metrics, args))
+            elif (
+                args.max_latency_p95 > 0
+                and metrics.latency_p95
+                and metrics.latency_p95 > args.max_latency_p95
+            ):
+                failures.append(
+                    f"[{label}] p95 latency {metrics.latency_p95:.1f} ms exceeds "
+                    f"--max-latency-p95 {args.max_latency_p95:.1f} ms"
                 )
 
-        # Accuracy gates apply once, on CPU, because accuracy is a property of
-        # the model and not of the device. Only latency is judged per device.
-        if device == devices[0]:
-            failures.extend(check_thresholds(metrics, args))
-        elif (
-            args.max_latency_p95 > 0
-            and metrics.latency_p95
-            and metrics.latency_p95 > args.max_latency_p95
-        ):
-            failures.append(
-                f"[{device}] p95 latency {metrics.latency_p95:.1f} ms exceeds "
-                f"--max-latency-p95 {args.max_latency_p95:.1f} ms"
-            )
+    if len(backends) > 1:
+        print_comparison(comparison)
 
     if args.json:
         destination = Path(args.json).expanduser()

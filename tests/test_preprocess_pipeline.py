@@ -556,3 +556,112 @@ def test_a_predicate_that_never_agrees_changes_nothing() -> None:
     with_predicate.recognize(scene, accept=lambda _read: False)
 
     assert len(with_predicate.variants_seen) == len(plain.variants_seen)
+
+
+# ---------------------------------------------------------------------------
+# Euroband suppression
+# ---------------------------------------------------------------------------
+
+
+def _plate_crop(band_fraction: float = 0.12, band_bgr: tuple = (150, 40, 20)) -> Any:
+    """A white plate with an optional blue band, stars and "TR" on the left."""
+    import cv2
+
+    width, height = 260, 64
+    image = np.full((height, width, 3), 235, np.uint8)
+    band = int(width * band_fraction)
+    if band:
+        image[:, :band] = band_bgr
+        # The band is not solid blue: the stars and the lettering cut through
+        # it, which is the reason the detector tolerates gaps at all.
+        cv2.circle(image, (band // 2, height // 4), max(1, band // 6), (60, 220, 230), -1)
+        cv2.putText(image, "TR", (2, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255,) * 3, 1)
+    cv2.putText(
+        image, "34ABC123", (band + 6, height - 16), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (20,) * 3, 2
+    )
+    return image
+
+
+def test_the_blue_band_is_removed_from_the_left_edge() -> None:
+    from lpr.detect.preprocess import strip_euroband
+
+    crop = _plate_crop(0.12)
+    stripped = strip_euroband(crop)
+    removed = 1 - stripped.shape[1] / crop.shape[1]
+    assert 0.10 < removed < 0.20
+
+
+def test_a_crop_with_no_band_is_returned_untouched() -> None:
+    """Identity, not a copy: a caller can tell "no band" from "band removed".
+
+    This is the case that makes a blind "drop the leftmost 12%" wrong. A
+    detector box is often tight around the number, and cutting on faith eats
+    the province digit and creates the error the feature exists to remove.
+    """
+    from lpr.detect.preprocess import strip_euroband
+
+    crop = _plate_crop(0.0)
+    assert strip_euroband(crop) is crop
+
+
+def test_an_all_blue_crop_keeps_its_width() -> None:
+    """A blue run that never ends is not a band bounded by plate.
+
+    Requiring only "blue from the left edge" fired on 55% of this project's
+    real crops and removed a fifth of each -- on a dusk or IR frame the whole
+    crop is blue-ish and the run simply reaches the search limit.
+    """
+    from lpr.detect.preprocess import strip_euroband
+
+    crop = np.full((64, 260, 3), (150, 40, 20), np.uint8)
+    assert strip_euroband(crop) is crop
+
+
+def test_a_blue_patch_away_from_the_edge_is_not_a_band() -> None:
+    from lpr.detect.preprocess import strip_euroband
+
+    crop = _plate_crop(0.0)
+    crop[:, 120:150] = (150, 40, 20)
+    assert strip_euroband(crop) is crop
+
+
+def test_a_grayscale_crop_is_returned_untouched() -> None:
+    """No colour, no evidence, no cut."""
+    import cv2
+
+    from lpr.detect.preprocess import strip_euroband
+
+    gray = cv2.cvtColor(_plate_crop(0.12), cv2.COLOR_BGR2GRAY)
+    assert strip_euroband(gray) is gray
+
+
+def test_a_dark_night_band_is_still_found() -> None:
+    from lpr.detect.preprocess import strip_euroband
+
+    crop = _plate_crop(0.12, band_bgr=(70, 18, 8))
+    assert strip_euroband(crop).shape[1] < crop.shape[1]
+
+
+def test_a_tiny_crop_is_left_alone() -> None:
+    from lpr.detect.preprocess import strip_euroband
+
+    crop = np.full((6, 10, 3), 200, np.uint8)
+    assert strip_euroband(crop) is crop
+
+
+def test_never_more_than_the_cap_is_removed() -> None:
+    from lpr.detect.preprocess import EUROBAND_MAX_FRACTION, strip_euroband
+
+    crop = _plate_crop(0.20)
+    stripped = strip_euroband(crop)
+    removed = 1 - stripped.shape[1] / crop.shape[1]
+    assert removed <= EUROBAND_MAX_FRACTION + 0.01
+
+
+def test_enhance_plate_strips_the_band_before_it_reads_anything() -> None:
+    """The wiring, not just the function: enhance_plate must call it on colour."""
+    from lpr.detect.preprocess import enhance_plate
+
+    banded = enhance_plate(_plate_crop(0.12))
+    plain = enhance_plate(_plate_crop(0.0))
+    assert banded.gray.shape[1] < plain.gray.shape[1]

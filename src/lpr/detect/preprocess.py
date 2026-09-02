@@ -58,9 +58,63 @@ __all__ = [
     "rectify_perspective",
     "separate_characters",
     "sharpness",
+    "strip_euroband",
     "stretch_contrast",
     "unsharp_mask",
 ]
+
+#: Hue range of the blue euroband, in OpenCV's 0-179 hue scale (so ~200-270
+#: degrees). Wide, because the band's rendered colour moves a long way between
+#: a sunlit plate, a dusk one and an IR-lit night frame -- and because a false
+#: *negative* here costs nothing, while a narrow range that misses the band on
+#: half the frames would make this feature look broken rather than absent.
+EUROBAND_HUE = (100, 135)
+
+#: Minimum saturation and value for a pixel to count as band blue. The floors
+#: are what keep a dark or desaturated background -- a night sky, a black car,
+#: a shadowed bumper -- from reading as a band and eating the province digits.
+EUROBAND_MIN_SATURATION = 70
+EUROBAND_MIN_VALUE = 35
+
+#: A column counts as band once this fraction of its pixels are blue. Well
+#: under half on purpose: the band carries white "TR" lettering and the EU
+#: stars, which are not blue at all, so a column through the text is only
+#: partly blue even on a perfect crop.
+EUROBAND_COLUMN_COVERAGE = 0.35
+
+#: How far right the search runs, as a fraction of crop width. A euroband is
+#: about 11-13% of a Turkish plate; the extra margin absorbs a crop with some
+#: bumper on the left, and the cap is what stops a blue vehicle from having its
+#: whole plate "de-banded" away.
+EUROBAND_MAX_FRACTION = 0.22
+
+#: A detected band narrower than this is noise -- a blue rivet, a reflection,
+#: JPEG ringing on the frame -- not the band.
+EUROBAND_MIN_FRACTION = 0.03
+
+#: Columns of non-blue allowed *inside* the band, as a fraction of the band
+#: found so far. The "TR" glyphs and the star ring cut through it and are each
+#: a few columns wide, but they are narrow relative to the band that contains
+#: them -- so the tolerance scales with the run rather than with the search
+#: window, which is what stops a run from bridging arbitrary gaps and creeping
+#: to the edge of the search.
+EUROBAND_MAX_GAP_FRACTION = 0.35
+
+#: Consecutive non-blue columns that end the band, as a fraction of the search
+#: window. This is the discriminator that matters: a real euroband is followed
+#: by white plate, so the run *terminates inside the window*. Measured on this
+#: project's own crops, requiring nothing more than "blue from the left edge"
+#: fired on 55% of frames and removed a mean 21.3% of the width -- pinned at
+#: the cap, because on a dusk or IR frame the whole crop is blue-ish and the
+#: run simply never ended. Demanding a clear stretch after the band turns that
+#: from a detection into a rejection.
+EUROBAND_CLEAR_RUN_FRACTION = 0.18
+
+#: Cut this much further right than the last blue column, as a fraction of the
+#: band's own width. The band's right edge is a bright boundary that
+#: binarisation turns into a stroke, which is one of the phantom characters
+#: this exists to remove.
+EUROBAND_MARGIN_FRACTION = 0.12
 
 #: Target height a plate crop is upscaled to before OCR.
 TARGET_CROP_HEIGHT = 64
@@ -355,6 +409,103 @@ def crop_with_padding(
         return frame
 
 
+def strip_euroband(crop: np.ndarray) -> np.ndarray:
+    """Remove the blue EU/TR band from the left edge of a plate crop.
+
+    The band is not part of the number, but it is part of the picture the
+    recogniser is shown, and it reads as characters: measured over 47 labelled
+    frames, 11 of 71 character errors were *insertions* -- a glyph that exists
+    in the read and not on the plate -- and they cluster at the front, turning
+    ``34TE6456`` into ``23LTE6458`` and ``34HKD338`` into ``03LH3381``. A
+    phantom leading character is worse than a wrong one: it shifts every
+    position after it, so the province coercion then repairs the wrong slots
+    and one bad glyph becomes a bad plate.
+
+    Detected, never assumed. The obvious implementation -- always drop the
+    leftmost 12% -- is wrong on this project's own data: a detector box is
+    often tight around the number with no band inside it at all, and a blind
+    crop then eats the province digit and *creates* the error it was meant to
+    remove. So a band has to be found, contiguous from the left edge, blue,
+    and the right width, or the crop is returned untouched.
+
+    Returns ``crop`` itself when there is nothing to remove, so a caller can
+    use identity to tell "no band" from "band removed".
+    """
+    if not _is_image(crop) or crop.ndim != 3 or crop.shape[2] != 3:
+        # Grayscale in, nothing to detect. Deliberately *not* falling back to a
+        # fractional crop: without the colour there is no evidence a band is
+        # there, and cutting on faith is the failure mode described above.
+        return crop
+
+    height, width = crop.shape[:2]
+    search = int(width * EUROBAND_MAX_FRACTION)
+    if height < 4 or width < 16 or search < 2:
+        return crop
+
+    try:
+        hsv = cv2.cvtColor(crop[:, :search], cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(
+            hsv,
+            np.array([EUROBAND_HUE[0], EUROBAND_MIN_SATURATION, EUROBAND_MIN_VALUE], np.uint8),
+            np.array([EUROBAND_HUE[1], 255, 255], np.uint8),
+        )
+    except cv2.error:  # pragma: no cover - defensive
+        return crop
+
+    coverage = blue.mean(axis=0) / 255.0
+    band_end = _euroband_end(coverage, search)
+    if band_end is None:
+        return crop
+
+    cut = band_end + max(1, int(round(band_end * EUROBAND_MARGIN_FRACTION)))
+    cut = min(cut, search)
+    if cut < width * EUROBAND_MIN_FRACTION or cut >= width:
+        return crop
+    return crop[:, cut:]
+
+
+def _euroband_end(coverage: np.ndarray, search: int) -> int | None:
+    """Last column of the band, or ``None`` when there is no band.
+
+    Three things have to hold, and the third is the one that does the work.
+
+    The run starts at the very left edge -- a blue patch beginning three
+    characters in is a car, a sign or a shadow. It may contain gaps, because
+    the white "TR" lettering and the ring of stars cut through it, but the gaps
+    are small *relative to the run*, not relative to the search window. And it
+    must **end** inside the window, with a clear stretch of non-blue after it:
+    that stretch is the white plate the band sits against.
+
+    Without the third condition this is not a band detector, it is a "is the
+    left of this image blue" detector, and on a dusk or IR frame the answer is
+    yes all the way to the search limit.
+    """
+    if coverage.size == 0 or coverage[0] < EUROBAND_COLUMN_COVERAGE:
+        return None
+
+    clear_run = max(2, int(round(search * EUROBAND_CLEAR_RUN_FRACTION)))
+    last_blue = 0
+    gap = 0
+    for index in range(1, coverage.size):
+        if coverage[index] >= EUROBAND_COLUMN_COVERAGE:
+            # A gap only counts as internal to the band while it stays small
+            # against the band already found.
+            if gap > max(1, int(round(last_blue * EUROBAND_MAX_GAP_FRACTION))):
+                break
+            last_blue = index
+            gap = 0
+            continue
+        gap += 1
+        if gap >= clear_run:
+            # Blue, then a sustained stretch of not-blue: a band against a
+            # plate. This is the only path that reports a band.
+            return last_blue or None
+
+    # Ran to the edge of the search window without ever clearing. Whatever is
+    # blue here is not a band bounded by plate, so nothing is removed.
+    return None
+
+
 def to_gray(crop: np.ndarray) -> np.ndarray:
     """Grayscale view of a BGR (or already-gray) crop."""
     if crop.ndim == 2:
@@ -409,6 +560,8 @@ def enhance_plate(
         return EnhancedCrop(gray=empty, binary=None)
 
     try:
+        # Before to_gray: the band is found by colour, and grayscale has none.
+        crop = strip_euroband(crop)
         gray = to_gray(crop)
 
         height = gray.shape[0]
