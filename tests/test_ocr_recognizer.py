@@ -463,3 +463,149 @@ def test_the_bypass_ships_off(tmp_path: Path, recording_easyocr: Any) -> None:
     assert recognizer.direct_recognize is False
     recognizer._read_fragments(_crop())
     assert RecordingReader.seen == ["readtext"]
+
+
+# ---------------------------------------------------------------------------
+# PaddleOCR result shapes
+# ---------------------------------------------------------------------------
+
+
+class OCRResult(dict):
+    """Mapping-like but not a dict, the way paddlex returns a page."""
+
+
+def test_a_3x_result_page_is_read() -> None:
+    """The shape that made this backend report every frame as empty.
+
+    PaddleOCR 3.x returns parallel `rec_texts` / `rec_scores` lists on a
+    mapping. The legacy walk indexed `line[1]` on that mapping, raised
+    TypeError, swallowed it per line, and produced nothing at all -- a 100%
+    miss rate that looks like an OCR failure and is a parsing one.
+    """
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    page = [{"rec_texts": ["34ABC123", "TR"], "rec_scores": [0.97, 0.4], "dt_polys": [[], []]}]
+    assert _parse_paddle_result(page) == [("34ABC123", 0.97), ("TR", 0.4)]
+
+
+def test_a_mapping_subclass_page_is_read() -> None:
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    page = [OCRResult(rec_texts=["06BZ1234"], rec_scores=[0.91])]
+    assert _parse_paddle_result(page) == [("06BZ1234", 0.91)]
+
+
+def test_a_payload_nested_under_res_is_read() -> None:
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    page = [{"res": {"rec_texts": ["35TR8801"], "rec_scores": [0.88]}}]
+    assert _parse_paddle_result(page) == [("35TR8801", 0.88)]
+
+
+def test_a_page_object_exposing_json_is_read() -> None:
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    class Page:
+        json = {"res": {"rec_texts": ["09RS2264"], "rec_scores": [0.66]}}
+
+    assert _parse_paddle_result([Page()]) == [("09RS2264", 0.66)]
+
+
+def test_a_missing_score_does_not_discard_the_text() -> None:
+    """Zero confidence still votes; a dropped read cannot."""
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    assert _parse_paddle_result([{"rec_texts": ["34XY99"]}]) == [("34XY99", 0.0)]
+    assert _parse_paddle_result([{"rec_texts": ["A", "B"], "rec_scores": [0.5]}]) == [
+        ("A", 0.5),
+        ("B", 0.0),
+    ]
+
+
+def test_the_legacy_2x_tuple_shape_still_reads() -> None:
+    """The 3.x support is an addition; a 2.x install must keep working."""
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    legacy = [[[[[0, 0], [1, 0], [1, 1], [0, 1]], ("34ABC123", 0.93)]]]
+    assert _parse_paddle_result(legacy) == [("34ABC123", 0.93)]
+
+
+@pytest.mark.parametrize("payload", [None, [], [None], [{}], ["nonsense"]])
+def test_an_empty_or_odd_result_yields_nothing_rather_than_raising(payload: Any) -> None:
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    assert _parse_paddle_result(payload) == []
+
+
+def test_blank_text_is_dropped() -> None:
+    from lpr.ocr.recognizer import _parse_paddle_result
+
+    page = [{"rec_texts": ["   ", "34AB12"], "rec_scores": [0.9, 0.8]}]
+    assert _parse_paddle_result(page) == [("34AB12", 0.8)]
+
+
+def test_the_constructor_cascades_past_rejected_keyword_sets() -> None:
+    """A signature filter cannot do this job.
+
+    ``PaddleOCR.__init__`` takes ``**kwargs``, so every keyword survives an
+    inspection-based filter, and 3.7 then refuses the *combination*:
+    "`use_angle_cls` and `use_textline_orientation` are mutually exclusive".
+    """
+    from lpr.ocr.recognizer import PaddleOcrRecognizer
+
+    seen: list[list[str]] = []
+
+    class Fussy:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.append(sorted(kwargs))
+            if "use_textline_orientation" in kwargs:
+                raise ValueError("mutually exclusive")
+            self.kwargs = kwargs
+
+    built = PaddleOcrRecognizer._build_reader(Fussy)
+    assert "use_angle_cls" in built.kwargs
+    assert len(seen) == 2  # modern set refused, legacy set accepted
+
+
+def test_a_reader_that_refuses_everything_is_reported_clearly() -> None:
+    from lpr.ocr.recognizer import PaddleOcrRecognizer
+
+    class Hopeless:
+        def __init__(self, **kwargs: Any) -> None:
+            raise ValueError("nope")
+
+    with pytest.raises(RuntimeError, match="could not be constructed"):
+        PaddleOcrRecognizer._build_reader(Hopeless)
+
+
+def test_an_engine_that_always_raises_is_reported_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Silence is what makes a broken install look like a bad model.
+
+    An engine raising on every call reports a 100% miss rate, which reads as
+    "PaddleOCR cannot see these plates" rather than "PaddleOCR never ran".
+    """
+    import logging
+
+    from lpr.ocr.recognizer import PaddleOcrRecognizer
+
+    class Exploding:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def predict(self, _image: Any) -> list[Any]:
+            raise NotImplementedError("ConvertPirAttribute2RuntimeAttribute not support")
+
+    module = type(sys)("paddleocr")
+    module.PaddleOCR = Exploding  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paddleocr", module)
+
+    recognizer = PaddleOcrRecognizer(_settings(tmp_path))
+    with caplog.at_level(logging.DEBUG, logger="lpr.ocr.recognizer"):
+        for _ in range(3):
+            assert recognizer._read_fragments(_crop()) == []
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, "the diagnosis must be logged once, not per frame"
+    assert "matched pair" in errors[0].getMessage()

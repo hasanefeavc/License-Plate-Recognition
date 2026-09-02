@@ -706,6 +706,20 @@ class PaddleOcrRecognizer(_BaseRecognizer):
     PaddleOCR has no allowlist parameter, so the Turkish alphabet restriction
     is enforced downstream by :mod:`lpr.ocr.normalize` instead of at the
     decoder.
+
+    Spans two incompatible generations of the package, because a site that
+    already has one installed should not have to change it to try this backend:
+
+    * **2.x** -- ``PaddleOCR(use_angle_cls=..., show_log=...)`` and
+      ``ocr(image, cls=True)``, returning nested tuples
+      ``[[[box, (text, score)], ...]]``.
+    * **3.x** -- those keywords are hard errors (``ValueError: Unknown argument:
+      show_log``), the entry point is ``predict()``, and a result is a list of
+      mapping-like objects carrying parallel ``rec_texts`` / ``rec_scores``
+      lists.
+
+    Both the constructor and the call are filtered against the installed
+    signature rather than guessed at, and the parser accepts either shape.
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
@@ -726,31 +740,197 @@ class PaddleOcrRecognizer(_BaseRecognizer):
             ) from exc
 
         logger.info("initialising PaddleOCR")
-        try:
-            self._ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        except (TypeError, ValueError):
-            # `show_log` was removed in newer paddleocr releases.
-            self._ocr = PaddleOCR(use_angle_cls=True, lang="en")
+        #: Set once the engine has raised, so the diagnosis is logged a single
+        #: time instead of per view of per frame.
+        self._failed = False
+        self._ocr = self._build_reader(PaddleOCR)
+
+    #: Constructor keyword sets, newest generation first. Tried in order until
+    #: one is accepted.
+    #:
+    #: A cascade rather than a signature filter, which is what this class needs
+    #: and the EasyOCR one does not: ``PaddleOCR.__init__`` takes ``**kwargs``,
+    #: so *every* keyword passes an inspection-based filter, and 3.7 then
+    #: rejects the combination at runtime with "`use_angle_cls` and
+    #: `use_textline_orientation` are mutually exclusive". The two generations'
+    #: keywords cannot be offered together at all.
+    #:
+    #: The document-level stages are switched off where the release has them: a
+    #: plate crop is already localised and rectified by this project's own
+    #: preprocessing, so orientation classification and dewarping cost time and
+    #: can rotate a crop that was right.
+    _CONSTRUCTOR_KWARGS: tuple[dict[str, Any], ...] = (
+        {
+            "lang": "en",
+            "use_textline_orientation": False,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+        },
+        {"lang": "en", "use_angle_cls": True, "show_log": False},
+        {"lang": "en", "use_angle_cls": True},
+        {"lang": "en"},
+    )
+
+    @classmethod
+    def _build_reader(cls, paddle_ocr: Any) -> Any:
+        """Construct ``PaddleOCR`` with whichever keywords this release takes.
+
+        Raises the *last* failure rather than a generic message, so a genuine
+        problem -- missing weights, no write access to the model cache -- is
+        reported as itself instead of being reported as a version mismatch.
+        """
+        last: Exception | None = None
+        for kwargs in cls._CONSTRUCTOR_KWARGS:
+            try:
+                return paddle_ocr(**kwargs)
+            except (TypeError, ValueError) as exc:
+                logger.debug("PaddleOCR rejected %s: %s", sorted(kwargs), exc)
+                last = exc
+        raise RuntimeError(f"PaddleOCR could not be constructed: {last}") from last
 
     def _read_fragments(self, image: np.ndarray) -> list[tuple[str, float]]:
+        """Recognise one view through whichever entry point exists.
+
+        ``predict`` first: it is the 3.x method, and there ``ocr`` is a thin
+        deprecated shim over it. On 2.x ``predict`` does not exist and ``ocr``
+        is the only option.
+        """
+        for name in ("predict", "ocr"):
+            method = getattr(self._ocr, name, None)
+            if not callable(method):
+                continue
+            try:
+                results = method(image, **_accepted_kwargs(method, {"cls": True}))
+            except Exception as exc:
+                # One unreadable view must not take down a frame; the ensemble
+                # still has the other views and, when configured, the other
+                # engine. But say so *once*, loudly.
+                #
+                # Silence here is what makes a broken install look like a bad
+                # model: an engine that raises on every call reports a 100% miss
+                # rate, which reads as "PaddleOCR cannot see these plates"
+                # rather than "PaddleOCR never ran". The specific case this was
+                # written for is a paddlepaddle too old for the model files
+                # paddlex ships, which surfaces as NotImplementedError out of
+                # the executor -- nothing about the message points at versions.
+                self._report_failure(name, exc)
+                continue
+            return _parse_paddle_result(results)
+        return []
+
+    def _report_failure(self, method: str, exc: BaseException) -> None:
+        """Log the first inference failure at ERROR, the rest at DEBUG."""
+        if self._failed:
+            logger.debug("PaddleOCR %s() failed again: %s", method, exc)
+            return
+        self._failed = True
+        hint = ""
+        if isinstance(exc, NotImplementedError):
+            hint = (
+                " This usually means the installed paddlepaddle cannot execute "
+                "the model files paddlex ships -- check that the two versions "
+                "are a matched pair. Until then every read will be empty."
+            )
+        logger.error("PaddleOCR %s() failed: %s.%s", method, exc, hint)
+
+
+def _accepted_kwargs(target: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """``kwargs`` reduced to what ``target``'s signature actually names.
+
+    A signature that cannot be inspected (a C extension, a test double) is
+    assumed to take everything.
+    """
+    try:
+        parameters = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return dict(kwargs)
+    return {name: value for name, value in kwargs.items() if name in parameters}
+
+
+def _as_mapping(item: Any) -> Any:
+    """``item`` as something with ``.get``, or ``None``.
+
+    A 3.x result is an ``OCRResult``: mapping-like, but not a ``dict``, and on
+    some releases the payload sits one level down under ``res``. Both are
+    unwrapped here so the caller only ever sees a plain lookup.
+    """
+    if isinstance(item, dict):
+        inner = item.get("res")
+        return inner if isinstance(inner, dict) and "rec_texts" in inner else item
+    for attribute in ("json", "res"):
+        value = getattr(item, attribute, None)
+        if isinstance(value, dict):
+            return _as_mapping(value)
+    if hasattr(item, "get") and hasattr(item, "keys"):
         try:
-            results = self._ocr.ocr(image, cls=True)
-        except TypeError:
-            # Newer releases dropped the `cls` keyword.
-            results = self._ocr.ocr(image)
-        return _parse_paddle_result(results)
+            return _as_mapping(dict(item))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _parse_paddle_result(results: Any) -> list[tuple[str, float]]:
     """Flatten PaddleOCR output into ``(text, confidence)`` pairs.
 
-    The shape has changed across releases (``[[ [box, (text, conf)], ... ]]``,
-    and a ``None`` page when nothing is found), so this walks the structure
-    defensively rather than indexing blindly.
+    Handles both generations, because the shape changed completely at 3.0:
+
+    * **3.x** -- ``[OCRResult]``, mapping-like, with ``rec_texts`` and
+      ``rec_scores`` as *parallel lists*. This is the shape that made the
+      backend read every frame as empty: the legacy walk indexes ``line[1]``
+      on what is actually a dictionary, which raises ``TypeError``, and the
+      old parser swallowed it per line and returned nothing at all.
+    * **2.x** -- ``[[[box, (text, score)], ...]]``, one page per image, and a
+      ``None`` page when the detector found nothing.
+
+    Missing or short ``rec_scores`` are tolerated: a text with no score is
+    worth more to the ensemble at zero confidence than discarded.
     """
     fragments: list[tuple[str, float]] = []
     if not results:
         return fragments
+
+    for page in results:
+        if page is None:
+            continue
+
+        mapping = _as_mapping(page)
+        if mapping is not None:
+            texts = mapping.get("rec_texts")
+            if texts is None:
+                single = mapping.get("rec_text")
+                texts = [single] if single is not None else []
+            scores = mapping.get("rec_scores")
+            if scores is None:
+                single_score = mapping.get("rec_score")
+                scores = [single_score] if single_score is not None else []
+            for index, text in enumerate(texts or []):
+                value = str(text)
+                if not value.strip():
+                    continue
+                try:
+                    confidence = float(scores[index])
+                except (IndexError, TypeError, ValueError):
+                    confidence = 0.0
+                fragments.append((value, confidence))
+            continue
+
+        # Legacy: a page is a list of [box, (text, score)] lines.
+        try:
+            lines = list(page)
+        except TypeError:
+            continue
+        for line in lines:
+            try:
+                payload = line[1]
+                text = str(payload[0])
+                confidence = float(payload[1])
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+            if text.strip():
+                fragments.append((text, confidence))
+    return fragments
     for page in results:
         if not page:
             continue
