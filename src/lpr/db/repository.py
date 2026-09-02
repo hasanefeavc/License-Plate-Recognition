@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import logging
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -377,6 +378,70 @@ class LogRepository:
             )
             return int(cur.lastrowid or 0)
 
+    def attach_snapshot(self, log_id: int, path: Any) -> bool:
+        """Link the evidence photo for one decision. Never raises.
+
+        Returns True when a row was updated. Resilient by contract: this runs
+        on the snapshot writer's thread, after the decision is already recorded
+        and the barrier has already moved, so a failure here costs a thumbnail
+        in the history view and nothing else. Losing the event because the
+        photograph could not be linked would be the wrong trade by a wide
+        margin.
+        """
+        if not log_id or path is None:
+            return False
+        try:
+            with transaction() as conn:
+                cur = conn.execute(schema.UPDATE_LOG_SNAPSHOT, (str(path), int(log_id)))
+                return bool(cur.rowcount)
+        except Exception:
+            logger.warning("Could not link snapshot to log row %s", log_id, exc_info=True)
+            return False
+
+    def snapshot_path(self, log_id: int) -> str | None:
+        """The linked photo for one row, or ``None`` when there is not one.
+
+        ``None`` covers every reason alike -- unknown row, snapshots disabled,
+        a frame the writer dropped, a file the retention sweep has since
+        removed. The caller cannot act differently on any of them, so they are
+        not distinguished here.
+        """
+        try:
+            conn = get_connection()
+            row = conn.execute(schema.SELECT_LOG_SNAPSHOT, (int(log_id),)).fetchone()
+        except Exception:
+            logger.debug("Could not read snapshot path for log row %s", log_id, exc_info=True)
+            return None
+        if row is None:
+            return None
+        value = row["snapshot_path"]
+        return str(value) if value else None
+
+    def ids_with_snapshots(self, ids: Sequence[int]) -> set[int]:
+        """Which of ``ids`` have a photo linked.
+
+        One query for a whole page rather than one per row: the history view
+        renders up to a thousand rows and only needs to know whether to draw a
+        thumbnail affordance, not what is behind it.
+        """
+        wanted = [int(value) for value in ids if value]
+        if not wanted:
+            return set()
+        try:
+            conn = get_connection()
+            # Only integers, produced by the comprehension above, are ever
+            # interpolated -- the values themselves travel as parameters.
+            placeholders = ",".join("?" * len(wanted))
+            rows = conn.execute(
+                "SELECT id FROM logs "  # noqa: S608
+                f"WHERE snapshot_path IS NOT NULL AND id IN ({placeholders})",
+                wanted,
+            ).fetchall()
+        except Exception:
+            logger.debug("Could not read snapshot availability", exc_info=True)
+            return set()
+        return {int(row["id"]) for row in rows}
+
     def query(
         self,
         since: str | None = None,
@@ -639,6 +704,199 @@ class LogRepository:
             "errors": int(row["errors"] or 0),
             "per_camera": {r["camera"]: int(r["n"]) for r in per_camera_rows},
         }
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+
+class SessionRepository:
+    """Vehicle stays, paired from the gate log: one row per visit.
+
+    A *record* of what the log already implies, not a second source of truth.
+    ``PlateRepository.occupancy_since`` still derives the live count by
+    scanning grants and is untouched, for two reasons: a derived number that
+    disagrees with this table is a free bug detector, and the barrier must
+    never come to depend on a bookkeeping table being healthy.
+
+    Every method swallows its own errors and reports failure in the return
+    value. These are called from the decision path, after the relay has already
+    fired -- a broken sessions table must cost accounting, never a gate.
+
+    Two situations are not exceptional and are handled deliberately, because
+    both are ordinary at a real site:
+
+    **A second entry for a plate already inside.** The open session is kept and
+    no new one is opened. The first entry is the true arrival, and a duplicate
+    entry read -- a missed exit, a car re-read while it waits at the barrier,
+    an operator waving one through twice -- must not restart the clock or
+    manufacture a phantom stay. :meth:`start_session` is therefore idempotent
+    for as long as a session stays open.
+
+    **An exit with no open session.** A closed row is written with a NULL
+    ``entry_ts`` and status ``orphan_exit``. The exit genuinely happened, so
+    dropping it would leave the audit trail claiming a car never left; but
+    inventing an entry time to compute a duration against would be fabricating
+    data. ``duration_seconds`` stays NULL and the row is visibly incomplete,
+    which is the honest shape for "we saw half of this".
+    """
+
+    __slots__ = ()
+
+    def start_session(self, plate: str, entry_ts: str, log_id: int | None = None) -> int | None:
+        """Open a stay for ``plate``. Returns the session id, or ``None``.
+
+        Returns the *existing* id when one is already open for this plate --
+        see the class docstring. ``None`` means the write failed, which the
+        caller is expected to log and ignore.
+        """
+        normalised = normalise_plate(plate)
+        if not normalised:
+            return None
+        try:
+            existing = self.open_session(normalised)
+            if existing is not None:
+                return int(existing["id"])
+            with transaction() as conn:
+                cur = conn.execute(
+                    schema.INSERT_SESSION,
+                    (
+                        normalised,
+                        entry_ts or utc_now_iso(),
+                        int(log_id) if log_id else None,
+                        schema.SESSION_OPEN,
+                    ),
+                )
+                return int(cur.lastrowid or 0) or None
+        except Exception:
+            logger.warning("Could not open a session for %s", normalised, exc_info=True)
+            return None
+
+    def close_session(self, plate: str, exit_ts: str, log_id: int | None = None) -> int | None:
+        """Close the open stay for ``plate``. Returns the session id, or ``None``.
+
+        With no open session this records an ``orphan_exit`` instead of doing
+        nothing, and returns that row's id.
+        """
+        normalised = normalise_plate(plate)
+        if not normalised:
+            return None
+        stamp = exit_ts or utc_now_iso()
+        try:
+            existing = self.open_session(normalised)
+            if existing is None:
+                with transaction() as conn:
+                    cur = conn.execute(
+                        schema.INSERT_ORPHAN_EXIT,
+                        (normalised, stamp, int(log_id) if log_id else None),
+                    )
+                logger.info("Exit for %s with no open session; recorded as orphan", normalised)
+                return int(cur.lastrowid or 0) or None
+
+            duration = _duration_seconds(existing["entry_ts"], stamp)
+            with transaction() as conn:
+                conn.execute(
+                    schema.CLOSE_SESSION,
+                    (stamp, int(log_id) if log_id else None, duration, int(existing["id"])),
+                )
+            return int(existing["id"])
+        except Exception:
+            logger.warning("Could not close the session for %s", normalised, exc_info=True)
+            return None
+
+    def open_session(self, plate: str) -> dict[str, Any] | None:
+        """The open stay for ``plate``, or ``None``."""
+        normalised = normalise_plate(plate)
+        if not normalised:
+            return None
+        conn = get_connection()
+        row = conn.execute(schema.SELECT_OPEN_SESSION, (normalised,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_active_sessions(self) -> list[dict[str, Any]]:
+        """Every vehicle currently inside, longest stay first.
+
+        Ordered by ``entry_ts`` ascending so the oldest -- the one an operator
+        is most likely to be asking about -- is at the top.
+        """
+        try:
+            conn = get_connection()
+            rows = conn.execute(schema.SELECT_ACTIVE_SESSIONS).fetchall()
+        except Exception:
+            logger.warning("Could not read active sessions", exc_info=True)
+            return []
+        now = utc_now_iso()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            # An open stay has no exit yet, so its duration is "so far". Computed
+            # on read rather than stored, because a stored value would be wrong
+            # from the moment it was written.
+            record["duration_seconds"] = _duration_seconds(record.get("entry_ts"), now)
+            result.append(record)
+        return result
+
+    def history(
+        self, plate: str | None = None, limit: int = 200, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Completed and open stays, newest first."""
+        bounded_limit = max(1, min(1000, int(limit)))
+        bounded_offset = max(0, int(offset))
+        try:
+            conn = get_connection()
+            if plate:
+                rows = conn.execute(
+                    schema.SELECT_SESSIONS_HISTORY_BY_PLATE,
+                    (normalise_plate(plate), bounded_limit, bounded_offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    schema.SELECT_SESSIONS_HISTORY, (bounded_limit, bounded_offset)
+                ).fetchall()
+        except Exception:
+            logger.warning("Could not read session history", exc_info=True)
+            return []
+        return [dict(row) for row in rows]
+
+    def active_count(self) -> int:
+        """How many vehicles are inside according to this table."""
+        try:
+            conn = get_connection()
+            row = conn.execute(schema.COUNT_ACTIVE_SESSIONS).fetchone()
+            return int(row["n"])
+        except Exception:
+            logger.warning("Could not count active sessions", exc_info=True)
+            return 0
+
+    def count(self) -> int:
+        try:
+            conn = get_connection()
+            row = conn.execute(schema.COUNT_SESSIONS).fetchone()
+            return int(row["n"])
+        except Exception:
+            return 0
+
+
+def _duration_seconds(entry_ts: Any, exit_ts: Any) -> int | None:
+    """Whole seconds between two stored timestamps, or ``None``.
+
+    ``None`` for a missing or unparseable bound rather than 0: a stay of
+    unknown length and a stay of no length are different facts, and an
+    ``orphan_exit`` reporting "0 seconds" would read as a car that arrived and
+    left in the same instant. Negative results are also ``None`` -- a clock
+    that went backwards between the two reads has produced a duration nobody
+    should act on.
+    """
+    if not entry_ts or not exit_ts:
+        return None
+    try:
+        start = datetime.fromisoformat(str(entry_ts))
+        end = datetime.fromisoformat(str(exit_ts))
+    except (TypeError, ValueError):
+        return None
+    seconds = int((end - start).total_seconds())
+    return seconds if seconds >= 0 else None
 
 
 # ---------------------------------------------------------------------------

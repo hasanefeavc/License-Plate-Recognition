@@ -1397,7 +1397,9 @@ def _modal(html: str, modal_id: str) -> str:
 def test_the_history_table_has_only_operational_columns() -> None:
     """Geçmiş Kayıtlar answers "which car, when, which gate, what happened".
 
-    A licensing control has no business in that view: nothing in it reads the
+    GÖRÜNTÜ belongs to that list -- the photograph is the evidence for the row
+    it sits on, and it is the first thing anybody asks for when a decision is
+    disputed. A licensing control does not: nothing in this view reads the
     value, and an operator scanning yesterday's entries had a licence duration
     dropdown sitting between the filters and the rows.
     """
@@ -1405,7 +1407,7 @@ def test_the_history_table_has_only_operational_columns() -> None:
     history = _modal(html, "modal-history")
 
     headers = re.findall(r"<th[^>]*>\s*([^<]+?)\s*</th>", history)
-    assert headers == ["ZAMAN", "KAMERA", "PLAKA", "DURUM", "GÜVEN"]
+    assert headers == ["ZAMAN", "KAMERA", "PLAKA", "DURUM", "GÜVEN", "GÖRÜNTÜ"]
 
     assert "LİSANS" not in history.upper()
     assert 'id="license-days"' not in history
@@ -1440,3 +1442,172 @@ def test_licence_state_is_still_shown_in_the_header() -> None:
     """Removing it from the log must not remove it from the operator's view."""
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     assert 'id="license-badge"' in html
+
+
+# ---------------------------------------------------------------------------
+# Snapshot evidence in the history modal
+# ---------------------------------------------------------------------------
+
+
+def test_the_preview_lives_inside_the_history_dialog() -> None:
+    """A panel, not a second modal.
+
+    The operator is comparing the photograph against the row they clicked, and
+    a dialog stacked on a dialog hides the table that gave it meaning.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    history = _modal(html, "modal-history")
+    assert 'id="history-preview"' in history
+    assert 'id="history-preview-img"' in history
+    assert 'id="history-preview-close"' in history
+
+
+def test_the_preview_starts_hidden() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    panel = html[html.index('id="history-preview"') :]
+    assert "hidden" in panel[: panel.index(">")]
+
+
+def test_the_preview_contains_the_frame_rather_than_cropping_it() -> None:
+    """Evidence: cropping to fill the panel hides what somebody is looking for."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    tag = html[html.index('id="history-preview-img"') :]
+    tag = tag[: tag.index(">")]
+    assert "object-contain" in tag
+    assert "object-cover" not in tag
+
+
+def test_the_preview_does_not_lengthen_the_dialog() -> None:
+    """The dashboard is viewport-locked; the modal is a bounded flex column.
+
+    `shrink-0` plus a capped height keeps the table scrolling and the footer
+    reachable when the panel opens.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    panel = html[html.index('id="history-preview"') :]
+    opening = panel[: panel.index(">")]
+    assert "shrink-0" in opening
+    # Up to the footer that follows the panel, so the nested image container
+    # is inside the window being asserted.
+    assert "max-h-[38vh]" in panel[: panel.index("<footer")]
+
+
+def test_the_snapshot_is_fetched_with_the_bearer_token() -> None:
+    """A bare <img src> has nowhere to put the header and gets a 401."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "objectUrlFromApi" in script
+    helper = script[script.index("async function objectUrlFromApi") :]
+    helper = helper[: helper.index("\n  }")]
+    assert "Authorization" in helper
+    assert "createObjectURL" in helper
+
+
+def test_every_object_url_is_revoked() -> None:
+    """One leaked frame per click adds up over a shift.
+
+    Opening a second preview must release the first, and closing must release
+    the last -- both routed through the same function so there is one place
+    that owns the URL.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    closer = script[script.index("function closeSnapshotPreview") :]
+    closer = closer[: closer.index("\n  }")]
+    assert "revokeObjectURL" in closer
+
+    opener = script[script.index("async function openSnapshotPreview") :]
+    opener = opener[: opener.index("\n  }")]
+    assert "closeSnapshotPreview()" in opener, "opening must release the previous frame"
+
+    # Shutting the dialog by Escape, backdrop or button all land in closeModal.
+    close_modal = script[script.index("function closeModal()") :]
+    close_modal = close_modal[: close_modal.index("\n  }")]
+    assert "closeSnapshotPreview" in close_modal
+
+
+def test_a_row_without_a_photograph_gets_no_affordance() -> None:
+    """Not a greyed icon and not a broken <img>.
+
+    Most rows predate the feature or had their file pruned, and a control that
+    is present but dead on two thirds of the table teaches the operator to stop
+    clicking it.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    cell = script[script.index("function snapshotCell") :]
+    cell = cell[: cell.index("\n  }")]
+    assert "if (!row.has_snapshot || !row.id) return td;" in cell
+
+
+# ---------------------------------------------------------------------------
+# Active stays
+# ---------------------------------------------------------------------------
+
+
+def test_the_active_stay_counter_is_on_the_dashboard() -> None:
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="sessions-active"' in html
+    assert 'id="sessions-longest"' in html
+    assert "AKTİF PARK" in html
+
+
+def test_the_stay_counter_sits_beside_the_occupancy_it_cross_checks() -> None:
+    """Two independent answers to the same question, shown together.
+
+    `occupancy` is derived from the log, `sessions-active` is counted from the
+    ledger. Displaying both is what makes a disagreement visible.
+    """
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert html.index('id="occupancy"') < html.index('id="sessions-active"')
+    between = html[html.index('id="occupancy"') : html.index('id="sessions-active"')]
+    assert "</header>" not in between, "the two counters must share the header row"
+
+
+def test_an_unknown_stay_renders_as_a_dash_not_a_zero() -> None:
+    """An unknown length and a zero length are different facts.
+
+    An orphan exit -- a car seen leaving that was never seen arriving -- has no
+    measurable stay, and printing `0dk` for it would assert one.
+    """
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    formatter = script[script.index("function formatStay") :]
+    formatter = formatter[: formatter.index("\n  }")]
+    assert 'return "—";' in formatter
+    assert "Number.isFinite" in formatter
+
+    renderer = script[script.index("function renderSessions") :]
+    renderer = renderer[: renderer.index("\n  }")]
+    assert "Number.isFinite" in renderer, "a null duration must not reach Math.max"
+
+
+def test_the_stay_ledger_failing_does_not_blank_the_dashboard() -> None:
+    """Bookkeeping. A gate works without it and so should the dashboard."""
+    script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    refresher = script[script.index("async function refreshSessions") :]
+    refresher = refresher[: refresher.index("\n  }")]
+    assert "renderSessions(null)" in refresher
+
+
+def test_a_superseded_snapshot_fetch_releases_its_own_object_url() -> None:
+    """Two quick clicks must not strand a blob with no reference left.
+
+    `previewUrl` is assigned *after* the await, so both requests find it empty,
+    neither revokes anything, and whichever resolves second overwrites the
+    variable -- leaking the other. A generation token lets the loser release
+    the URL it alone holds, and stops a slow first response painting over a
+    newer one.
+    """
+    source = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "previewToken" in source, "no generation token guards the preview fetch"
+    opener = source[source.index("async function openSnapshotPreview") :]
+    opener = opener[: opener.index("\n  /**")]
+    assert "const token = previewToken" in opener, "the open path captures no token"
+    assert "token !== previewToken" in opener, "the resolved fetch never checks it was still wanted"
+    assert "URL.revokeObjectURL(url)" in opener, "a superseded fetch must release its own URL"
+
+
+def test_closing_the_preview_invalidates_a_download_still_in_flight() -> None:
+    """Closing the modal must discard a frame that has not arrived yet."""
+    source = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    closer = source[source.index("function closeSnapshotPreview") :]
+    closer = closer[: closer.index("\n  async function")]
+    assert "previewToken += 1" in closer, "close does not invalidate an in-flight fetch"
+    assert "revokeObjectURL(previewUrl)" in closer, "close does not release the current URL"

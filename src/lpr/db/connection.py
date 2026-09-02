@@ -273,6 +273,7 @@ def init_db(force: bool = False) -> None:
                     tx.execute(statement)
                 _add_missing_columns(tx, "plates", schema.PLATES_ADDED_COLUMNS)
                 _add_missing_columns(tx, "users", schema.USERS_ADDED_COLUMNS)
+                _add_missing_columns(tx, "logs", schema.LOGS_ADDED_COLUMNS)
                 tx.execute(
                     schema.UPSERT_SCHEMA_META,
                     (schema.SCHEMA_VERSION_KEY, str(schema.SCHEMA_VERSION)),

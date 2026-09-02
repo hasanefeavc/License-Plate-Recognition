@@ -143,6 +143,20 @@
           <span id="occupancy" class="text-accent">0</span><span class="text-muted"> / </span><span id="capacity">—</span>
         </div>
       </div>
+      <div class="h-8 w-px bg-line"></div>
+      <!-- The stay ledger, next to the occupancy it cross-checks rather than
+           replaces: `occupancy` is derived from the log, `sessions-active` is
+           counted from the sessions table. Two independent numbers that should
+           agree, and a visible disagreement is a fault worth seeing. Placed in
+           the existing counter row so it adds no height -- the dashboard is
+           locked to one viewport. -->
+      <div class="text-center leading-tight">
+        <div class="text-[10px] font-bold tracking-widest text-muted">AKTİF PARK</div>
+        <div class="font-mono text-base font-bold tabular-nums sm:text-lg">
+          <span id="sessions-active" class="text-accent">0</span><span class="text-muted"> · </span><span
+            id="sessions-longest" class="text-sm text-muted sm:text-base">—</span>
+        </div>
+      </div>
     </div>
 
     <div class="flex items-center justify-end gap-2 sm:gap-4">
@@ -625,7 +639,7 @@
          sideways on a phone rather than crushing five columns into 360px. -->
 
     <div class="scroll-thin min-h-0 flex-1 overflow-auto">
-      <table class="w-full min-w-[46rem] border-collapse text-left">
+      <table class="w-full min-w-[52rem] border-collapse text-left">
         <thead class="sticky top-0 z-10 bg-chrome">
           <tr class="text-[11px] font-bold tracking-wider text-muted">
             <th scope="col" class="px-4 py-2.5 sm:px-6">ZAMAN</th>
@@ -633,11 +647,36 @@
             <th scope="col" class="px-3 py-2.5">PLAKA</th>
             <th scope="col" class="px-3 py-2.5">DURUM</th>
             <th scope="col" class="px-4 py-2.5 text-right sm:px-6">GÜVEN</th>
+            <th scope="col" class="px-3 py-2.5 text-center">GÖRÜNTÜ</th>
           </tr>
         </thead>
         <tbody id="history-rows" class="divide-y divide-line/60"></tbody>
       </table>
       <p id="history-empty" class="py-12 text-center text-sm text-muted">Kayıt bulunamadı.</p>
+    </div>
+
+    <!-- Evidence preview. A panel inside the dialog rather than a second modal
+         on top of it: the operator is comparing the photograph against the row
+         they clicked, and a stacked dialog hides the table that gave it
+         meaning. `shrink-0` and a capped height keep the table scrolling and
+         the footer reachable when this opens -- the modal is already a flex
+         column with a bounded height. -->
+    <div id="history-preview" hidden
+         class="shrink-0 border-t border-line bg-void px-4 py-3 sm:px-6">
+      <div class="flex items-center gap-3">
+        <span id="history-preview-label" class="flex-1 truncate font-mono text-xs text-muted"></span>
+        <button id="history-preview-close" type="button" aria-label="Görüntüyü kapat"
+                class="min-h-[36px] rounded-lg border border-line px-3 text-xs font-bold text-muted transition hover:border-accent hover:text-accent">
+          Kapat
+        </button>
+      </div>
+      <div class="mt-2 flex max-h-[38vh] items-center justify-center overflow-hidden rounded-lg border border-line bg-black">
+        <!-- object-contain, never cover: this is evidence, and cropping it to
+             fill the panel would hide the part of the frame somebody is
+             looking for. -->
+        <img id="history-preview-img" alt="Kayda ait anlık görüntü"
+             class="max-h-[38vh] w-auto max-w-full object-contain">
+      </div>
     </div>
 
     <footer class="flex shrink-0 items-center gap-3 border-t border-line px-4 py-3.5 sm:px-6">

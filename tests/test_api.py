@@ -580,6 +580,10 @@ def test_logs_are_serialised_from_events(
             "plate": "34ABC123",
             "action": "granted",
             "confidence": 0.9712,
+            # Additive, and False here because this repository double does not
+            # implement the snapshot lookup at all -- no method means no
+            # thumbnails, never no logs.
+            "has_snapshot": False,
         }
     ]
 
@@ -3151,3 +3155,217 @@ def test_a_lockout_does_not_leak_whether_the_account_exists(
     fake = api_client.post("/api/auth/login", json={"username": "nobody", "password": "x"})
     assert real.status_code == fake.status_code == 401
     assert real.json()["error"]["detail"] == fake.json()["error"]["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Snapshot route
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def snaps_dir(db: Any) -> Any:
+    """The directory the injected settings actually resolve snapshots to.
+
+    Taken from the settings rather than invented, because the route re-resolves
+    every stored path against exactly this directory before serving it -- a
+    fixture that wrote elsewhere would be testing the traversal guard by
+    accident on every case.
+    """
+    return db.paths.snapshots_dir
+
+
+@pytest.fixture()
+def snapshot_app(real_log_app: Any) -> Any:
+    return real_log_app
+
+
+def _granted_row(plate: str = "34ABC123") -> int:
+    from lpr.contracts import LprEvent, utc_now_iso
+    from lpr.db import LogRepository
+
+    return LogRepository().write(
+        LprEvent(ts=utc_now_iso(), camera="entry", plate=plate, action="granted", confidence=0.9)
+    )
+
+
+def test_a_linked_snapshot_is_served(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    from lpr.db import LogRepository
+
+    row_id = _granted_row()
+    photo = snaps_dir / "shot.jpg"
+    photo.write_bytes(b"\xff\xd8\xff\xe0jpegbytes")
+    LogRepository().attach_snapshot(row_id, photo)
+
+    client = TestClient(snapshot_app)
+    response = client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token))
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.content == b"\xff\xd8\xff\xe0jpegbytes"
+
+
+def test_the_snapshot_route_needs_the_same_auth_as_the_log(snapshot_app: Any) -> None:
+    """The picture is more sensitive than the row that points at it."""
+    client = TestClient(snapshot_app)
+    assert client.get("/api/logs/1/snapshot").status_code == 401
+
+
+def test_an_unknown_row_has_no_snapshot(snapshot_app: Any, operator_token: str) -> None:
+    client = TestClient(snapshot_app)
+    response = client.get("/api/logs/999999/snapshot", headers=auth(operator_token))
+    assert response.status_code == 404
+
+
+def test_a_row_with_nothing_linked_has_no_snapshot(snapshot_app: Any, operator_token: str) -> None:
+    row_id = _granted_row()
+    client = TestClient(snapshot_app)
+    assert (
+        client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token)).status_code == 404
+    )
+
+
+def test_a_pruned_file_has_no_snapshot(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    """Retention deletes files while their rows survive; that is a 404, not a 500."""
+    from lpr.db import LogRepository
+
+    row_id = _granted_row()
+    photo = snaps_dir / "gone.jpg"
+    photo.write_bytes(b"x")
+    LogRepository().attach_snapshot(row_id, photo)
+    photo.unlink()
+
+    client = TestClient(snapshot_app)
+    assert (
+        client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token)).status_code == 404
+    )
+
+
+def test_a_path_outside_the_snapshot_directory_is_refused(
+    snapshot_app: Any, operator_token: str, tmp_path: Any
+) -> None:
+    """The column holds a filesystem path; it is re-checked before it is served."""
+    from lpr.db import LogRepository
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not yours", encoding="utf-8")
+    row_id = _granted_row()
+    LogRepository().attach_snapshot(row_id, secret)
+
+    client = TestClient(snapshot_app)
+    response = client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token))
+    assert response.status_code == 404
+    assert b"not yours" not in response.content
+
+
+def test_traversal_out_of_the_snapshot_directory_is_refused(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    from lpr.db import LogRepository
+
+    (snaps_dir.parent / "escape.txt").write_text("nope", encoding="utf-8")
+    row_id = _granted_row()
+    LogRepository().attach_snapshot(row_id, snaps_dir / ".." / "escape.txt")
+
+    client = TestClient(snapshot_app)
+    assert (
+        client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token)).status_code == 404
+    )
+
+
+def test_the_log_list_says_which_rows_have_a_picture(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    from lpr.db import LogRepository
+
+    linked = _granted_row("34ABC123")
+    _granted_row("06BZ1234")
+    photo = snaps_dir / "a.jpg"
+    photo.write_bytes(b"x")
+    LogRepository().attach_snapshot(linked, photo)
+
+    client = TestClient(snapshot_app)
+    rows = client.get("/api/logs", headers=auth(operator_token)).json()
+    flags = {row["plate"]: row["has_snapshot"] for row in rows}
+    assert flags == {"34ABC123": True, "06BZ1234": False}
+
+
+# ---------------------------------------------------------------------------
+# Session routes
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def session_app(api_app: Any, db: Any) -> Any:
+    from lpr.db import SessionRepository
+
+    repo = SessionRepository()
+    api_app.dependency_overrides[deps.get_session_repository] = lambda: repo
+    return api_app
+
+
+def test_active_sessions_are_listed(session_app: Any, operator_token: str) -> None:
+    from lpr.db import SessionRepository
+
+    SessionRepository().start_session("34ABC123", "2026-05-01T09:00:00+00:00", 1)
+    client = TestClient(session_app)
+    rows = client.get("/api/sessions/active", headers=auth(operator_token)).json()
+
+    assert [row["plate"] for row in rows] == ["34ABC123"]
+    assert rows[0]["status"] == "open"
+    assert rows[0]["exit_ts"] is None
+
+
+def test_session_history_reports_a_closed_stay(session_app: Any, operator_token: str) -> None:
+    from lpr.db import SessionRepository
+
+    repo = SessionRepository()
+    repo.start_session("34ABC123", "2026-05-01T09:00:00+00:00", 1)
+    repo.close_session("34ABC123", "2026-05-01T11:30:00+00:00", 2)
+
+    client = TestClient(session_app)
+    rows = client.get("/api/sessions/history", headers=auth(operator_token)).json()
+    assert rows[0]["duration_seconds"] == 9000
+    assert rows[0]["status"] == "closed"
+
+
+def test_an_orphan_exit_serialises_with_no_entry_or_duration(
+    session_app: Any, operator_token: str
+) -> None:
+    from lpr.db import SessionRepository
+
+    SessionRepository().close_session("99XY999", "2026-05-01T12:00:00+00:00", 5)
+    client = TestClient(session_app)
+    row = client.get("/api/sessions/history", headers=auth(operator_token)).json()[0]
+
+    assert row["status"] == "orphan_exit"
+    assert row["entry_ts"] is None
+    assert row["duration_seconds"] is None
+
+
+def test_session_history_can_be_filtered_and_paged(session_app: Any, operator_token: str) -> None:
+    from lpr.db import SessionRepository
+
+    repo = SessionRepository()
+    repo.start_session("34ABC123", "2026-05-01T09:00:00+00:00", 1)
+    repo.start_session("06BZ1234", "2026-05-01T10:00:00+00:00", 2)
+
+    client = TestClient(session_app)
+    filtered = client.get(
+        "/api/sessions/history", params={"plate": "34ABC123"}, headers=auth(operator_token)
+    ).json()
+    assert [row["plate"] for row in filtered] == ["34ABC123"]
+
+    paged = client.get(
+        "/api/sessions/history", params={"limit": 1}, headers=auth(operator_token)
+    ).json()
+    assert len(paged) == 1
+
+
+def test_the_session_routes_need_auth(session_app: Any) -> None:
+    client = TestClient(session_app)
+    assert client.get("/api/sessions/active").status_code == 401
+    assert client.get("/api/sessions/history").status_code == 401

@@ -25,6 +25,8 @@ __all__ = [
     "AdminSettings",
     "LicenseGuardDep",
     "LogRepo",
+    "SessionRepo",
+    "SettingsDep",
     "MetaRepo",
     "PlateRepo",
     "UserRepo",
@@ -36,6 +38,7 @@ __all__ = [
     "get_pipeline",
     "get_pipeline_optional",
     "get_plate_repository",
+    "get_session_repository",
     "get_settings_dep",
     "get_system_event_repository",
     "get_system_updater",
@@ -231,6 +234,15 @@ def get_log_repository(request: Request) -> Any:
     return _cached_on_state(request.app, "log_repository", factory)
 
 
+def get_session_repository(request: Request) -> Any:
+    def factory() -> Any:
+        from lpr.db import SessionRepository
+
+        return SessionRepository()
+
+    return _cached_on_state(request.app, "session_repository", factory)
+
+
 def get_user_repository(request: Request) -> Any:
     def factory() -> Any:
         from lpr.db import UserRepository
@@ -295,8 +307,11 @@ def get_settings_dep() -> Settings:
 LicenseGuardDep = Annotated[Any, Depends(get_license_guard_dep)]
 PlateRepo = Annotated[Any, Depends(get_plate_repository)]
 LogRepo = Annotated[Any, Depends(get_log_repository)]
+SessionRepo = Annotated[Any, Depends(get_session_repository)]
 UserRepo = Annotated[Any, Depends(get_user_repository)]
 MetaRepo = Annotated[Any, Depends(get_meta_repository)]
+SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
+#: Historical name for the same injection, kept where it is already used.
 AdminSettings = Annotated[Settings, Depends(get_settings_dep)]
 ModelAssetsDep = Annotated[Any, Depends(get_model_assets_dep)]
 SystemUpdaterDep = Annotated[Any, Depends(get_system_updater)]

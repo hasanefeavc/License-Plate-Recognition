@@ -1642,3 +1642,97 @@ def test_a_refused_re_entry_is_recorded_as_a_denial(db) -> None:
 
     rows = LogRepository().recent(limit=5)
     assert [row.action for row in rows][:2] == [str(Action.DENIED), str(Action.GRANTED)]
+
+
+# ---------------------------------------------------------------------------
+# Vehicle sessions
+# ---------------------------------------------------------------------------
+
+
+def test_a_granted_entry_opens_a_session(db, frame) -> None:
+    from lpr.db import SessionRepository
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=FakeRelay())
+    pipeline.process_frame("entry", frame)
+
+    active = SessionRepository().get_active_sessions()
+    assert [row["plate"] for row in active] == ["34ABC123"]
+    assert active[0]["entry_log_id"], "the session must point at the log row it came from"
+
+
+def test_a_granted_exit_closes_the_matching_session(db, frame) -> None:
+    from lpr.db import SessionRepository
+
+    PlateRepository().upsert("34ABC123")
+    sessions = SessionRepository()
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=FakeRelay())
+
+    pipeline.process_frame("entry", frame)
+    pipeline.process_frame("exit", frame)
+
+    assert sessions.get_active_sessions() == []
+    row = sessions.history(limit=1)[0]
+    assert row["status"] == "closed"
+    assert row["exit_log_id"]
+
+
+def test_a_refusal_opens_no_session(db, frame) -> None:
+    """Nothing moved, so no vehicle changed side."""
+    from lpr.db import SessionRepository
+
+    # Unregistered: the plate is never upserted.
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=FakeRelay())
+    pipeline.process_frame("entry", frame)
+
+    assert SessionRepository().get_active_sessions() == []
+    assert SessionRepository().count() == 0
+
+
+def test_a_broken_sessions_table_does_not_stop_the_gate(db, frame) -> None:
+    """Bookkeeping must never cost a barrier.
+
+    The whole point of writing the session after the relay has already fired:
+    a sessions table that is missing, locked or corrupt is an accounting
+    problem, and the car in front of the barrier is not.
+    """
+    from lpr.db.connection import transaction
+
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=relay)
+    with transaction() as conn:
+        conn.execute("DROP TABLE sessions")
+
+    events = pipeline.process_frame("entry", frame)
+
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert relay.triggers == 1
+
+
+def test_a_snapshot_is_linked_to_the_row_it_evidences(db, frame, tmp_path) -> None:
+    """The link is one UPDATE: `_record` already put the rowid on the event."""
+    from lpr.db import LogRepository
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=FakeRelay())
+    events = pipeline.process_frame("entry", frame)
+    row_id = events[0].id
+
+    photo = tmp_path / "shot.jpg"
+    photo.write_bytes(b"\xff\xd8\xff\xe0")
+    pipeline._link_snapshot(events[0], photo)
+
+    assert LogRepository().snapshot_path(row_id) == str(photo)
+
+
+def test_a_dropped_frame_links_nothing_and_raises_nothing(db, frame) -> None:
+    """The writer reports failure as a None path; that is not an error here."""
+    from lpr.db import LogRepository
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=FakeRelay())
+    events = pipeline.process_frame("entry", frame)
+
+    pipeline._link_snapshot(events[0], None)
+    assert LogRepository().snapshot_path(events[0].id) is None

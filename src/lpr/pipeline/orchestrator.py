@@ -69,6 +69,7 @@ from lpr.db import (
     PLATE_UNKNOWN,
     LogRepository,
     PlateRepository,
+    SessionRepository,
     SystemEventRepository,
     init_db,
 )
@@ -274,6 +275,7 @@ class PipelineOrchestrator:
 
         self._plates = PlateRepository()
         self._logs = LogRepository()
+        self._sessions = SessionRepository()
         self._system_events = SystemEventRepository()
 
         # Evidence retention. Built here (so it is available to tests that
@@ -933,9 +935,15 @@ class PipelineOrchestrator:
         # rather than from here -- that way it carries the very file that was
         # written instead of a second encode of the same frame.
         reason = self._notify_reason(event)
-        on_saved = None
-        if reason is not None:
-            on_saved = lambda path: self._send_notification(event, reason, path)  # noqa: E731
+
+        def on_saved(path: Any) -> None:
+            # Link first, alert second. Both are bookkeeping that runs on the
+            # writer thread long after the barrier moved, and neither may raise
+            # into the writer -- `attach_snapshot` swallows its own errors and
+            # `_send_notification` already did.
+            self._link_snapshot(event, path)
+            if reason is not None:
+                self._send_notification(event, reason, path)
 
         queued = self._snapshots.submit(event.plate, frame, camera=camera, on_saved=on_saved)
         if reason is not None and not queued:
@@ -943,6 +951,49 @@ class PipelineOrchestrator:
             # out; it just goes out without a photograph, which is far better
             # than staying silent about a refused vehicle.
             self._send_notification(event, reason, None)
+
+    def _track_session(self, camera: str, event: LprEvent) -> None:
+        """Open or close the stay behind one granted decision. Never raises.
+
+        Only grants reach here: a refusal, a cooldown or an error did not move
+        the barrier, so no vehicle changed side and nothing about the stay is
+        known to have happened.
+
+        Bookkeeping, deliberately after :meth:`_record` and after the relay has
+        already fired. The whole call is wrapped because a sessions table that
+        is missing, locked or corrupt must cost accounting and never a gate --
+        the same contract the snapshot writer and the audit trail already work
+        under. ``occupancy_since`` keeps deriving the live count from the log
+        independently, so the dashboard's number survives this failing.
+        """
+        try:
+            if camera == CameraRole.ENTRY.value:
+                self._sessions.start_session(event.plate, event.ts, event.id)
+            elif camera == CameraRole.EXIT.value:
+                self._sessions.close_session(event.plate, event.ts, event.id)
+        except Exception:  # pragma: no cover - the repository already swallows
+            logger.debug("Session bookkeeping failed for %s", event.plate, exc_info=True)
+
+    @property
+    def sessions(self) -> SessionRepository:
+        """The stay ledger, for the API and for tests."""
+        return self._sessions
+
+    def _link_snapshot(self, event: LprEvent, path: Any) -> None:
+        """Record which file is the evidence for this decision. Never raises.
+
+        ``event.id`` is the ``logs`` rowid, set by :meth:`_record` from the
+        insert -- so the row is already there by the time the writer finishes,
+        and the link is one UPDATE with no lookup. A row with no id never had a
+        log line to attach to (the write failed), and a ``None`` path means the
+        writer could not save the frame; both are silently nothing to do.
+        """
+        if path is None or not getattr(event, "id", None):
+            return
+        try:
+            self._logs.attach_snapshot(int(event.id or 0), path)
+        except Exception:  # pragma: no cover - attach_snapshot already swallows
+            logger.debug("Could not link snapshot for %s", event.plate, exc_info=True)
 
     def _notify_reason(self, event: LprEvent) -> str | None:
         """Why this event should raise an alert, or ``None`` for silence.
@@ -1081,7 +1132,9 @@ class PipelineOrchestrator:
             with self._stats_lock:
                 self._stats.grants += 1
             logger.info("Camera %s: %s registered, gate opened", camera, plate)
-            return self._record(camera, plate, Action.GRANTED, confidence)
+            event = self._record(camera, plate, Action.GRANTED, confidence)
+            self._track_session(camera, event)
+            return event
 
         # Every remaining verdict keeps the barrier shut. The relay is not
         # touched on any of these paths -- that is the whole point of routing

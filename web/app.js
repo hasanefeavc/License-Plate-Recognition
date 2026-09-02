@@ -111,6 +111,7 @@
     wsTimer: null,
     statsTimer: null,
     parkingTimer: null,
+    sessionsTimer: null,
     uptimeTimer: null,
     /** Camera roles the server actually has a worker for, from /api/stats.
      *  A role missing from here has no frames now and will have none later --
@@ -181,6 +182,9 @@
     check: "M20 6 9 17l-5-5",
     x: "M18 6 6 18M6 6l12 12",
     chevron: "M6 9.5 12 15.5l6-6",
+    camera: "M3 8.5A1.5 1.5 0 0 1 4.5 7h2L8 5h8l1.5 2h2A1.5 1.5 0 0 1 21 8.5v9"
+      + "A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z"
+      + "M12 16a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z",
   };
 
   /** The markup for one glyph. `currentColor` throughout, so a button's own
@@ -231,6 +235,8 @@
     "modal-history", "history-day", "history-camera", "history-refresh",
     "history-csv", "history-rows", "history-empty", "history-count",
     "history-status",
+    "history-preview", "history-preview-img", "history-preview-label",
+    "history-preview-close",
     // Settings modal + capacity
     // User management modal
     "modal-users", "btn-users", "user-form", "user-name", "user-password",
@@ -243,6 +249,7 @@
     "settings-status", "capacity-input", "capacity-hint", "quality-select",
     "capacity-section", "capacity-divider",
     "occupancy", "capacity", "full-banner",
+    "sessions-active", "sessions-longest",
     // System telemetry drawer (admin only)
     "tel-bar", "tel-toggle", "tel-word", "tel-body",
     "tel-q-state", "tel-q-cams", "tel-q-fps", "tel-q-license",
@@ -387,6 +394,37 @@
     // Revoked on the next tick: revoking synchronously can cancel the download
     // in some browsers before they have read the blob.
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  /** An object URL for an authenticated binary endpoint, or throw.
+   *
+   *  `api()` cannot serve this: it calls `response.json()`, and a JPEG is not
+   *  JSON. A bare `<img src>` cannot either -- the bearer token has nowhere to
+   *  live on an image request, so the browser fetches it anonymously and gets
+   *  a 401. So the bytes are fetched with the header attached and handed to
+   *  the <img> as a blob.
+   *
+   *  The caller owns the URL that comes back and must revoke it. Each call
+   *  allocates a new one, and a blob that is never revoked is held for the
+   *  lifetime of the document -- one leaked frame per click adds up on a
+   *  dashboard that stays open for a shift.
+   */
+  async function objectUrlFromApi(path) {
+    const headers = {};
+    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+
+    const response = await fetch(path, { headers });
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}`;
+      try {
+        const payload = await response.json();
+        if (payload && payload.error && payload.error.detail) detail = payload.error.detail;
+      } catch (_) { /* an image error body need not be JSON */ }
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
+    }
+    return URL.createObjectURL(await response.blob());
   }
 
   /** Pull the filename out of a Content-Disposition header, if there is one. */
@@ -1065,6 +1103,60 @@
     }
   }
 
+  /** Active stays: how many cars are parked, and how long the longest has been.
+   *
+   *  A separate call from `/api/parking` on purpose. Occupancy is derived from
+   *  the log; this is counted from the sessions ledger. They are two
+   *  independent answers to the same question, and showing both means a
+   *  disagreement is visible rather than averaged away.
+   *
+   *  Failures are swallowed to a dash. The ledger is bookkeeping -- a gate
+   *  keeps working without it, and so should the dashboard. */
+  async function refreshSessions() {
+    try {
+      renderSessions(await api("/api/sessions/active"));
+    } catch (err) {
+      if (err.status === 401) {
+        logout("Oturumunuzun süresi doldu. Lütfen tekrar giriş yapın.");
+        return;
+      }
+      renderSessions(null);
+    }
+  }
+
+  function renderSessions(sessions) {
+    if (!Array.isArray(sessions)) {
+      setText(el["sessions-active"], "—");
+      setText(el["sessions-longest"], "—");
+      return;
+    }
+    setText(el["sessions-active"], String(sessions.length));
+
+    // The server returns oldest first, so the longest stay is the head -- but
+    // only among the rows that actually have a duration. An orphan exit
+    // carries `null`, and `Math.max` over a null would silently score it 0.
+    const known = sessions
+      .map((session) => Number(session.duration_seconds))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    setText(el["sessions-longest"], known.length ? formatStay(Math.max(...known)) : "—");
+  }
+
+  /** A stay as an operator reads it: `2s 14dk`, `14dk`, `48sn`.
+   *
+   *  `null` is an em dash, never `0`. An unknown length and a zero length are
+   *  different facts -- a car that left without ever being seen arriving has
+   *  no measurable stay, and printing `0dk` for it would assert one. */
+  function formatStay(seconds) {
+    const total = Number(seconds);
+    if (!Number.isFinite(total) || total < 0) return "—";
+    if (total < 60) return `${Math.floor(total)}sn`;
+    const minutes = Math.floor(total / 60);
+    if (minutes < 60) return `${minutes}dk`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? `${hours}s ${rest}dk` : `${hours}s`;
+  }
+
   /** Nudge the counter the instant the barrier moves, rather than waiting for
    *  the next poll. The server stays the source of truth: refreshParking()
    *  overwrites this on its own timer, so a missed or duplicated event
@@ -1189,6 +1281,10 @@
 
   function closeModal() {
     const modal = state.openModal && el[state.openModal];
+    // Escape, the backdrop and the footer button all land here, so this is the
+    // one place that reliably sees the history modal shut -- and the one place
+    // that can be trusted to release the previewed frame.
+    if (state.openModal === "modal-history") closeSnapshotPreview();
     state.openModal = null;
     if (modal) modal.hidden = true;
     if (state.lastFocus && document.contains(state.lastFocus)) state.lastFocus.focus();
@@ -1909,7 +2005,8 @@
         cell(formatPlate(row.plate), "px-3 py-2 font-mono font-bold"),
         cell(ACTION_LABELS[action] || action.toUpperCase(),
              `px-3 py-2 text-xs font-bold ${TEXT_CLASSES[tone]}`),
-        cell(formatConfidence(row.confidence), "px-6 py-2 text-right font-mono tabular-nums")
+        cell(formatConfidence(row.confidence), "px-6 py-2 text-right font-mono tabular-nums"),
+        snapshotCell(row)
       );
       body.append(tr);
     });
@@ -1917,6 +2014,98 @@
     el["history-empty"].hidden = rows.length > 0;
     setText(el["history-count"], String(rows.length));
     el["history-csv"].disabled = rows.length === 0;
+    // A redraw replaces every row, including whichever one was being previewed.
+    closeSnapshotPreview();
+  }
+
+  /** The evidence cell: a button when there is a photograph, nothing when not.
+   *
+   *  Nothing, deliberately -- not a greyed icon and not a broken <img>. Most
+   *  rows predate the feature or had their file pruned by the retention
+   *  window, and an affordance that is present but dead on two thirds of the
+   *  table teaches the operator to stop clicking it. */
+  function snapshotCell(row) {
+    const td = document.createElement("td");
+    td.className = "px-3 py-2 text-center";
+    if (!row.has_snapshot || !row.id) return td;
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.icon = "camera";
+    button.className =
+      "inline-flex h-8 w-8 items-center justify-center rounded-md border border-line " +
+      "text-muted transition hover:border-accent hover:text-accent";
+    button.title = "Anlık görüntüyü aç";
+    button.setAttribute("aria-label", `${formatPlate(row.plate)} görüntüsünü aç`);
+    button.addEventListener("click", () => openSnapshotPreview(row));
+    td.append(button);
+    paintIcons(td);
+    return td;
+  }
+
+  /** The object URL currently held by the preview, so it can be revoked.
+   *
+   *  One variable rather than a per-call closure: opening a second preview
+   *  must release the first, and only the newest URL is ever live. */
+  let previewUrl = "";
+  /** Bumped by every open and every close, so a fetch that was in flight can
+   *  tell it has been superseded. Without it two quick clicks race: both find
+   *  `previewUrl` still empty (neither request has resolved yet), so neither
+   *  revokes anything, and whichever finishes *second* overwrites the variable
+   *  -- stranding the other object URL with no reference left to revoke it,
+   *  and letting a slow first response paint over a newer one. */
+  let previewToken = 0;
+
+  function closeSnapshotPreview() {
+    // Invalidate anything in flight first: closing the panel must also discard
+    // a frame that is still downloading, or it arrives after the modal is gone.
+    previewToken += 1;
+    const panel = el["history-preview"];
+    if (!panel) return;
+    panel.hidden = true;
+    const image = el["history-preview-img"];
+    if (image) image.removeAttribute("src");
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      previewUrl = "";
+    }
+  }
+
+  async function openSnapshotPreview(row) {
+    const panel = el["history-preview"];
+    const image = el["history-preview-img"];
+    if (!panel || !image) return;
+
+    // Release the previous frame before fetching the next: a shift's worth of
+    // clicks would otherwise pin every image it ever showed.
+    closeSnapshotPreview();
+    const token = previewToken;
+    setText(el["history-preview-label"], `${formatPlate(row.plate)} · yükleniyor...`);
+    panel.hidden = false;
+
+    try {
+      const url = await objectUrlFromApi(`/api/logs/${encodeURIComponent(row.id)}/snapshot`);
+      if (token !== previewToken) {
+        // Superseded while downloading. This URL is the only reference to the
+        // blob, so it has to be released here -- nothing else knows about it.
+        URL.revokeObjectURL(url);
+        return;
+      }
+      previewUrl = url;
+      image.src = url;
+      setText(
+        el["history-preview-label"],
+        `${formatPlate(row.plate)} · ${String(row.ts || "").replace("T", " ").replace("+00:00", "")}`
+      );
+    } catch (err) {
+      if (token !== previewToken) return;  // a newer click already owns the panel
+      // A pruned file and a row that never had one are the same 404 by design,
+      // so the message says what the operator can act on: there is no picture.
+      closeSnapshotPreview();
+      modalStatus(el["history-status"], err.status === 404
+        ? "Bu kayda ait görüntü bulunamadı (silinmiş olabilir)."
+        : err.message, "bad");
+    }
   }
 
   /** Minutes east of UTC for this browser: +180 in Turkey.
@@ -2610,6 +2799,7 @@
     refreshLicense();      // deployment licence -> the banner
     refreshUserLicense();  // this account's licence -> the navbar badge
     refreshParking();
+    refreshSessions();
     loadRecentLogs();
     startTimers();
   }
@@ -2621,6 +2811,10 @@
     stopTimers();
     state.statsTimer = setInterval(refreshStats, STATS_INTERVAL_MS);
     state.parkingTimer = setInterval(refreshParking, PARKING_INTERVAL_MS);
+    // Shares the parking cadence: the two numbers answer the same question
+    // from different sources, so polling them apart would make them disagree
+    // for reasons that are only about timing.
+    state.sessionsTimer = setInterval(refreshSessions, PARKING_INTERVAL_MS);
     // Counted locally between polls so the clock ticks every second instead
     // of jumping once per stats refresh.
     state.uptimeTimer = setInterval(() => {
@@ -2633,9 +2827,11 @@
   function stopTimers() {
     clearInterval(state.statsTimer);
     clearInterval(state.parkingTimer);
+    clearInterval(state.sessionsTimer);
     clearInterval(state.uptimeTimer);
     state.statsTimer = null;
     state.parkingTimer = null;
+    state.sessionsTimer = null;
     state.uptimeTimer = null;
   }
 
@@ -2765,6 +2961,9 @@
     el["btn-plates"].addEventListener("click", openPlates);
     el["btn-history"].addEventListener("click", openHistory);
     if (el["btn-users"]) el["btn-users"].addEventListener("click", openUsers);
+    if (el["history-preview-close"]) {
+      el["history-preview-close"].addEventListener("click", closeSnapshotPreview);
+    }
     if (el["tel-toggle"]) {
       el["tel-toggle"].addEventListener("click", () => {
         const body = el["tel-body"];
@@ -2878,6 +3077,7 @@
       // startTimers() clears first, so re-focusing can never stack intervals.
       refreshStats();
       refreshParking();
+      refreshSessions();
       startTimers();
     });
 

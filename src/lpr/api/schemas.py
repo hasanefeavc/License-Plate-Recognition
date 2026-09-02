@@ -27,6 +27,7 @@ __all__ = [
     "HealthOut",
     "CameraIssueOut",
     "LogOut",
+    "SessionOut",
     "ModelAssetsOut",
     "LicenseIn",
     "LicenseOut",
@@ -301,6 +302,47 @@ class PlateListOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class SessionOut(BaseModel):
+    """One vehicle stay: when it arrived, when it left, how long it stayed.
+
+    ``entry_ts`` and ``duration_seconds`` are both nullable, and for the same
+    reason: an ``orphan_exit`` is a car seen leaving that was never seen
+    arriving, so there is no arrival to report and no interval to measure.
+    Reporting 0 there would read as a vehicle that came and went in the same
+    instant, which is a different and wrong claim.
+
+    For an *open* stay ``duration_seconds`` is "so far", computed when the row
+    is read rather than stored -- a stored value would be stale the moment it
+    was written.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": 42,
+                    "plate": "34ABC123",
+                    "entry_ts": "2026-05-01T09:15:00+00:00",
+                    "exit_ts": "2026-05-01T11:45:00+00:00",
+                    "entry_log_id": 512,
+                    "exit_log_id": 588,
+                    "duration_seconds": 9000,
+                    "status": "closed",
+                }
+            ]
+        }
+    )
+
+    id: int = Field(examples=[42])
+    plate: str = Field(examples=["34ABC123"])
+    entry_ts: str | None = Field(default=None, examples=["2026-05-01T09:15:00+00:00"])
+    exit_ts: str | None = Field(default=None, examples=["2026-05-01T11:45:00+00:00"])
+    entry_log_id: int | None = Field(default=None, examples=[512])
+    exit_log_id: int | None = Field(default=None, examples=[588])
+    duration_seconds: int | None = Field(default=None, ge=0, examples=[9000])
+    status: str = Field(examples=["closed"])
+
+
 class LogOut(BaseModel):
     """One log row. Field-for-field mirror of ``LprEvent.to_dict()``."""
 
@@ -325,11 +367,22 @@ class LogOut(BaseModel):
     plate: str = Field(examples=["34ABC123"])
     action: str = Field(examples=["granted"])
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, examples=[0.9712])
+    #: Whether an evidence photo is linked to this row and still on disk.
+    #:
+    #: A boolean rather than the path: the path is a server filesystem detail
+    #: that no client needs and that would be worth hiding even if one did. The
+    #: image is fetched from ``GET /api/logs/{id}/snapshot``, which re-checks
+    #: everything -- so this is an affordance hint for the history view, not a
+    #: promise the byte stream will still be there a second later.
+    #:
+    #: Defaulted to False so an older client, and every code path that builds a
+    #: LogOut without asking the question, keeps working unchanged.
+    has_snapshot: bool = Field(default=False, examples=[True])
 
     @classmethod
-    def from_event(cls, event: Any) -> LogOut:
+    def from_event(cls, event: Any, has_snapshot: bool = False) -> LogOut:
         """Build from anything exposing ``to_dict()`` (i.e. ``LprEvent``)."""
-        return cls.model_validate(event.to_dict())
+        return cls.model_validate({**event.to_dict(), "has_snapshot": has_snapshot})
 
 
 class LogQuery(BaseModel):

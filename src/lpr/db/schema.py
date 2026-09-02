@@ -31,7 +31,12 @@ from typing import Final
 #: is ownership metadata for the management screen only: the barrier never
 #: reads it, because a user's licence governs their access to the dashboard and
 #: not their car's access to the car park.
-SCHEMA_VERSION: Final[int] = 8
+#: v9 added ``logs.snapshot_path`` (the evidence photo behind a decision) and
+#: the ``sessions`` table (entry/exit pairing and stay duration). Both are
+#: additive: ``snapshot_path`` arrives through ``LOGS_ADDED_COLUMNS`` and every
+#: pre-v9 row keeps NULL, which reads as "no photograph was linked", the same
+#: answer a row whose file has since been pruned gives.
+SCHEMA_VERSION: Final[int] = 9
 
 SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -111,14 +116,114 @@ USERS_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
 
 CREATE_LOGS: Final[str] = """
 CREATE TABLE IF NOT EXISTS logs (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         TEXT NOT NULL,
-    camera     TEXT NOT NULL,
-    plate      TEXT NOT NULL,
-    action     TEXT NOT NULL,
-    confidence REAL NOT NULL DEFAULT 0
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    camera        TEXT NOT NULL,
+    plate         TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    confidence    REAL NOT NULL DEFAULT 0,
+    snapshot_path TEXT
 )
 """
+
+#: Columns added to ``logs`` after v8. Same additive migration as
+#: ``PLATES_ADDED_COLUMNS``; see :func:`lpr.db.connection.init_db`.
+#:
+#: ``snapshot_path`` is the evidence photo behind one decision, written by the
+#: snapshot writer and linked back once the file exists on disk. Nullable
+#: because it genuinely is optional at three separate moments: snapshots may be
+#: switched off, the writer drops frames when the disk cannot keep up, and the
+#: retention sweep deletes old files while their rows survive. Every one of
+#: those reads as NULL, and the API answers 404 for all of them alike.
+LOGS_ADDED_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
+    ("snapshot_path", "ALTER TABLE logs ADD COLUMN snapshot_path TEXT"),
+)
+
+#: Vehicle sessions: one row per stay, paired from the gate log.
+#:
+#: Deliberately a *record* of what the log already implies rather than a new
+#: source of truth. ``PlateRepository.occupancy_since`` keeps deriving the live
+#: count by scanning grants, and it is left alone: a derived number that
+#: disagrees with this table is a bug detector worth keeping, and the barrier
+#: must never depend on a bookkeeping table being healthy.
+#:
+#: ``entry_ts`` is nullable because an exit can legitimately arrive with no
+#: entry behind it -- a car that was already inside when the system was
+#: installed, or one whose entry read was missed. See
+#: ``SessionRepository.close_session`` for why that is recorded rather than
+#: dropped.
+CREATE_SESSIONS: Final[str] = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    plate            TEXT NOT NULL,
+    entry_ts         TEXT,
+    exit_ts          TEXT,
+    entry_log_id     INTEGER,
+    exit_log_id      INTEGER,
+    duration_seconds INTEGER,
+    status           TEXT NOT NULL DEFAULT 'open'
+)
+"""
+
+#: ``get_active_sessions`` filters on ``status`` and orders by ``entry_ts``;
+#: ``close_session`` looks up the open row for one plate. One composite index
+#: serves both without a second structure to keep current.
+CREATE_IDX_SESSIONS_STATUS_PLATE: Final[str] = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_status_plate ON sessions(status, plate)"
+)
+
+CREATE_IDX_SESSIONS_ENTRY_TS: Final[str] = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_entry_ts ON sessions(entry_ts)"
+)
+
+#: Status values. ``open`` is inside; ``closed`` is a completed stay;
+#: ``orphan_exit`` is an exit whose entry was never seen.
+SESSION_OPEN: Final[str] = "open"
+SESSION_CLOSED: Final[str] = "closed"
+SESSION_ORPHAN_EXIT: Final[str] = "orphan_exit"
+
+_SESSION_COLUMNS: Final[str] = (
+    "id, plate, entry_ts, exit_ts, entry_log_id, exit_log_id, duration_seconds, status"
+)
+
+INSERT_SESSION: Final[str] = (
+    "INSERT INTO sessions (plate, entry_ts, entry_log_id, status) VALUES (?, ?, ?, ?)"
+)
+
+SELECT_OPEN_SESSION: Final[str] = (
+    f"SELECT {_SESSION_COLUMNS} FROM sessions "
+    "WHERE status = 'open' AND plate = ? ORDER BY id DESC LIMIT 1"
+)
+
+SELECT_ACTIVE_SESSIONS: Final[str] = (
+    f"SELECT {_SESSION_COLUMNS} FROM sessions WHERE status = 'open' ORDER BY entry_ts ASC, id ASC"
+)
+
+SELECT_SESSIONS_HISTORY: Final[str] = (
+    f"SELECT {_SESSION_COLUMNS} FROM sessions ORDER BY id DESC LIMIT ? OFFSET ?"
+)
+
+SELECT_SESSIONS_HISTORY_BY_PLATE: Final[str] = (
+    f"SELECT {_SESSION_COLUMNS} FROM sessions WHERE plate = ? ORDER BY id DESC LIMIT ? OFFSET ?"
+)
+
+CLOSE_SESSION: Final[str] = (
+    "UPDATE sessions SET exit_ts = ?, exit_log_id = ?, duration_seconds = ?, "
+    "status = 'closed' WHERE id = ?"
+)
+
+INSERT_ORPHAN_EXIT: Final[str] = (
+    "INSERT INTO sessions (plate, entry_ts, exit_ts, exit_log_id, status) "
+    "VALUES (?, NULL, ?, ?, 'orphan_exit')"
+)
+
+COUNT_ACTIVE_SESSIONS: Final[str] = "SELECT COUNT(*) AS n FROM sessions WHERE status = 'open'"
+
+COUNT_SESSIONS: Final[str] = "SELECT COUNT(*) AS n FROM sessions"
+
+UPDATE_LOG_SNAPSHOT: Final[str] = "UPDATE logs SET snapshot_path = ? WHERE id = ?"
+
+SELECT_LOG_SNAPSHOT: Final[str] = "SELECT snapshot_path FROM logs WHERE id = ?"
 
 CREATE_SCHEMA_META: Final[str] = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -174,12 +279,15 @@ ALL_DDL: Final[tuple[str, ...]] = (
     CREATE_PLATES,
     CREATE_USERS,
     CREATE_LOGS,
+    CREATE_SESSIONS,
     CREATE_SCHEMA_META,
     CREATE_SYSTEM_META,
     CREATE_SYSTEM_EVENTS,
     CREATE_IDX_LOGS_TS,
     CREATE_IDX_LOGS_PLATE,
     CREATE_IDX_LOGS_CAMERA_TS,
+    CREATE_IDX_SESSIONS_STATUS_PLATE,
+    CREATE_IDX_SESSIONS_ENTRY_TS,
     CREATE_IDX_SYSTEM_EVENTS_TS,
 )
 

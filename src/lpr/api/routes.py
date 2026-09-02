@@ -17,6 +17,11 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+
+# `Path` in this module is FastAPI's path-parameter helper, imported above.
+# The filesystem one therefore needs a different name, or the snapshot route
+# would silently build a query-parameter spec out of a file path.
+from pathlib import Path as FilePath  # noqa: E402
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import (
@@ -31,7 +36,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
@@ -61,6 +66,7 @@ from lpr.api.schemas import (
     PlateUpdateIn,
     RegisterIn,
     RelayTriggerOut,
+    SessionOut,
     StatsOut,
     SystemEventOut,
     SystemUpdateIn,
@@ -874,7 +880,18 @@ async def list_logs(
             offset=query.offset,
         )
     )
-    return [LogOut.from_event(event) for event in events]
+    # One extra indexed lookup for the whole page, so the history view knows
+    # which rows to offer a thumbnail for without a request per row.
+    # getattr, not a bare call: the Recognizer/Repository protocols in this
+    # project are duck-typed, third-party and test doubles implement only what
+    # they need, and a history list must not 500 because a repository has not
+    # grown an optional lookup. No method means no thumbnails, not no logs.
+    ids = [event.id for event in events if event.id]
+    lookup = getattr(log_repo, "ids_with_snapshots", None)
+    with_snapshots: set[int] = set()
+    if ids and callable(lookup):
+        with_snapshots = await _in_thread(lookup, ids)
+    return [LogOut.from_event(event, has_snapshot=event.id in with_snapshots) for event in events]
 
 
 @router.get(
@@ -905,6 +922,106 @@ async def log_dates(
     """
     days = await _in_thread(log_repo.dates, int(tz_offset))
     return [str(day) for day in days]
+
+
+@router.get(
+    "/api/logs/{log_id}/snapshot",
+    tags=["logs"],
+    summary="Kayıt görüntüsü",
+    responses={200: {"content": {"image/jpeg": {}}}, 404: {"description": "Görüntü yok"}},
+)
+async def log_snapshot(
+    _: LicensedUser,
+    log_repo: deps.LogRepo,
+    settings: deps.SettingsDep,
+    log_id: Annotated[int, Path(ge=1, examples=[512])],
+) -> FileResponse:
+    """The evidence photo behind one gate decision.
+
+    Behind the same ``LicensedUser`` dependency as ``GET /api/logs`` itself:
+    the picture is more sensitive than the row that points at it, so it can
+    never be the easier of the two to reach.
+
+    **404 for every kind of absence**, deliberately without distinguishing
+    them: an unknown row, a row with nothing linked, snapshots switched off, a
+    frame the writer dropped, a file the retention sweep removed. They are one
+    answer to the client -- "there is no picture here" -- and separating them
+    would let an unauthenticated-adjacent caller probe which log ids exist.
+
+    The stored path is re-resolved against the configured snapshot directory
+    before anything is served. The value in that column was written by this
+    application, but it is still a filesystem path arriving from the database,
+    and a path that escapes the snapshot directory is refused rather than
+    read -- the check costs a ``resolve()`` and removes the whole class.
+    """
+    stored = await _in_thread(log_repo.snapshot_path, log_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="Bu kayda ait görüntü yok")
+
+    # Injected rather than fetched: calling the provider directly would reach
+    # straight past app.dependency_overrides and read the process's real
+    # settings, which is wrong in a test and surprising anywhere the settings
+    # are swapped. Same reasoning as UserRepo in lpr.api.security.
+    root = settings.paths.snapshots_dir.resolve()
+    try:
+        candidate = FilePath(stored).expanduser().resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        logger.warning("Snapshot path outside the snapshot directory: %s", stored)
+        raise HTTPException(status_code=404, detail="Bu kayda ait görüntü yok") from None
+
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Bu kayda ait görüntü yok")
+
+    return FileResponse(
+        candidate,
+        media_type="image/jpeg",
+        # `inline` so the history view can show it in an <img> rather than
+        # prompting a download the operator did not ask for.
+        content_disposition_type="inline",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vehicle sessions
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/api/sessions/active",
+    response_model=list[SessionOut],
+    tags=["sessions"],
+    summary="İçerideki araçlar",
+)
+async def active_sessions(_: LicensedUser, session_repo: deps.SessionRepo) -> list[SessionOut]:
+    """Vehicles currently inside, longest stay first.
+
+    ``duration_seconds`` here is "so far", measured when the request is served.
+    This is a *parallel* record to ``GET /api/parking``, which keeps deriving
+    its count from the gate log: the two are computed independently on purpose,
+    and a disagreement between them is a signal worth looking at rather than a
+    number to reconcile away.
+    """
+    rows = await _in_thread(session_repo.get_active_sessions)
+    return [SessionOut.model_validate(row) for row in rows]
+
+
+@router.get(
+    "/api/sessions/history",
+    response_model=list[SessionOut],
+    tags=["sessions"],
+    summary="Geçmiş ziyaretler",
+)
+async def session_history(
+    _: LicensedUser,
+    session_repo: deps.SessionRepo,
+    plate: Annotated[str | None, Query(examples=["34ABC123"])] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[SessionOut]:
+    """Completed and open stays, newest first. Paged like ``GET /api/logs``."""
+    rows = await _in_thread(session_repo.history, plate, int(limit), int(offset))
+    return [SessionOut.model_validate(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------

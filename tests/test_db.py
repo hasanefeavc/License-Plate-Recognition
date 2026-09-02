@@ -18,6 +18,7 @@ from lpr.contracts import Action, CameraRole, LprEvent, utc_now_iso
 from lpr.db import (
     LogRepository,
     PlateRepository,
+    SessionRepository,
     UserRepository,
     get_connection,
     normalise_plate,
@@ -803,3 +804,181 @@ def test_authorization_ignores_the_owning_accounts_licence(db) -> None:
 
     assert repo.authorization("35ACP250") == PLATE_OK
     assert repo.is_registered("35ACP250") is True
+
+
+# ---------------------------------------------------------------------------
+# Snapshot linkage
+# ---------------------------------------------------------------------------
+
+
+def _log_row(camera: str = "entry", plate: str = "34ABC123") -> int:
+    return LogRepository().write(
+        LprEvent(ts=_iso(), camera=camera, plate=plate, action="granted", confidence=0.9)
+    )
+
+
+def test_the_logs_table_carries_a_snapshot_column(db) -> None:
+    conn = get_connection()
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(logs)")}
+    assert "snapshot_path" in columns
+
+
+def test_a_snapshot_can_be_linked_to_a_row(db) -> None:
+    logs = LogRepository()
+    row_id = _log_row()
+    assert logs.attach_snapshot(row_id, "/snaps/a.jpg") is True
+    assert logs.snapshot_path(row_id) == "/snaps/a.jpg"
+
+
+def test_a_row_with_no_snapshot_reports_none(db) -> None:
+    logs = LogRepository()
+    assert logs.snapshot_path(_log_row()) is None
+
+
+def test_an_unknown_row_reports_none_rather_than_raising(db) -> None:
+    assert LogRepository().snapshot_path(999_999) is None
+
+
+def test_linking_to_a_missing_row_is_false_not_an_exception(db) -> None:
+    """A lost thumbnail must never become a lost event."""
+    assert LogRepository().attach_snapshot(999_999, "/snaps/a.jpg") is False
+
+
+def test_linking_nothing_is_a_no_op(db) -> None:
+    logs = LogRepository()
+    row_id = _log_row()
+    assert logs.attach_snapshot(row_id, None) is False
+    assert logs.attach_snapshot(0, "/snaps/a.jpg") is False
+
+
+def test_only_rows_with_a_photo_are_reported_as_having_one(db) -> None:
+    logs = LogRepository()
+    linked, bare = _log_row(), _log_row(camera="exit")
+    logs.attach_snapshot(linked, "/snaps/a.jpg")
+    assert logs.ids_with_snapshots([linked, bare]) == {linked}
+
+
+def test_asking_about_no_rows_costs_no_query(db) -> None:
+    assert LogRepository().ids_with_snapshots([]) == set()
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+
+def test_a_granted_entry_opens_a_stay(db) -> None:
+    sessions = SessionRepository()
+    session_id = sessions.start_session("34ABC123", "2026-05-01T09:00:00+00:00", 1)
+    assert session_id
+    active = sessions.get_active_sessions()
+    assert [row["plate"] for row in active] == ["34ABC123"]
+    assert active[0]["status"] == "open"
+
+
+def test_a_second_entry_for_a_car_already_inside_keeps_the_first(db) -> None:
+    """The first entry is the true arrival.
+
+    A duplicate entry read -- a missed exit, a car re-read while it waits at
+    the barrier -- must not restart the clock or manufacture a phantom stay.
+    """
+    sessions = SessionRepository()
+    first = sessions.start_session("34ABC123", "2026-05-01T09:00:00+00:00", 1)
+    second = sessions.start_session("34ABC123", "2026-05-01T09:05:00+00:00", 2)
+
+    assert second == first
+    assert len(sessions.get_active_sessions()) == 1
+    assert sessions.get_active_sessions()[0]["entry_ts"] == "2026-05-01T09:00:00+00:00"
+
+
+def test_an_exit_closes_the_stay_and_records_its_duration(db) -> None:
+    sessions = SessionRepository()
+    sessions.start_session("34ABC123", "2026-05-01T09:00:00+00:00", 1)
+    sessions.close_session("34ABC123", "2026-05-01T11:30:00+00:00", 2)
+
+    assert sessions.get_active_sessions() == []
+    row = sessions.history(limit=1)[0]
+    assert row["status"] == "closed"
+    assert row["duration_seconds"] == 9000
+    assert row["exit_log_id"] == 2
+
+
+def test_an_exit_with_no_open_stay_is_recorded_not_dropped(db) -> None:
+    """A car leaving is evidence, even when its arrival was never seen.
+
+    Dropping it would leave the trail claiming the car never left; inventing an
+    entry time to measure against would be fabricating data. The row is kept
+    with a NULL entry and no duration, which is the honest shape.
+    """
+    sessions = SessionRepository()
+    assert sessions.close_session("99XY999", "2026-05-01T12:00:00+00:00", 7)
+
+    row = sessions.history(limit=1)[0]
+    assert row["status"] == "orphan_exit"
+    assert row["entry_ts"] is None
+    assert row["duration_seconds"] is None
+    assert sessions.get_active_sessions() == []
+
+
+def test_an_open_stay_reports_its_duration_so_far(db) -> None:
+    """Computed on read: a stored value would be stale the moment it was written."""
+    sessions = SessionRepository()
+    sessions.start_session("34ABC123", _iso(days_ago=0.5), 1)
+    assert sessions.get_active_sessions()[0]["duration_seconds"] >= 43_000
+
+
+def test_active_stays_are_ordered_oldest_first(db) -> None:
+    sessions = SessionRepository()
+    sessions.start_session("06BZ1234", "2026-05-01T11:00:00+00:00", 1)
+    sessions.start_session("34ABC123", "2026-05-01T09:00:00+00:00", 2)
+    assert [row["plate"] for row in sessions.get_active_sessions()] == ["34ABC123", "06BZ1234"]
+
+
+def test_an_empty_plate_is_refused(db) -> None:
+    sessions = SessionRepository()
+    assert sessions.start_session("", "2026-05-01T09:00:00+00:00", 1) is None
+    assert sessions.close_session("   ", "2026-05-01T09:00:00+00:00", 1) is None
+
+
+def test_a_clock_that_went_backwards_yields_no_duration(db) -> None:
+    """An unknown length and a zero length are different facts."""
+    sessions = SessionRepository()
+    sessions.start_session("34ABC123", "2026-05-01T11:00:00+00:00", 1)
+    sessions.close_session("34ABC123", "2026-05-01T09:00:00+00:00", 2)
+    assert sessions.history(limit=1)[0]["duration_seconds"] is None
+
+
+def test_the_active_count_matches_the_active_list(db) -> None:
+    sessions = SessionRepository()
+    sessions.start_session("34ABC123", _iso(), 1)
+    sessions.start_session("06BZ1234", _iso(), 2)
+    sessions.close_session("34ABC123", _iso(), 3)
+    assert sessions.active_count() == len(sessions.get_active_sessions()) == 1
+
+
+def test_history_can_be_filtered_by_plate(db) -> None:
+    sessions = SessionRepository()
+    sessions.start_session("34ABC123", _iso(), 1)
+    sessions.start_session("06BZ1234", _iso(), 2)
+    rows = sessions.history(plate="34ABC123")
+    assert [row["plate"] for row in rows] == ["34ABC123"]
+
+
+def test_history_paginates(db) -> None:
+    sessions = SessionRepository()
+    for index in range(5):
+        sessions.start_session(f"34AB{index}12", _iso(), index + 1)
+    assert len(sessions.history(limit=2)) == 2
+    assert len(sessions.history(limit=2, offset=4)) == 1
+
+
+def test_sessions_do_not_disturb_the_derived_occupancy(db) -> None:
+    """`occupancy_since` stays the source of truth for the live count.
+
+    The two are computed independently on purpose: a disagreement is a bug
+    detector, and the barrier must never depend on the sessions table.
+    """
+    logs = LogRepository()
+    logs.write(LprEvent(ts=_iso(), camera="entry", plate="34ABC123", action="granted"))
+    SessionRepository().start_session("34ABC123", _iso(), 1)
+    assert logs.occupancy_since(_iso(days_ago=1))["inside"] == 1
