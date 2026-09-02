@@ -161,3 +161,67 @@ def test_the_page_and_the_stylesheet_agree_on_the_path(web_client: TestClient) -
     href = match.group(1)
     assert not href.startswith(("/", "http")), "an absolute href breaks under a sub-path mount"
     assert web_client.get(f"{WEB_MOUNT_PATH}/{href}").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Camera aspect ratio
+# ---------------------------------------------------------------------------
+
+
+def test_the_camera_image_letterboxes_rather_than_stretching() -> None:
+    """`object-fit: contain` must survive the compile, not just the markup.
+
+    This regressed once and was invisible from the markup: a rule inserted
+    directly above `_object_fit` landed *between* its `@rule` decorator and its
+    body, so the decorator registered the wrong function and every `object-*`
+    class compiled to `appearance: none`. The class was still in the HTML, the
+    stylesheet still had a `.object-contain` line, and nothing looked wrong
+    except the video -- an <img> with no `object-fit` falls back to `fill`,
+    which distorts a 4:3 sensor into a 16:9 card silently.
+    """
+    css = STYLESHEET.read_text(encoding="utf-8")
+    assert ".object-contain { object-fit: contain; }" in css
+
+
+@pytest.mark.parametrize(
+    ("utility", "declaration"),
+    [
+        ("object-contain", "object-fit: contain"),
+        ("object-cover", "object-fit: cover"),
+        ("appearance-none", "-webkit-appearance: none; appearance: none"),
+        ("h-full", "height: 100%"),
+        ("w-full", "width: 100%"),
+        ("aspect-video", "aspect-ratio: 16 / 9"),
+    ],
+)
+def test_a_utility_compiles_to_what_it_says(utility: str, declaration: str) -> None:
+    """Spot checks on the utilities the camera panes are built from."""
+    compiled = load_builder().compile_class(utility)
+    assert compiled is not None, f"{utility} has no rule"
+    assert compiled[0] == declaration
+
+
+def test_no_two_rule_decorators_share_one_builder() -> None:
+    """The structural form of the bug above, caught for any future insertion.
+
+    Stacking `@rule` decorators is never intended here -- each pattern has its
+    own builder -- so two adjacent ones mean a function was inserted between a
+    decorator and the body it was written for, and one builder is now silently
+    dead code registered under someone else's pattern.
+    """
+    source = BUILDER.read_text(encoding="utf-8").splitlines()
+    stacked = [
+        (index + 1, line.strip())
+        for index, line in enumerate(source[:-1])
+        if line.startswith("@rule(") and source[index + 1].startswith("@rule(")
+    ]
+    assert not stacked, f"stacked @rule decorators at {stacked}"
+
+
+def test_the_camera_panes_ask_for_contain() -> None:
+    """Both feeds, so a fix to one cannot quietly miss the other."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    for camera in ("cam-entry", "cam-exit"):
+        tag = html[html.index(f'id="{camera}"') :]
+        tag = tag[: tag.index(">")]
+        assert "object-contain" in tag, f"{camera} would stretch its frame"

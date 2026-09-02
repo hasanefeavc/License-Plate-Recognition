@@ -274,6 +274,12 @@
           <span id="fps-entry" class="ml-auto font-mono text-xs text-muted"></span>
           <span id="badge-entry" class="text-xs font-bold text-bad">Bağlı Değil</span>
         </figcaption>
+        <!-- The stage is whatever shape the layout gives it; the frame inside
+             keeps the shape the sensor sent. `object-contain` letterboxes or
+             pillarboxes against the `bg-void` ground rather than stretching a
+             4:3 sensor into a 16:9 card, and it centres by default. Never
+             `object-cover` here: filling the box means cropping the frame, and
+             the cropped edge is exactly where a plate entering the scene is. -->
         <div class="relative aspect-video min-h-0 overflow-hidden bg-void lg:aspect-auto lg:flex-1">
           <!-- Hidden until the first frame arrives: a broken <img> paints its
                alt text over the placeholder, which reads as a bug. -->
@@ -292,6 +298,7 @@
           <span id="fps-exit" class="ml-auto font-mono text-xs text-muted"></span>
           <span id="badge-exit" class="text-xs font-bold text-bad">Bağlı Değil</span>
         </figcaption>
+        <!-- Same contract as the entry pane above: contain, never cover. -->
         <div class="relative aspect-video min-h-0 overflow-hidden bg-void lg:aspect-auto lg:flex-1">
           <img id="cam-exit" alt="Çıkış kamerası canlı görüntü" hidden
                class="absolute inset-0 h-full w-full object-contain">

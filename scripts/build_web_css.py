@@ -305,7 +305,6 @@ def _aspect(m: re.Match[str]) -> Decls:
     return "aspect-ratio: " + {"video": "16 / 9", "square": "1 / 1", "auto": "auto"}[m.group(1)]
 
 
-@rule(r"object-(contain|cover|fill|none|scale-down)")
 @rule(r"appearance-none")
 def _appearance(m: re.Match[str]) -> Decls:
     """Strips a native control's platform chrome so a <select> can take the
@@ -313,7 +312,16 @@ def _appearance(m: re.Match[str]) -> Decls:
     return _kv(**{"-webkit-appearance": "none", "appearance": "none"})
 
 
+@rule(r"object-(contain|cover|fill|none|scale-down)")
 def _object_fit(m: re.Match[str]) -> Decls:
+    """How a replaced element fills its box -- the camera panes' whole story.
+
+    ``object-contain`` is what letterboxes a 4:3 sensor inside a 16:9 card
+    instead of stretching it. When this rule was accidentally shadowed the
+    class still appeared in the markup and still compiled to *something*, so
+    nothing looked broken anywhere except in the video itself: an <img> with no
+    ``object-fit`` falls back to ``fill``, which distorts silently.
+    """
     return f"object-fit: {m.group(1)}"
 
 

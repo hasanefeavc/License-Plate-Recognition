@@ -205,7 +205,8 @@ body { overflow: hidden; }
 .overflow-y-auto { overflow-y: auto; }
 .aspect-video { aspect-ratio: 16 / 9; }
 .appearance-none { -webkit-appearance: none; appearance: none; }
-.object-contain { -webkit-appearance: none; appearance: none; }
+.object-contain { object-fit: contain; }
+.object-cover { object-fit: cover; }
 .flex-col { flex-direction: column; }
 .flex-wrap { flex-wrap: wrap; }
 .flex-1 { flex: 1 1 0%; }
