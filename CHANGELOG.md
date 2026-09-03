@@ -89,6 +89,70 @@ are currently driving through.
 
 ### Fixed
 
+- **A clean Windows 11 machine could not finish `run.bat`.** Three separate
+  blockers, all of them between `git clone` and the first frame, and none of
+  them reachable from a Linux CI job. Found by installing the project on a
+  machine nobody had prepared.
+
+  - **`stringzilla` tried to compile C++ and failed.** It arrives four levels
+    down — paddleocr → albumentations → albucore → stringzilla — under an open
+    `>=3.10.4`, so pip took the newest, and 5.1.2 is the one release in a long
+    line that did not publish a `cp311` win_amd64 wheel. On a Windows box
+    running Python 3.11, which is inside the supported range, pip fell back to
+    the sdist and stopped on the missing MSVC Build Tools: several gigabytes of
+    tooling to install, for a package nothing here calls. `requirements.txt`
+    now pins `stringzilla>=3.10.0,<5.1.0`, a range whose every release ships
+    Windows wheels for all of 3.11–3.13.
+
+  - **PyTorch could not load its own DLL.** The win_amd64 wheel on PyPI links
+    the Intel OpenMP runtime (`libiomp5md.dll`) without shipping it, so the
+    first `import torch` on a machine that has never had a redistributable
+    installed by some other program died with `[WinError 127] … shm.dll` — a
+    loader error naming a file that is present, which reads as a corrupt
+    install rather than a missing sibling. `run.bat` now installs `torch` and
+    `torchvision` from `https://download.pytorch.org/whl/cpu`, whose wheels
+    bundle the runtime, **before** `pip install -r requirements.txt` — after
+    it, the PyPI wheel is already in place and the step does nothing. It then
+    proves `import torch` works and reinstalls once from the CPU index if it
+    does not, which is what carries the fix onto machines that were set up
+    before it existed. `run.sh` is untouched: on Linux the PyPI wheel is
+    self-contained and is the one that carries CUDA support.
+
+  - **Smart App Control blocked a DLL for a feature this project never uses.**
+    `paddleocr` imports `ppstructure.recovery.recovery_to_doc` at module scope
+    — part of PP-Structure's "recover a layout into a .docx" path — which
+    imports `python-docx` and then `lxml.etree`. Smart App Control refuses that
+    unsigned native extension, and the `ImportError` came back out of
+    `from paddleocr import PaddleOCR`, so the pipeline never started and the
+    message named `lxml`: a package in no requirements file here, with nothing
+    to do with reading plates. Turning Smart App Control off is not advice to
+    give a site, because it cannot be turned back on without reinstalling
+    Windows. The recogniser now seeds `sys.modules` with an empty stand-in
+    before importing paddleocr, so the import is answered before any finder is
+    consulted and neither `python-docx` nor `lxml` is loaded at all. An
+    already-imported real module always wins, so a genuine PP-Structure user in
+    the same process is unaffected.
+
+- **PaddleOCR narrated every frame to stdout and the console became the
+  bottleneck.** Two DEBUG lines per inference (`dt_boxes num : 1, elapsed :
+  0.012s` and the matching `rec_res`) plus a repeating WARNING about the angle
+  classifier — over fifty lines a second at 30 FPS. Inference itself costs
+  about 35 ms; the writes did not, until a Windows console had to render them,
+  and conhost repaints per line. The gate appeared to freeze, and nothing in a
+  profile of this project pointed at a text renderer.
+
+  `show_log=False` was already in the constructor cascade and was reaching
+  nothing. `PaddleOCR.__init__` on 2.x is `**kwargs` over
+  `params.__dict__.update(**kwargs)`, so it accepts *any* keyword without
+  complaint — including the 3.x-only set offered first — and the cascade
+  stopped there, never trying the entry that carried it. `show_log` defaults to
+  `True`, so the logger stayed at DEBUG. It would not have been enough anyway:
+  it only lowers the logger to INFO, which leaves the WARNING repeating. The
+  recogniser now sets the `ppocr` logger to ERROR directly, after the reader is
+  built (construction can raise the level back up). paddleocr gives that logger
+  its own handler and `propagate = False`, so this removes stdout noise and no
+  structured log line — `lpr.*` output is untouched.
+
 - **Two cameras pointed at one device took the capture pipeline down** instead
   of being refused. Setting entry and exit to the same index — the default
   `"0"` on both, which is what a fresh `config.yaml` gives you — locks the

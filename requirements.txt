@@ -38,6 +38,20 @@ onnxruntime>=1.17,<2
 # plates. 2.10 with paddlepaddle 3.0 is the pair this was validated on.
 paddleocr>=2.10,<3
 paddlepaddle>=3.0,<3.1
+# Pulled in transitively: paddleocr -> albumentations -> albucore ->
+# stringzilla. albucore asks only for ">=3.10.4", so pip takes whatever is
+# newest, and 5.1.2 is the first release in a long line that did not publish a
+# cp311 win_amd64 wheel -- 4.6.x through 5.1.1 all ship cp310 through cp314.
+# pip on a Windows 11 box running Python 3.11 therefore falls back to the
+# sdist and tries to compile C++, which fails on any machine without the MSVC
+# Build Tools: a clean-install blocker several gigabytes of tooling away from
+# being fixed by hand, for a package nothing here calls directly.
+#
+# Capped below the gap rather than at "!=5.1.2" so the range stays one that is
+# known to publish complete Windows wheel coverage for every interpreter in
+# `requires-python`. Lift it once albucore's own floor moves above this and
+# the wheels are there for 3.11-3.13.
+stringzilla>=3.10.0,<5.1.0
 # Kept alongside: it is the fallback backend for a box where paddle will not
 # install, the second opinion for ocr.ensemble_backends, and it needs no
 # system libraries of its own.

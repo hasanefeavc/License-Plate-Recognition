@@ -195,10 +195,57 @@ del /f /q "%SENTINEL%" >nul 2>&1
 
 "%VENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 goto :deps_failed
+
+rem PyTorch comes from PyTorch's own CPU index on Windows, before
+rem requirements.txt is touched. The wheel PyPI serves for win_amd64 is not
+rem self-contained: it links libiomp5md.dll and the rest of the Intel OpenMP
+rem runtime without shipping them, so on a clean Windows 11 -- one that has
+rem never had a redistributable installed by some other program -- the very
+rem first `import torch` dies with "[WinError 127] The specified procedure
+rem could not be found ... shm.dll". That is a loader error naming a file that
+rem is present, so it reads as a corrupt install; it is a missing sibling DLL.
+rem The wheels on download.pytorch.org bundle the runtime and just work.
+rem
+rem Order matters. This has to run *before* `pip install -r requirements.txt`:
+rem torch is pinned there too, so installing it here first leaves that
+rem requirement already satisfied and pip moves on, while the reverse order
+rem downloads a quarter of a gigabyte from PyPI and then finds nothing left to
+rem do. Nothing is pinned here on purpose -- requirements.txt owns the version
+rem range, and the install below enforces it on whatever this brought in.
+rem
+rem Not fatal on its own. A site behind a proxy that reaches PyPI but not
+rem download.pytorch.org should still get an environment; the check after the
+rem install is what decides whether torch actually works.
+set "TORCH_CPU_INDEX=https://download.pytorch.org/whl/cpu"
+"%VENV_PY%" -m pip install torch torchvision --index-url %TORCH_CPU_INDEX%
+if errorlevel 1 echo [!] PyTorch CPU deposuna erisilemedi; PyPI surumu denenecek.
+
 "%VENV_PY%" -m pip install -r requirements.txt
 if errorlevel 1 goto :deps_failed
 "%VENV_PY%" -m pip install -e .
 if errorlevel 1 goto :deps_failed
+
+rem Proving it, rather than assuming it. This catches the two ways the step
+rem above can still leave a broken environment: an install that predates this
+rem launcher and already has the PyPI wheel in place (pip sees the requirement
+rem satisfied and does nothing), and a torch that requirements.txt pulled back
+rem to a PyPI build to satisfy its version range. Both look like a completed
+rem install and fail hours later at the first frame.
+rem
+rem The cost is one `import torch` on an install that already ran, which is
+rem seconds, and it is paid only on this path -- an up-to-date environment
+rem skips the whole section.
+"%VENV_PY%" -c "import torch, torchvision" >nul 2>&1
+if not errorlevel 1 goto :torch_ok
+
+echo.
+echo ==^> PyTorch calismiyor, CPU tekerlekleri yeniden kuruluyor...
+"%VENV_PY%" -m pip install --force-reinstall torch torchvision --index-url %TORCH_CPU_INDEX%
+if errorlevel 1 goto :torch_failed
+"%VENV_PY%" -c "import torch, torchvision" >nul 2>&1
+if errorlevel 1 goto :torch_failed
+
+:torch_ok
 
 "%VENV_PY%" -c "import hashlib, pathlib, sys; d = hashlib.sha256(); [(d.update(n.encode()), d.update(pathlib.Path(n).read_bytes() if pathlib.Path(n).is_file() else b'')) for n in sys.argv[2:]]; pathlib.Path(sys.argv[1]).write_text(d.hexdigest())" "%SENTINEL%" "requirements.txt" "pyproject.toml"
 
@@ -209,6 +256,16 @@ rem gate than a launcher that refuses to run.
 "%VENV_PY%" scripts\setup_dev.py
 if errorlevel 1 echo [!] scripts\setup_dev.py basarisiz oldu; servis eksik yapilandirmayla baslayacak.
 goto :dirs
+
+:torch_failed
+echo.
+echo [x] PyTorch bu makinede calistirilamiyor.
+echo     Genellikle Visual C++ Redistributable eksik oldugunda gorulur:
+echo     https://aka.ms/vs/17/release/vc_redist.x64.exe adresinden kurup
+echo     run.bat dosyasini yeniden calistirin.
+echo.
+pause
+exit /b 1
 
 :deps_failed
 echo.

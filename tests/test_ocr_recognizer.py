@@ -609,3 +609,321 @@ def test_an_engine_that_always_raises_is_reported_once(
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert len(errors) == 1, "the diagnosis must be logged once, not per frame"
     assert "matched pair" in errors[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# The imports paddleocr makes that this project cannot use
+# ---------------------------------------------------------------------------
+#
+# `paddleocr/paddleocr.py` does, at module scope,
+# `from ppstructure.recovery.recovery_to_doc import sorted_layout_boxes,
+# convert_info_docx`, which pulls in python-docx and then lxml.etree. On
+# Windows 11 with Smart App Control on, that DLL load is blocked and the
+# ImportError comes back out of `from paddleocr import PaddleOCR` -- naming
+# lxml, a package that is in no requirements file here and has nothing to do
+# with plates. Seeding sys.modules short-circuits the import before any finder
+# is consulted. See `_stub_unused_paddle_imports`.
+
+
+@pytest.fixture
+def unstubbed_paddle_modules() -> Any:
+    """Run with the stubs absent, and put sys.modules back afterwards.
+
+    The stubs are permanent by design -- once installed they stay for the life
+    of the process, because paddleocr re-imports lazily and a second recogniser
+    must not fall through to the blocked DLL. That is right in production and
+    unusable in a test file, where an earlier test would decide what a later
+    one observes.
+    """
+    from lpr.ocr.recognizer import _UNUSED_PADDLE_MODULES
+
+    saved = {name: sys.modules.pop(name, None) for name, _ in _UNUSED_PADDLE_MODULES}
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            sys.modules.pop(name, None)
+            if module is not None:
+                sys.modules[name] = module
+
+
+def test_the_blocked_import_paddleocr_makes_now_succeeds(unstubbed_paddle_modules: Any) -> None:
+    """The statement under test is the one paddleocr executes, verbatim."""
+    from lpr.ocr.recognizer import _stub_unused_paddle_imports
+
+    _stub_unused_paddle_imports()
+
+    from ppstructure.recovery.recovery_to_doc import (  # type: ignore[import-not-found]
+        convert_info_docx,
+        sorted_layout_boxes,
+    )
+
+    # Bound to None deliberately: paddleocr only calls these from PPStructure's
+    # recovery path, which this project never reaches. If that ever changed, a
+    # TypeError naming the function is the right way to find out.
+    assert sorted_layout_boxes is None
+    assert convert_info_docx is None
+
+
+def test_the_stub_keeps_docx_and_lxml_out_of_the_process(unstubbed_paddle_modules: Any) -> None:
+    """Short-circuiting the import is the point; importing it quietly is not.
+
+    A stub that still let the real chain load would pass the test above on
+    Linux, where lxml imports fine, and fail on exactly the machine it was
+    written for.
+    """
+    from lpr.ocr.recognizer import _stub_unused_paddle_imports
+
+    for name in ("docx", "lxml.etree", "ppstructure", "ppstructure.recovery"):
+        sys.modules.pop(name, None)
+
+    _stub_unused_paddle_imports()
+    # What `from ppstructure.recovery.recovery_to_doc import ...` compiles to.
+    # The form matters: a bare `import a.b.c` binds the top-level name and so
+    # still needs the parent, while this one is answered from sys.modules
+    # outright. All three of paddleocr's call sites use the `from` form.
+    __import__("ppstructure.recovery.recovery_to_doc", fromlist=("sorted_layout_boxes",))
+
+    assert "docx" not in sys.modules
+    assert "lxml.etree" not in sys.modules
+    # The parents are never walked either -- sys.modules is consulted before
+    # any finder, so the import stops at the entry that was seeded.
+    assert "ppstructure" not in sys.modules
+
+
+def test_the_stub_is_a_module_not_a_namespace(unstubbed_paddle_modules: Any) -> None:
+    """Anything that walks sys.modules expects modules to be in it.
+
+    A `types.SimpleNamespace` satisfies `from ... import name` and nothing
+    else: it carries no `__name__` and no `__spec__`, so importlib's reload
+    path, `inspect.getmodule`, pkgutil and pytest's own assertion rewriter all
+    have to be defensive about it. `types.ModuleType` costs the same and is
+    what the rest of the interpreter is written against.
+    """
+    import types
+
+    from lpr.ocr.recognizer import _UNUSED_PADDLE_MODULES, _stub_unused_paddle_imports
+
+    _stub_unused_paddle_imports()
+
+    for name, attributes in _UNUSED_PADDLE_MODULES:
+        stub = sys.modules[name]
+        assert isinstance(stub, types.ModuleType)
+        assert stub.__name__ == name
+        assert stub.__spec__ is None
+        for attribute in attributes:
+            assert hasattr(stub, attribute)
+
+
+def test_a_real_module_already_imported_is_never_replaced(
+    unstubbed_paddle_modules: Any,
+) -> None:
+    """Somebody genuinely using PP-Structure in this process must keep working.
+
+    The stub is a workaround for an import this project does not want, not a
+    claim that the real module is unwelcome.
+    """
+    from lpr.ocr.recognizer import _UNUSED_PADDLE_MODULES, _stub_unused_paddle_imports
+
+    name, _ = _UNUSED_PADDLE_MODULES[0]
+    real = type(sys)(name)
+    real.sorted_layout_boxes = "the real thing"  # type: ignore[attr-defined]
+    sys.modules[name] = real
+
+    _stub_unused_paddle_imports()
+
+    assert sys.modules[name] is real
+
+
+def test_stubbing_twice_changes_nothing(unstubbed_paddle_modules: Any) -> None:
+    """Called once per recogniser, so a second one must not swap the entry out.
+
+    Rebinding it would hand a module object to code that had already imported
+    names out of the first -- harmless with these two, and the kind of thing
+    that stops being harmless the moment a stub carries state.
+    """
+    from lpr.ocr.recognizer import _UNUSED_PADDLE_MODULES, _stub_unused_paddle_imports
+
+    name, _ = _UNUSED_PADDLE_MODULES[0]
+
+    _stub_unused_paddle_imports()
+    first = sys.modules[name]
+    _stub_unused_paddle_imports()
+
+    assert sys.modules[name] is first
+
+
+def test_the_stubs_are_in_place_before_paddleocr_is_imported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unstubbed_paddle_modules: Any
+) -> None:
+    """Ordering is the entire fix and it leaves no trace when it is right.
+
+    paddleocr does the offending import at module scope, so the stubs have to
+    exist before the interpreter reaches `from paddleocr import PaddleOCR`.
+    Installed one line later, the recogniser still fails on the machine this
+    was written for, and every other test in this section still passes.
+    """
+    from lpr.ocr.recognizer import _UNUSED_PADDLE_MODULES, PaddleOcrRecognizer
+
+    stubbed_at_import: list[bool] = []
+
+    class Watching(type(sys)):  # type: ignore[misc]
+        def __getattr__(self, attribute: str) -> Any:
+            # `from paddleocr import PaddleOCR` resolves the name through here,
+            # which is the moment paddleocr's own module body would have run.
+            if attribute != "PaddleOCR":
+                raise AttributeError(attribute)
+            stubbed_at_import.append(
+                all(name in sys.modules for name, _ in _UNUSED_PADDLE_MODULES)
+            )
+            return lambda **_kwargs: None
+
+    monkeypatch.setitem(sys.modules, "paddleocr", Watching("paddleocr"))
+
+    PaddleOcrRecognizer(_settings(tmp_path))
+
+    assert stubbed_at_import == [True]
+
+
+# ---------------------------------------------------------------------------
+# PaddleOCR's own logging
+# ---------------------------------------------------------------------------
+#
+# paddleocr logs two DEBUG lines per inference plus a WARNING about the angle
+# classifier. At 30 FPS that is 50+ lines a second onto stdout, and a Windows
+# console repaints per line -- the pipeline looks like it is freezing when what
+# is slow is the terminal. See `_quieten_paddle_logging`.
+
+
+@pytest.fixture
+def restore_paddle_logger_levels() -> Any:
+    """Put the ppocr logger's level back; it is process-wide state."""
+    import logging
+
+    from lpr.ocr.recognizer import _PADDLE_LOGGERS
+
+    saved = {name: logging.getLogger(name).level for name in _PADDLE_LOGGERS}
+    try:
+        yield
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
+
+
+def test_the_paddle_loggers_are_silenced_to_error(restore_paddle_logger_levels: Any) -> None:
+    import logging
+
+    from lpr.ocr.recognizer import _PADDLE_LOGGERS, _quieten_paddle_logging
+
+    for name in _PADDLE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.DEBUG)
+
+    _quieten_paddle_logging()
+
+    for name in _PADDLE_LOGGERS:
+        assert logging.getLogger(name).level == logging.ERROR
+
+
+def test_the_flooding_records_are_dropped_and_a_real_failure_is_not(
+    restore_paddle_logger_levels: Any,
+) -> None:
+    """The three lines from the report, plus the one that must still get out.
+
+    `show_log=False` would only lower the logger to INFO, which silences the
+    two DEBUG lines and leaves the angle-classifier WARNING repeating at frame
+    rate. ERROR is what covers all three.
+    """
+    import logging
+
+    from lpr.ocr.recognizer import _quieten_paddle_logging
+
+    _quieten_paddle_logging()
+    ppocr = logging.getLogger("ppocr")
+
+    assert not ppocr.isEnabledFor(logging.DEBUG)  # dt_boxes num : 1, elapsed
+    assert not ppocr.isEnabledFor(logging.INFO)  # rec_res num : 1, elapsed
+    assert not ppocr.isEnabledFor(logging.WARNING)  # angle classifier not initialized
+    assert ppocr.isEnabledFor(logging.ERROR)  # an engine that actually broke
+
+
+def test_our_own_loggers_are_untouched(restore_paddle_logger_levels: Any) -> None:
+    """Suppression has to be surgical: the structured log is the product.
+
+    A blunter fix -- raising the root level, or attaching a filter to the root
+    handler -- would take `lpr.ocr.voting` and `lpr.pipeline.snapshots` with
+    it, which is the log somebody reads after an unexplained restart.
+    """
+    import logging
+
+    from lpr.ocr.recognizer import _quieten_paddle_logging
+
+    ours = [
+        logging.getLogger(name)
+        for name in ("lpr", "lpr.ocr.voting", "lpr.pipeline.snapshots", "lpr.ocr.recognizer")
+    ]
+    # Effective levels, not the levels set on each logger: ours are normally
+    # NOTSET and inherit from the root, so a fix that raised the *root* would
+    # silence all of them while leaving every `logger.level` at 0 -- the
+    # failure this test is here to catch would pass a check on `.level` alone.
+    before = [logger.getEffectiveLevel() for logger in ours]
+    root_before = logging.getLogger().level
+
+    _quieten_paddle_logging()
+
+    assert [logger.getEffectiveLevel() for logger in ours] == before
+    assert logging.getLogger().level == root_before
+
+
+def test_the_two_x_keyword_set_still_carries_show_log() -> None:
+    """Belt and braces: on a release where it arrives, it should still be sent.
+
+    It is not sufficient on its own -- see `_quieten_paddle_logging` -- but a
+    2.x install that is handed it prints less during construction too.
+    """
+    from lpr.ocr.recognizer import PaddleOcrRecognizer
+
+    legacy = [kw for kw in PaddleOcrRecognizer._CONSTRUCTOR_KWARGS if "use_angle_cls" in kw]
+    assert any(kw.get("show_log") is False for kw in legacy)
+
+
+def test_show_log_is_never_offered_to_a_three_x_release() -> None:
+    """`ValueError: Unknown argument: show_log` is a hard error on 3.x.
+
+    Putting it in the modern set to "make sure it arrives" would push every 3.x
+    install down the cascade onto the legacy keywords.
+    """
+    from lpr.ocr.recognizer import PaddleOcrRecognizer
+
+    modern = [
+        kw for kw in PaddleOcrRecognizer._CONSTRUCTOR_KWARGS if "use_textline_orientation" in kw
+    ]
+    assert modern, "the 3.x keyword set has gone"
+    for kwargs in modern:
+        assert "show_log" not in kwargs
+
+
+def test_the_logger_is_quietened_after_the_reader_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_paddle_logger_levels: Any
+) -> None:
+    """Ordering, and it is the opposite of the stub's.
+
+    `PaddleOCR.__init__` runs `logger.setLevel(INFO)` itself when it is handed
+    `show_log=False`, so quietening before construction is undone by the
+    construction. This has to happen after.
+    """
+    import logging
+
+    from lpr.ocr.recognizer import PaddleOcrRecognizer
+
+    class Noisy:
+        def __init__(self, **_kwargs: Any) -> None:
+            # What paddleocr 2.x does to this logger while it is being built.
+            logging.getLogger("ppocr").setLevel(logging.INFO)
+
+    module = type(sys)("paddleocr")
+    module.PaddleOCR = Noisy  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paddleocr", module)
+
+    PaddleOcrRecognizer(_settings(tmp_path))
+
+    assert logging.getLogger("ppocr").level == logging.ERROR

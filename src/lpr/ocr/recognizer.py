@@ -46,6 +46,8 @@ import inspect
 import logging
 import signal
 import socket
+import sys
+import types
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -701,6 +703,117 @@ class EasyOcrRecognizer(_BaseRecognizer):
         return method(image, **allowed)
 
 
+#: Modules ``import paddleocr`` reaches for on the way to a feature this
+#: project never uses, and the attributes it imports from each. Pre-empted in
+#: :data:`sys.modules` by :func:`_stub_unused_paddle_imports`.
+#:
+#: One entry today. It is a table rather than a literal because the pattern --
+#: an optional PP-Structure dependency imported unconditionally at module
+#: scope -- has recurred across paddleocr releases, and the next one should
+#: cost a line here rather than another function.
+_UNUSED_PADDLE_MODULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ppstructure.recovery.recovery_to_doc", ("sorted_layout_boxes", "convert_info_docx")),
+)
+
+
+def _stub_unused_paddle_imports() -> None:
+    """Register empty stand-ins for the paddleocr imports this project cannot use.
+
+    ``paddleocr/paddleocr.py`` has, at module scope,
+    ``from ppstructure.recovery.recovery_to_doc import sorted_layout_boxes,
+    convert_info_docx``. That module is part of PP-Structure's "recover a
+    document's layout into a .docx" feature; it imports ``python-docx``, which
+    imports ``lxml.etree``. Nothing in this project reads a document -- the
+    only thing asked of paddleocr here is text out of a plate crop -- but the
+    import is unconditional, so the whole chain is dragged in before
+    :class:`PaddleOCR` exists.
+
+    On Windows 11 with Smart App Control enabled that chain does not complete.
+    ``lxml.etree`` is a native extension whose DLL is unsigned, Smart App
+    Control blocks the load, and the ``ImportError`` propagates all the way out
+    of ``from paddleocr import PaddleOCR``. The recogniser then refuses to
+    construct, the pipeline never starts, and the message names ``lxml`` -- a
+    package that appears nowhere in requirements.txt and has nothing to do with
+    reading plates. Smart App Control cannot be re-enabled once turned off
+    without reinstalling Windows, so "switch it off" is not advice to give a
+    site.
+
+    Seeding :data:`sys.modules` short-circuits the import: ``_find_and_load``
+    checks that mapping before it consults any finder, so the parent packages
+    are never walked and ``python-docx`` and ``lxml`` are never touched. That
+    is specific to the ``from a.b.c import name`` form, which is answered from
+    the mapping outright -- a bare ``import a.b.c`` binds the top-level name
+    and would still need a real ``ppstructure``. All three of paddleocr's call
+    sites use the ``from`` form; the parents are deliberately left alone,
+    because stubbing them would shadow PP-Structure for anyone who does want
+    it. The
+    two names are bound to ``None`` because paddleocr only calls them from
+    ``PPStructure``'s recovery path, which this project does not reach; if that
+    ever changed, a ``TypeError`` naming the function is the correct outcome.
+
+    ``setdefault``, so a real module already imported -- by a genuine
+    PP-Structure user in the same process, or by a previous call -- always
+    wins. Permanent by design: the entry stays for the life of the process,
+    because paddleocr re-imports lazily and a second recogniser must not fall
+    through to the blocked DLL.
+    """
+    for name, attributes in _UNUSED_PADDLE_MODULES:
+        stub = types.ModuleType(name)
+        stub.__doc__ = "Stand-in installed by lpr.ocr.recognizer; see _stub_unused_paddle_imports."
+        for attribute in attributes:
+            setattr(stub, attribute, None)
+        sys.modules.setdefault(name, stub)
+
+
+#: Loggers paddleocr writes its per-frame progress to, silenced by
+#: :func:`_quieten_paddle_logging`. A tuple because paddlex adds its own in
+#: later releases and the next one should cost a line here.
+_PADDLE_LOGGERS: tuple[str, ...] = ("ppocr",)
+
+
+def _quieten_paddle_logging(level: int = logging.ERROR) -> None:
+    """Stop paddleocr narrating every frame to stdout.
+
+    PaddleOCR logs two lines per inference at DEBUG --
+    ``ppocr DEBUG: dt_boxes num : 1, elapsed : 0.012s`` and the matching
+    ``rec_res`` line -- plus a WARNING about the angle classifier. At 30 FPS
+    that is over fifty lines a second. The inference itself costs about 35 ms;
+    the writes do not, until the terminal has to render them. Windows conhost
+    serialises and repaints per line, so the console becomes the slowest part
+    of the pipeline and the whole thing looks like it is stalling. The symptom
+    is "the gate freezes", the cause is a text renderer, and nothing in a
+    profile of this project points at it.
+
+    Three things make this need its own call rather than a constructor
+    keyword:
+
+    * ``show_log=False`` only lowers the logger to INFO
+      (``paddleocr.py``: ``if not params.show_log: logger.setLevel(INFO)``),
+      which silences the two DEBUG lines and leaves the WARNING repeating.
+    * On 2.x it never even arrives. ``PaddleOCR.__init__`` is
+      ``**kwargs`` over ``params.__dict__.update(**kwargs)``, so it accepts
+      *any* keyword without complaint -- including the 3.x-only set that
+      :data:`PaddleOcrRecognizer._CONSTRUCTOR_KWARGS` offers first. The
+      cascade stops at the first entry, and the entry carrying
+      ``show_log=False`` is never tried. ``show_log`` defaults to ``True``,
+      so the logger stays at DEBUG.
+    * The construction itself can *raise* the level back up. That same line
+      runs during ``__init__``, so setting ERROR beforehand would be undone by
+      a build that did receive ``show_log=False``. This has to run after the
+      reader is built.
+
+    Nothing of ours is affected. paddleocr builds the ``ppocr`` logger with its
+    own ``StreamHandler`` and sets ``propagate = False``, so these records
+    never reach the root logger, never reach this project's JSON handler, and
+    are not what any ``lpr.*`` logger emits. Suppressing them removes stdout
+    noise and no structured log line.
+
+    ERROR rather than CRITICAL so a genuine engine failure still says so.
+    """
+    for name in _PADDLE_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+
 #: Signals whose disposition ``import paddleocr`` has to be protected from.
 #: ``SIGBREAK`` exists only on Windows and ``getattr`` is how that is asked --
 #: this is a capability check, not an OS branch, so it stays out of
@@ -824,6 +937,13 @@ class PaddleOcrRecognizer(_BaseRecognizer):
         self._settings = settings
         self._configure_preprocessing(settings)
 
+        # Both of these are about the import below rather than about OCR.
+        # `_stub_unused_paddle_imports` keeps it from failing outright on a
+        # Windows box with Smart App Control on; `_capture_process_globals`
+        # records what it is about to overwrite. Order matters only in that
+        # both must precede the import.
+        _stub_unused_paddle_imports()
+
         # `import paddleocr` is not a passive import -- see
         # `_undo_paddle_process_globals` for what it changes underneath us and
         # why each change has to be put back.
@@ -844,6 +964,11 @@ class PaddleOcrRecognizer(_BaseRecognizer):
         #: time instead of per view of per frame.
         self._failed = False
         self._ocr = self._build_reader(PaddleOCR)
+
+        # After the build, not before: `PaddleOCR.__init__` sets this logger's
+        # level itself when it is handed `show_log=False`, which would raise it
+        # back to INFO. See `_quieten_paddle_logging`.
+        _quieten_paddle_logging()
 
     #: Constructor keyword sets, newest generation first. Tried in order until
     #: one is accepted.
