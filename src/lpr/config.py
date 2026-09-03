@@ -503,7 +503,7 @@ class PreprocessConfig(BaseModel):
 class OcrConfig(BaseModel):
     #: Recognition engine. PaddleOCR by default since it was measured against
     #: EasyOCR on 47 hand-labelled frames from this installation and was not
-    #: close: 89.4% plate accuracy against 25.5%, and 2.7% CER against 18.7%.
+    #: close: 95.7% plate accuracy against 38.3%, and 0.6% CER against 17.6%.
     #: EasyOCR remains fully supported and is one config line away -- it needs
     #: no extra system packages, which is why it was the original default.
     #:

@@ -120,8 +120,8 @@ preprocess:
 
 ocr:
   # PaddleOCR by default. Measured against EasyOCR on 47 hand-labelled frames
-  # from this installation: 89.4% plate accuracy against 25.5%, CER 2.7%
-  # against 18.7%. EasyOCR needs no extra system packages and stays supported
+  # from this installation: 95.7% plate accuracy against 38.3%, CER 0.6%
+  # against 17.6%. EasyOCR needs no extra system packages and stays supported
   # -- switch this one line back if paddle cannot be installed on a box.
   # Re-measure per site:
   #   python scripts/evaluate.py --images data/snapshots \

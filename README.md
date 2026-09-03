@@ -8,6 +8,7 @@ Targets **Ubuntu 24.04 LTS** and **Windows 11**.
 
 | | |
 |---|---|
+| **Just want it running?** | [⚡ Quick start (one click)](#-quick-start-one-click) — `run.bat` on Windows, `./run.sh` on Linux/macOS |
 | **Installing this at a site?** | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — the field guide, start to finish |
 | **Training the detector?** | [`README_TRAINING.md`](README_TRAINING.md) |
 | **Reporting a vulnerability?** | [`SECURITY.md`](SECURITY.md) |
@@ -22,13 +23,388 @@ Targets **Ubuntu 24.04 LTS** and **Windows 11**.
 
 ---
 
+## ⚡ Quick start (one click)
+
+Two different people run this for the first time, and they want different
+things. Somebody commissioning a gate wants the service up with as few
+decisions as possible, on a box that may never have had Python on it. Somebody
+working on the code wants a virtualenv they chose and control. The launchers in
+the repository root serve the first; the Docker and virtualenv paths below
+serve the second. All three end at the same service on the same port, so
+nothing is given up by starting with the easiest one.
+
+### Option 1 — the one-click launchers
+
+**Windows** — double-click **`run.bat`**. From a terminal it is the same file:
+
+```bat
+run.bat
+```
+
+In PowerShell that has to be `.\run.bat`: PowerShell will not run a program
+from the current directory without the leading `.\`. See
+[Troubleshooting](#troubleshooting) if you were expecting an execution-policy
+problem — there isn't one, and the reason is worth knowing.
+
+**Linux and macOS** —
+
+```bash
+./run.sh          # or: make launch
+```
+
+**Then open <http://localhost:8000>** — plate list, live preview, history, and
+the manual gate button.
+
+`run.sh` and `run.bat` are the same script written twice and kept deliberately
+in step, so a site can be talked through a first start over the phone with one
+set of instructions whatever it is running. Neither needs `make`, an activated
+virtualenv, or any idea of what a virtualenv is. Both are idempotent: run them
+again any time you are unsure whether something completed.
+
+### What the first run does
+
+Both launchers do the same five things in the same order, and each one stops
+with a message naming the step that failed rather than a traceback:
+
+1. **Find a usable interpreter.** Python **3.11 – 3.13** — which is
+   `requires-python = ">=3.11,<3.14"` in `pyproject.toml` spelled out. *Both*
+   ends are enforced, because both ends break: too old and the install fails in
+   the resolver, too new and the ML wheels (torch, and easyocr's dependency
+   chain) are not published yet. Checking here rather than letting pip refuse
+   means the error names the real problem instead of arriving forty lines into
+   an install log. On Windows the `py` launcher is tried first
+   (`py -3.13`, `-3.12`, `-3.11`, `-3`) and bare `python` last; on Linux and
+   macOS, `python3` first, then the versioned names.
+2. **Create the virtualenv.** An existing `venv/` wins, because that is the
+   name the Makefile hardcodes (`VENV ?= venv`) and a checkout already set up
+   with `make setup` must not silently grow a second, half-installed
+   environment beside the first. Anything else gets `.venv/`, which editors and
+   tooling autodetect. Both are gitignored.
+3. **Install the dependencies — but only when they are stale.** The sentinel
+   `<venv>/.deps_installed` holds a SHA-256 over `requirements.txt` and
+   `pyproject.toml`, so "stale" is answered by content rather than by a
+   timestamp; git does not preserve mtimes, and a mtime comparison on a fresh
+   clone answers either "always stale" or "never stale" depending on checkout
+   order. **Expect the first run to take a few minutes** (torch and the OCR
+   stack are most of it). Every run after that skips straight to the server,
+   and a `git pull` that touches either file reinstalls without being asked.
+4. **Provision the checkout**, on the same trigger as step 3 — a first
+   install, or a dependency refresh: `scripts/setup_dev.py`
+   creates `data/`, `models/`, `keys/` and `data/snapshots/`, generates the RSA
+   licence-signing pair, mints a local developer licence into `data/.license`,
+   and copies `.env.example` to `.env` if there is no `.env`. Nothing existing
+   is overwritten without `--force`, which matters most for `.env` — that is
+   the uncommitted file holding this machine's real secrets. A failure here is
+   deliberately *not* fatal: the service starts degraded and reports what is
+   missing, which is more use to somebody standing at the gate than a launcher
+   that refuses to run.
+5. **Start the service** — `python -m lpr.api.main`, after making sure `data/`
+   and `data/snapshots/` exist so a permission problem on the data volume
+   surfaces now, with a path in the message, instead of an hour later as a
+   swallowed warning on the snapshot writer's thread. Host and port come from
+   `config.yaml` / `.env` (`api.host`, `api.port`; `0.0.0.0:8000` as shipped).
+   Ctrl+C stops it, and uvicorn's graceful shutdown stops the pipeline and
+   joins the camera threads on the way out.
+
+### Signing in for the first time
+
+**No default username or password ships with this project**, and none is
+generated — a gate controller with a known factory login is a gate that opens
+for anyone who read the README.
+
+The first account is created from the dashboard itself. The login screen reads
+`setup_required` from the unauthenticated `/health` and shows the **Yönetici
+Oluştur** button only while the user table is empty; the account created there
+is made an admin. After that the button disappears, `POST /api/auth/register`
+requires an admin token, and `POST /api/users` is the ordinary way to add
+people. The full rules, and why the button is hidden by default rather than
+shown permanently, are under [Bootstrap](#bootstrap).
+
+One thing to change before this box is anything but a test bench:
+`api.secret_key` ships as `change-me`, and running with `LPR_ENV=production`
+refuses to boot while it still says that. Set `LPR_API__SECRET_KEY` in the
+`.env` the launcher wrote — see [Secrets](#secrets).
+
+### What has to be in place
+
+| | |
+|---|---|
+| **Python 3.11 – 3.13** | The only hard prerequisite. On Debian/Ubuntu `python3-venv` is a separate package and the launcher says so if it is missing. |
+| **A camera, or an RTSP URL** | `cameras.entry.source` ships as `"0"` — the first webcam on the machine. Exit ships blank, which means "this camera is not fitted", not an error: that is the normal single-camera site. Point either at an RTSP stream with `LPR_CAMERAS__ENTRY__SOURCE=rtsp://user:pass@host:554/stream1` in `.env`, or edit `config.yaml`. |
+| **Detector weights** | A fresh clone has none — every `.pt` is gitignored. |
+
+**None of these stop the service from starting**, and that is on purpose. With
+no camera reachable, `/health` still answers 200 with `status: "degraded"` and
+a `detail` naming the problem — and it distinguishes a role that configuration
+validation switched off (a duplicate device, a source that is not an index, a
+device, a URL or an existing file) from a camera that is simply not answering,
+because the first is one line of `.env` and the second is a cable. With no
+detection weights the pipeline falls back to the much weaker contour detector,
+says so, and `GET /api/system/assets` names the exact file it is waiting for.
+Fetch the baseline with `python scripts/fetch_models.py`; train the real plate
+model per **[README_TRAINING.md](README_TRAINING.md)**. Until you do, treat any
+plate it reads as a demonstration rather than a result.
+
+### Option 2 — Docker (recommended for a permanent install)
+
+The one-click launchers run the service directly on the host, which is the
+right shape for a first look and for a developer machine. For a box that has to
+come back up by itself after a power cut, the headless core in a container is
+the better answer: the image pins the whole ML stack at a known version,
+`restart: unless-stopped` brings the service back after a reboot, and a
+healthcheck catches the wedged-but-alive process that a bare restart policy
+cannot see. Provisioning still runs on the host — `scripts/setup_dev.py` is
+import-light and needs only a Python, not the ML stack — because the `.env`,
+the keys and the licence it writes are exactly the state that has to survive
+the container being rebuilt.
+
+```bash
+python scripts/setup_dev.py               # .env, keys, licence, directories
+# ...then set LPR_API__SECRET_KEY in the .env it just wrote
+python scripts/fetch_models.py --easyocr  # baseline detector + OCR weights into models/
+docker compose -f docker/docker-compose.yml up --build
+curl http://localhost:8000/health
+```
+
+**The `.env` goes in the repo root, not in `docker/`.** That is the file the
+compose stack injects (`env_file: ../.env`) and the file the application reads
+directly when you run it on the host. A `.env` inside `docker/` is loaded by
+Compose for `${...}` substitution *only* — and since nothing in the compose
+files substitutes `LPR_API__SECRET_KEY`, a secret put there reaches neither the
+container nor the app.
+
+`data/`, `models/` and `config.yaml` are bind-mounted, so the database, weights and
+settings live on the host and survive rebuilds. `--easyocr` pre-fills
+`models/easyocr` with the ~100 MB of OCR networks; without it the first container
+start downloads them itself, which is slow and is the step that fails on a flaky
+link.
+
+The compose file requests an NVIDIA GPU — see **[GPU acceleration](#gpu-acceleration)**
+below for the toolkit it needs and how to run without one.
+
+### Option 3 — a virtualenv you control (development)
+
+```bash
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install -e ".[gui]"                               # only for the desktop client
+lpr init                                              # directories, keys, licence, .env
+lpr-api                                               # http://127.0.0.1:8000/docs
+lpr-gui --api-url http://127.0.0.1:8000               # separate process/machine
+```
+
+`lpr init` is `python scripts/setup_dev.py` typed shorter — the script exists so
+the very first command after `git clone` does not require `pip install -e .` to
+have happened first. `make setup` is `install` followed by `init`, which is the
+whole of a fresh checkout in one target.
+
+**`make run` and `make launch` are not the same path, and the difference is
+deliberate.** `make launch` is exactly `./run.sh`: the site path, no reload,
+host and port from `config.yaml`. `make run` is the developer path — uvicorn
+with `--reload`, forced onto `0.0.0.0:8000` whatever the config says. Reload
+watches the source tree and restarts the process on every save, which is
+exactly wrong at a gate, where a restart drops the camera threads mid-shift. So
+neither target delegates to the other; making `run` call `run.sh` would have
+silently taken the developer's reload away.
+
+### What is missing, and why
+
+```bash
+make status    # what is installed, what is not; exits non-zero if anything is
+make doctor    # ...plus torch/cv2/easyocr imports, the database, and stray LPR_ vars
+```
+
+Both are import-light on purpose: on a box where the ML stack is what is
+broken, `status` still answers and `doctor` is what tells you which import
+failed.
+
+One wrinkle if you started with `./run.sh` on a fresh clone: every Makefile
+target except `launch` runs the interpreter at `$(VENV)/bin/python`, and `VENV`
+defaults to `venv` — while the launcher, finding no `venv/`, will have created
+`.venv/`. Point make at it for the session, or export it once:
+
+```bash
+make status VENV=.venv
+```
+
+`make launch` is unaffected, because it hands straight over to `run.sh`, which
+finds the environment itself.
+
+---
+
+## Troubleshooting
+
+Everything here is a first-run failure — the launcher stopped, or it started
+and the gate did nothing. Failures *after* a working install (a camera that
+drops out, an OTA update that will not apply) are covered in their own sections
+below and in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+### "Python was not found", or a Store page opens
+
+Windows ships a stub `python.exe` on `PATH` that exists only to advertise the
+Microsoft Store. That is why every probe in `run.bat` *runs* the candidate
+interpreter instead of testing for the file: the stub exits non-zero without
+opening the Store, so it is skipped rather than picked and failed on later.
+
+When nothing usable is found you get one of two messages, and they mean
+different things:
+
+| Message | Means | Fix |
+|---|---|---|
+| `Python bulunamadi.` | No interpreter answered at all | Install from [python.org](https://www.python.org/downloads/) and **tick "Add Python to PATH"** during setup |
+| `Kurulu Python surumu uygun degil.` | There is a Python, it is outside 3.11 – 3.13 | Install a supported version *alongside* the one you have — `py -3.12` will find it whether or not it is on `PATH` |
+
+The second case is the common one on a machine that has kept up with releases,
+and "install Python" is unhelpful advice to somebody who already has one, which
+is why the launcher separates them.
+
+### PowerShell "cannot be loaded because running scripts is disabled"
+
+**`run.bat` is a batch file.** It is executed by `cmd.exe`, and PowerShell's
+`ExecutionPolicy` governs `.ps1` files only — it does not and cannot block a
+`.bat`. Almost everybody assumes otherwise and reaches for
+`Set-ExecutionPolicy`; you do not need it here, and weakening it is a real
+change to a machine's security posture made for no reason.
+
+What *does* stop a batch file on Windows is the **mark of the web**. A file
+extracted from a ZIP that a browser downloaded carries an alternate data stream
+saying it came from the internet, and Windows then warns or refuses. Clear it:
+
+```powershell
+Unblock-File .\run.bat            # one file
+Get-ChildItem -Recurse | Unblock-File   # the whole extracted tree
+```
+
+...or right-click the file, Properties → General → **Unblock**. Cloning with
+`git` instead of downloading a ZIP avoids the mark entirely, which is the
+better habit for something you will be pulling updates into anyway.
+
+The other PowerShell surprise is not an error at all: `run.bat` alone is "not
+recognized", because PowerShell does not search the current directory. Type
+`.\run.bat`.
+
+### Forcing a dependency reinstall
+
+The launchers install only when the sentinel disagrees with the content of
+`requirements.txt` + `pyproject.toml`, so an edit to either is noticed by
+itself. Delete the sentinel when the environment was damaged by something
+*else* — an interrupted `pip`, a half-deleted `site-packages`, a wheel
+installed by hand and regretted:
+
+```bash
+rm .venv/.deps_installed          # or venv/.deps_installed
+```
+
+```bat
+del .venv\.deps_installed
+```
+
+The next launch reinstalls everything and re-runs `scripts/setup_dev.py`.
+Deleting the whole `.venv/` (or `venv/`) directory is the bigger hammer for the
+case where the interpreter inside it is wrong — which the launcher will tell
+you about by name, since it version-checks the environment that is actually
+going to run the service rather than the system Python that would not.
+
+### Port 8000 is already in use
+
+The service will not bind and says so. Either free the port:
+
+```bash
+make stop                     # fuser -k 8000/tcp
+ss -lptn 'sport = :8000'      # ...or find out what is holding it first
+```
+
+```bat
+netstat -ano | findstr :8000
+taskkill /PID <pid> /F
+```
+
+...or move the service, which is usually the right answer when something else
+legitimately owns 8000:
+
+```bash
+LPR_API__PORT=8080            # in .env — the environment wins over config.yaml
+```
+
+`config.yaml`'s `api.port` is the other place to set it. Note that this only
+affects `run.sh` / `run.bat` / `lpr-api`, which read the setting: `make run`
+passes `--host 0.0.0.0 --port 8000` to uvicorn explicitly and ignores both
+files.
+
+### The camera does not open
+
+`/health` answers `degraded` with a `detail` naming the cause, and
+`GET /api/cameras` reports per-role state — start there, because the message
+already distinguishes a role that configuration validation disabled from one
+that is configured fine and not answering.
+
+- **Linux, USB.** `ls -l /dev/video*` — the nodes are group-owned by `video`,
+  so an account outside that group opens nothing at all. `sudo usermod -aG
+  video $USER`, then log out and back in (group membership is granted at login,
+  so a fresh shell is not enough). Prove the camera outside this project with
+  `v4l2-ctl --list-devices` or `ffplay /dev/video0` before touching the config.
+- **macOS.** The first capture attempt raises the system camera-permission
+  prompt for the *terminal application*, not for this project. If it was ever
+  denied, no amount of restarting helps until it is re-granted in System
+  Settings → Privacy & Security → Camera.
+- **Windows.** Settings → Privacy & security → Camera → "Let desktop apps
+  access your camera". DirectShow also gives exclusive access, so a Teams,
+  Zoom or Camera-app window holding the webcam is enough to keep the pipeline
+  out of it.
+- **Both roles on one device.** Entry and exit must not name the same camera —
+  `"0"` and `/dev/video0` are one webcam spelled two ways. The second role is
+  disabled with a warning naming the first; see
+  [Camera sources](#camera-sources) for why that is refused at startup rather
+  than left to fail at open time.
+
+### RTSP: the stream is unreachable, or opens and then stops
+
+Prove the URL outside the application first — it is the fastest way to tell a
+credential problem from a network one:
+
+```bash
+ffplay -rtsp_transport tcp "rtsp://user:pass@10.0.0.5:554/stream1"
+```
+
+Then, in order of how often each one is the answer: a password containing `@`,
+`:` or `/` must be percent-encoded or it truncates the URL; `rtsp_transport`
+stays `tcp` (the default here, and not FFmpeg's) because udp on a congested or
+wifi-bridged link produces torn frames that surface as OCR errors rather than
+as network errors; `open_timeout_s` bounds the connect so a black-holed address
+fails fast instead of hanging startup. A stream that opens and later goes quiet
+is the failure the `stall_timeout_s` watchdog exists for — a TCP connection
+that stays open while the camera stops sending, which otherwise parks the
+capture thread forever while `/health` keeps answering 200.
+
+### It starts, the dashboard works, and no plate is ever recognised
+
+Almost always the missing detector. A fresh clone ships no trained weights, the
+pipeline falls back to contour detection, and that misses angled, blurred and
+night plates entirely. `GET /api/system/assets` names the file it wants; `make
+status` prints the same thing from the command line. See
+[README_TRAINING.md](README_TRAINING.md).
+
+If the detector *is* in place, check that motion gating is not eating
+everything (`motion_skipped` in `GET /api/stats`) and that the reads are
+arriving but not clearing the vote (`grants` and `fast_path_hits` in the same
+response).
+
+### Where to look next
+
+The launcher's own output is the first place; after that, `data/lpr.log`, which
+is the rotating log file the service writes alongside its console output. In
+Docker, `docker compose -f docker/docker-compose.yml logs -f` gives the same
+records as single-line JSON.
+
+---
+
 ## Architecture
 
 ```
                  ┌──────────────────────────────────────────────┐
    RTSP / USB    │  headless core  (Docker, no display needed)  │
    cameras ─────▶│                                              │
-                 │  CameraWorker ──▶ YOLOv8n ──▶ EasyOCR ──▶     │
+                 │  CameraWorker ──▶ YOLOv8n ──▶ PaddleOCR ──▶   │
                  │   (1 thread     detect      recognise        │
                  │    per camera)                 │             │
                  │                                ▼             │
@@ -64,7 +440,7 @@ src/lpr/
 │   └── snapshots.py    one JPEG per gate decision, written off the hot path
 ├── detect/             YOLOv8n detector, contour fallback
 │   └── preprocess.py   gamma/contrast, CLAHE, unsharp, deskew, perspective warp
-├── ocr/                EasyOCR/PaddleOCR backends
+├── ocr/                PaddleOCR (default) and EasyOCR backends
 │   ├── ensemble.py     per-frame confidence-weighted vote across views + engines
 │   ├── normalize.py    Turkish plate grammar, positional repair, edit-cost cap
 │   └── voting.py       multi-frame temporal consensus
@@ -75,77 +451,6 @@ docker/                 Dockerfile, compose, entrypoint
 scripts/fetch_models.py model bootstrap
 legacy/main_legacy.py   the original 836-line single-file app, kept for reference
 ```
-
----
-
-## Quick start
-
-### First run (any platform)
-
-```bash
-python scripts/setup_dev.py    # or `make init`, or `lpr init` once installed
-```
-
-That is the whole of provisioning a fresh clone, and it is idempotent — run it
-again any time you are not sure whether you ran it. It creates `data/`,
-`models/`, `keys/` and `data/snapshots/`; generates the RSA licence-signing
-pair; mints a local developer licence into `data/.license`; and copies
-`.env.example` to `.env` if there is no `.env`. Nothing existing is
-overwritten without `--force`, which matters most for `.env`: that is the
-uncommitted file holding this machine's real secrets.
-
-Then check what is still missing, and why:
-
-```bash
-make status    # what is installed, what is not; exits non-zero if anything is
-make doctor    # ...plus torch/cv2/easyocr imports, the database, and stray LPR_ vars
-```
-
-A fresh clone has no detection weights — every `.pt` is gitignored — so the
-service starts *degraded*, on the much weaker contour detector, and says so.
-`GET /api/system/assets` names the exact file it is waiting for. Fetch the
-baseline with `python scripts/fetch_models.py`; train the real plate model per
-**[README_TRAINING.md](README_TRAINING.md)**.
-
-### Docker (headless core — recommended)
-
-```bash
-python scripts/setup_dev.py               # .env, keys, licence, directories
-# ...then set LPR_API__SECRET_KEY in the .env it just wrote
-python scripts/fetch_models.py --easyocr  # baseline detector + OCR weights into models/
-docker compose -f docker/docker-compose.yml up --build
-curl http://localhost:8000/health
-```
-
-**The `.env` goes in the repo root, not in `docker/`.** That is the file the
-compose stack injects (`env_file: ../.env`) and the file the application reads
-directly when you run it on the host. A `.env` inside `docker/` is loaded by
-Compose for `${...}` substitution *only* — and since nothing in the compose
-files substitutes `LPR_API__SECRET_KEY`, a secret put there reaches neither the
-container nor the app.
-
-`data/`, `models/` and `config.yaml` are bind-mounted, so the database, weights and
-settings live on the host and survive rebuilds. `--easyocr` pre-fills
-`models/easyocr` with the ~100 MB of OCR networks; without it the first container
-start downloads them itself, which is slow and is the step that fails on a flaky
-link.
-
-The compose file requests an NVIDIA GPU — see **[GPU acceleration](#gpu-acceleration)**
-below for the toolkit it needs and how to run without one.
-
-### Native
-
-```bash
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-pip install -e ".[gui]"                               # only for the desktop client
-lpr init                                              # directories, keys, licence, .env
-lpr-api                                               # http://127.0.0.1:8000/docs
-lpr-gui --api-url http://127.0.0.1:8000               # separate process/machine
-```
-
-`make setup` is `install` followed by `init`, which is the whole of a fresh
-checkout in one target.
 
 ---
 
@@ -257,8 +562,8 @@ neither is privileged:
 **Browser** — start `lpr-api` and open `http://<host>:8000/`, which redirects
 to `/web/`. The page is plain HTML and vanilla JS from `web/`, mounted with
 `StaticFiles`; it adds no endpoints and holds no privileges of its own. Log in
-with the same account the desktop client uses (on a fresh install, "Kaydol"
-creates the first account, which becomes the admin).
+with the same account the desktop client uses (on a fresh install, **Yönetici
+Oluştur** creates the first account, which becomes the admin).
 
 Two details make it work in a browser: an `<img>` cannot send an
 `Authorization` header and neither can a WebSocket handshake, so the MJPEG and
@@ -313,6 +618,81 @@ snapshots:
   queue_size: 64       # frames awaiting encode before the writer drops
 ```
 
+#### The image is attached to the row, not just filed beside it
+
+Matching timestamps make an image and its record *line up*; they do not make
+either one point at the other. Reading a decision out of the history and then
+reconstructing a filename from its `ts` and plate is an operation that works
+until a plate contains a character the filesystem spells differently, or the
+snapshot lands a second either side of the row, or somebody moves the directory
+— and it fails silently every time, by finding nothing.
+
+So the link is stored. `logs.snapshot_path` (schema v9) holds the path the
+writer actually wrote, filled in after the fact by the writer thread, so the
+decision is never delayed waiting for a JPEG to encode. From there:
+
+- `GET /api/logs` returns `has_snapshot` on every row, resolved for the whole
+  page in one query rather than one stat call per row.
+- `GET /api/logs/{id}/snapshot` serves the image, behind the same
+  `LicensedUser` dependency as `GET /api/logs` itself — the picture is more
+  sensitive than the row that points at it, so it can never be the easier of
+  the two to reach.
+- The dashboard's history table shows a thumbnail indicator on the rows that
+  have one and previews it inline; a row with no image simply does not offer
+  the control, which is the honest answer to "was anything captured here".
+
+**Every kind of absence is the same 404**, deliberately: an unknown row, a row
+with nothing linked, snapshots switched off, a frame the writer dropped, a file
+the retention sweep removed. They are one answer to the client — there is no
+picture here — and separating them would let a caller probe which log ids exist.
+
+The stored path is re-resolved against the configured snapshot directory before
+anything is served. That column was written by this application, but it is still
+a filesystem path arriving from the database, and a path resolving outside the
+snapshot directory is refused rather than read: the check costs one `resolve()`
+and removes the whole class.
+
+### Vehicle sessions: who is inside, and for how long
+
+The `logs` table answers "what happened at the gate". It does not answer "how
+long has that car been in here", which is the question a car park is actually
+run on — and deriving it per query means walking the log backwards looking for
+a matching entry, once per vehicle, every time anybody opens the dashboard.
+
+The `sessions` table (schema v9, written through `SessionRepository`) keeps that
+answer as a fact rather than a computation: one row per stay, with `plate`,
+`entry_ts`, `exit_ts`, the `logs` ids at both ends, a `status`, and
+`duration_seconds`. Rows are written **from granted decisions only** — a refused
+car did not enter, and a stay ledger built from attempts would count it as
+though it had.
+
+Three cases decide the shape of the table, and each is recorded rather than
+smoothed over:
+
+| Situation | What is written | Why |
+|---|---|---|
+| Entry for a plate with no open stay | A new `open` row | The ordinary case |
+| A second entry for a plate already inside | Nothing — the open stay is kept | Two cameras seeing one car, or a driver who reversed and came back in, must not become two overlapping stays for one vehicle. The first entry is the true one |
+| An exit with no open stay | A row with `status = 'orphan_exit'`, `entry_ts` NULL and NULL duration | The car was inside before this table existed, or its entry was missed. Inventing an entry time would put a fabricated number into the record; a NULL says exactly what is known |
+
+Duration is computed on read for a stay that is still open, so "so far" is
+measured when the request is served rather than by a background job that has to
+be running for the number to be right.
+
+`GET /api/sessions/active` lists the vehicles inside, longest stay first;
+`GET /api/sessions/history` pages through completed and open stays, newest
+first, filterable by plate — paged like `GET /api/logs`.
+
+**The dashboard shows this beside the occupancy counter, not instead of it.**
+The two numbers are derived independently — occupancy from the gate log,
+the active-stay counter from the sessions ledger — and they are put next to each
+other precisely so a disagreement is visible. A counter that reconciled itself
+against the other would hide the one thing worth knowing: that the site's record
+of who is inside has drifted from the site's record of what came through the
+gate. Note also that they measure over different windows by design — the
+occupancy tally resets at 00:00 UTC, because a gate log is not a parking
+contract, while a stay stays open until its car leaves.
+
 ---
 
 ## API
@@ -324,7 +704,9 @@ snapshots:
 | `GET/POST /api/plates` · `PATCH`/`DELETE /api/plates/{plate}` | user · admin | allow-list CRUD, partial edit |
 | `POST /api/plates/import` · `GET /api/plates/export` | admin | bulk CSV in/out |
 | `GET /api/events/export` | user | access history as CSV |
-| `GET /api/logs` · `/api/logs/dates` | user | history, filterable by camera/plate/date |
+| `GET /api/logs` · `/api/logs/dates` | user | history, filterable by camera/plate/date; rows carry `has_snapshot` |
+| `GET /api/logs/{id}/snapshot` | user | the evidence JPEG behind one decision; 404 for every kind of absence |
+| `GET /api/sessions/active` · `/api/sessions/history` | user | vehicles currently inside; completed and open stays |
 | `GET /api/stats` · `/api/cameras` | user | pipeline and per-camera health |
 | `POST /api/relay/trigger` · `/api/pipeline/pause` · `/resume` | admin | manual control |
 | `GET /api/license` · `POST /api/license` | user · admin | licence state; install a new key |
@@ -347,12 +729,74 @@ The legacy pipeline was Canny edge detection → contour search → a four-point
 Tesseract `--psm 8`. It needed a clean quadrilateral, so it failed on angled, blurred,
 night and partially-occluded plates.
 
+### Where it currently stands
+
+Measured on the 47 hand-labelled frames in `data/ocr_ground_truth.json`, with
+the default PaddleOCR backend on CUDA:
+
+| | |
+|---|---|
+| Plate accuracy | **95.74 %** — 45 of 47 read exactly right |
+| Character error rate | **0.57 %** |
+| Wrong plate | **4.26 %** (the 2 remaining errors) |
+| Miss rate | **0.00 %** — every frame produced a read |
+| Latency | mean **106.5 ms**, p50 **99.1 ms**, p95 **136.0 ms** |
+
+Reproduce it, or re-measure on your own footage, with:
+
+```bash
+python scripts/evaluate.py --images <dir> --truth data/ocr_ground_truth.json \
+       --backend paddleocr --device cuda
+```
+
+`--device` defaults to `cpu`, so leaving it off measures a different machine
+from the one the latencies above came from. `--compare-backends` runs every
+supported engine over the same images and prints them side by side, which is
+the measurement to make before switching one.
+
+Two numbers there deserve more than a table cell. **The miss rate is zero and the
+error rate is not**, which is the harder of the two shapes to live with: the
+pipeline always answers, so a wrong answer arrives looking exactly like a right
+one, and everything downstream — the multi-frame vote, the whitelist check — is
+there to stop a confident wrong string from moving a barrier. And **both
+remaining errors are the same kind of mistake**, M read as H and M read as N.
+That is a glyph-shape confusion, not a preprocessing failure: the positional
+repair map cannot help, because all three are legal letters in the letter block,
+so the read is grammatical and wrong. It is the case a second engine in the
+ensemble is for.
+
+This is a small, single-site set. It says what this installation's cameras
+produce, not what a plate recogniser scores in general, and the point of
+`scripts/evaluate.py` shipping with the project is that a new site measures its
+own rather than inheriting these.
+
+### The engine underneath
+
+The recognition backend is **PaddleOCR**, and it is the default by measurement
+rather than by preference: on the same 47 labelled frames it read 89.4 % of
+plates exactly against EasyOCR's 25.5 %, at comparable latency, before the
+margin-trimming work below took it to where it is now. EasyOCR stays installed
+beside it — it is the fallback for a box where paddle will not build, it is the
+second opinion `ocr.ensemble_backends` pools in, and it needs no system
+libraries of its own. Switching is one line (`ocr.backend`), and
+`scripts/evaluate.py --compare-backends` is how that choice should be made.
+
+The version is capped below 3.0 deliberately. PaddleOCR 3.x moved to PIR-format
+model files through paddlex, and a `paddlepaddle` that cannot execute them fails
+at *inference* with `ConvertPirAttribute2RuntimeAttribute not support` — every
+read comes back empty, which looks exactly like a model that cannot see the
+plates rather than a version mismatch. `paddleocr>=2.10,<3` with
+`paddlepaddle>=3.0,<3.1` is the pair this was validated on.
+
+### The six layers
+
 The replacement stacks six independent accuracy layers:
 
 1. **YOLOv8n detection** — learned plate localisation, plus plausibility filters on
    aspect ratio, area, and Laplacian sharpness so blurred crops never reach OCR.
-2. **Crop enhancement** — upscale, dynamic gamma + percentile contrast stretch, CLAHE,
-   bilateral denoise, unsharp mask, deskew; the recogniser builds the grayscale,
+2. **Crop enhancement** — trim whatever sits left of the number (the blue band by
+   colour, a dark margin by luminance), then upscale, dynamic gamma + percentile
+   contrast stretch, CLAHE, bilateral denoise, unsharp mask, deskew; the recogniser builds the grayscale,
    thresholded and deskewed variants. If none of them yields a *grammatical* plate, it
    escalates to a **perspective-rectified** copy of the crop — the plate's four corners
    are located and warped back to a head-on rectangle — and tries again. That second
@@ -364,7 +808,8 @@ The replacement stacks six independent accuracy layers:
    confuses depends on the view — `0`/`O` flips with the binarisation threshold, `8`/`B`
    with the sharpening — so agreement across views is stronger evidence than any one
    view's certainty, and an over-confident outlier can no longer win outright. Set
-   `ocr.ensemble_backends: [paddleocr]` to add a second engine as an equal voter.
+   `ocr.ensemble_backends: [easyocr]` to add the second engine as an equal voter
+   alongside the default PaddleOCR.
 4. **Turkish normalisation** — `^(0[1-9]|[1-7][0-9]|8[01])([A-Z]{1,3})([0-9]{2,4})$`,
    with a *positional* confusion map (`0↔O`, `1↔I`, `8↔B`, `5↔S`, `3↔E`, …) applied per
    block: digits in the province code, letters in the middle, digits in the tail. Case is
@@ -394,7 +839,7 @@ inference, never a blind pipeline. Skipped frames are counted per camera as
 `motion_skipped`, and `latest()` keeps updating so the live preview never freezes.
 
 Tracking also caps the OCR bill: once a track has opened (or been refused at) the gate,
-or has burned `voting.max_track_attempts` reads without confirming anything, EasyOCR is
+or has burned `voting.max_track_attempts` reads without confirming anything, OCR is
 skipped for that track entirely — the pipeline recognises a *car*, not a *frame*. The
 saving shows up as `ocr_skipped` in `GET /api/stats`. Set `detection.track: false` to
 go back to stateless per-frame detection; everything downstream falls back to the
@@ -413,6 +858,7 @@ load-bearing:
 
 | # | Stage | Why here |
 | --- | --- | --- |
+| 0 | **Left-margin trim** (`strip_euroband`, then `trim_dark_margin`) | Before `to_gray`, because the first of the two works by colour and grayscale has none. Whatever sits left of the number — the blue EU/TR band, a frame, a bumper, a shadow — is not part of the plate but is part of the picture the recogniser is shown, and it reads as a character. |
 | 1 | **Upscale** to a 64 px character height (cubic, capped at 4×) | A 20–30 px crop wastes most of the recogniser's capability. Capped because interpolating 6 px to 64 px invents detail rather than revealing it. |
 | 2 | **Dynamic gamma** (`auto_gamma` / `apply_gamma`) | Global exposure must be fixed before anything local runs. |
 | 3 | **Percentile contrast stretch** (`stretch_contrast`) | Spreads what survives gamma across the full range. |
@@ -420,6 +866,39 @@ load-bearing:
 | 5 | **Bilateral denoise** | Edge-preserving: a plain Gaussian would soften the strokes the recogniser needs. |
 | 6 | **Unsharp mask** (`unsharp_mask`) | Puts back the stroke edges the bilateral filter softened. |
 | 7 | **Adaptive threshold** | Binarised variant, produced *last* so it thresholds a crisp image. |
+
+#### Trimming what is not the plate
+
+A phantom *leading* character is worse than a wrong one. It shifts every position
+after it, so the province coercion in `normalize_plate` then repairs the wrong
+slots and one bad glyph becomes a bad plate: `34TE6456` came back as `23LTE6458`,
+`34HKD338` as `03LH3381`. Over the 47 labelled frames, 11 of 71 character errors
+were insertions of this kind, and they clustered at the front of the string.
+
+`strip_euroband` removes the blue band — **detected, never assumed**. The obvious
+implementation, always dropping the leftmost 12 %, is wrong on this project's own
+data: a detector box is often tight around the number with no band inside it at
+all, and a blind crop then eats the province digit and *creates* the error it was
+meant to remove. So a band has to be found — contiguous from the left edge, blue,
+and the right width — or the crop is returned untouched.
+
+`trim_dark_margin` is its companion, and it is the one that works at night. Hue
+cannot separate a band from the bodywork around it on a blue-cast frame; measured
+on this project's own failures, the whole left fifth of such a crop reads as band
+blue and the colour detector correctly refuses. Luminance still separates
+cleanly, because whatever is left of the number is dark and the printed plate is
+white. Three of the five errors remaining at 89 % accuracy were a fabricated
+digit in front of an otherwise perfect read — `34HB4082` returned as `13AHB4082`
+— and all three were fixed by this stage.
+
+It is guarded so it cannot eat a plate: a crop with no real dynamic range is left
+alone (there is no margin to find in a uniformly grey picture, only noise to trip
+over), the bright region has to be *sustained* rather than one column so a
+specular highlight on a bumper is not mistaken for the plate, and nothing is
+trimmed unless the margin is wide enough to hold a character and never more than
+`DARK_MARGIN_MAX_FRACTION` of the width. Both functions return the crop object
+itself when there is nothing to remove, so a caller can tell "no band" from "band
+removed" by identity.
 
 #### Dynamic gamma correction
 
@@ -530,7 +1009,8 @@ never what they learned, so none of it requires the detector retrained.
 | `preprocess.rectify_perspective` | `true` | Retry a failed read on a perspective-corrected crop. One extra OCR pass, only on crops that already produced nothing grammatical. |
 | `preprocess.hard_case_variants` | `true` | Last-resort Otsu and polarity-inverted views for dark and IR-lit crops. Same bargain as rectification — an extra OCR pass, paid only on crops that already failed. |
 | `preprocess.escalate_below_confidence` | `0.5` | Keep escalating while the best read scores below this. `0` restores stopping at the first grammatical read whatever its confidence. |
-| `ocr.ensemble_backends` | `[]` | Extra OCR engines pooled into the per-frame vote as equal voters, e.g. `[paddleocr]`. |
+| `ocr.backend` | `paddleocr` | The recognition engine. PaddleOCR is the default; `easyocr` is the supported fallback for a box where paddle will not install. |
+| `ocr.ensemble_backends` | `[]` | Extra OCR engines pooled into the per-frame vote as equal voters, e.g. `[easyocr]` alongside the default PaddleOCR. |
 | `preprocess.frame_enhance` | `false` | Whole-frame CLAHE (on the LAB lightness channel, so hue is left alone) plus a mild unsharp mask, applied **before the detector**. ≈ 12 ms per 720p frame. |
 
 The crop-level settings are on by default because they can only ever affect what the
@@ -559,20 +1039,37 @@ frames of agreement. A resident's car in daylight is not that case, and until
 this existed it paid the same bill: the full escalation ladder, then
 `voting.min_votes` frames before the barrier moved.
 
-The fast path short-circuits it. After **every view** — not every stage, since
-the first stage is itself several OCR passes — the running vote is offered to
-the pipeline. If it is above `voting.fast_path_confidence` *and* names a plate
-`PlateRepository.authorization` clears at that instant, the remaining views are
-never computed and the gate opens on that frame. The finished read is offered
-one last time after the ladder has run, so a crop that only became legible on
-its final view still opens the gate on that frame rather than waiting for a
-second one.
+The fast path short-circuits the *OCR* half of it. After **every view** — not
+every stage, since the first stage is itself several OCR passes — the running
+vote is offered to the pipeline. If it is above `voting.fast_path_confidence`
+*and* names a plate `PlateRepository.authorization` clears at that instant, the
+remaining views are never computed. The finished read is offered one last time
+after the ladder has run, so a crop that only became legible on its final view
+still exits early rather than paying for views it no longer needs.
+
+Whether that early exit may also **open the barrier on that single frame** is a
+separate switch, and it ships off:
 
 ```yaml
 voting:
-  fast_path_enabled: true
+  fast_path_enabled: true      # skip the remaining OCR views on a confident hit
   fast_path_confidence: 0.82
+  fast_path_opens_gate: false  # ...but still require the multi-frame vote
 ```
+
+`fast_path_opens_gate: false` is the shipped default because the confidence
+score cannot carry the weight the earlier design put on it. Measured on the 47
+labelled frames, the correct reads scored 0.905–0.999 and the *wrong* ones
+scored 0.949 and 0.955 — inside the same band. There is no threshold that
+separates them, so a single-frame gate opening is not a confident decision with
+a small error rate; it is an unguarded one. With the switch off, a fast-path hit
+still saves the escalation ladder — the part that was always free — and the
+plate still has to win `voting.min_votes` of the last `voting.window` reads
+inside `voting.ttl_s` before the relay fires.
+
+A site that has measured its own footage and wants the last frame of latency
+back sets it to `true` knowingly. Nothing else in the configuration is a
+one-line change with that much reach.
 
 These two used to be a top-level `fast_path:` section with the keys `enabled`
 and `min_confidence`. That section is still read — an in-place upgrade keeps
@@ -583,23 +1080,26 @@ What is skipped, and what that costs:
 
 | | Slow path | Fast path |
 |---|---|---|
-| Enhanced views (gamma, unsharp, rectify, Otsu) | computed as needed | never computed |
-| Frames before the gate moves | `voting.min_votes` (default 2) | 1 |
+| Enhanced views (gamma, unsharp, rectify, Otsu) | computed as needed | never computed once the vote holds |
+| Frames before the gate moves | `voting.min_votes` (default 2) | the same 2, unless `fast_path_opens_gate` is on |
 | Applies to | every read | reads that clear the whitelist *now* |
 
 The escalation saving is free: those views exist to rescue a crop that did not
-read, and this one did. **The multi-frame saving is not free**, and it is worth
-being explicit about the trade. A single confident misread that happens to
-spell a *registered* plate now opens the barrier, where before it would have
-needed `voting.min_votes` frames to agree on the same wrong string. The bound
-that carries the weight is the second one: the misread has to land on a plate
-actually registered at this site, not merely on something plate-shaped. The
-threshold is the softer bound, and at 0.82 it is deliberately softer than the
+read, and this one did. **The multi-frame saving is not free**, which is why it
+is now behind `fast_path_opens_gate` and off. Turned on, a single confident
+misread that happens to spell a *registered* plate opens the barrier, where the
+ordinary path would need `voting.min_votes` frames to agree on the same wrong
+string. Two bounds are left holding it, and only one of them is load-bearing:
+the misread has to land on a plate actually registered at this site rather than
+on something merely plate-shaped. The confidence threshold is the softer bound —
+softer than it looks, since the measurement above found wrong reads scoring
+higher than correct ones — and at 0.82 it is deliberately softer still than the
 0.90 this shipped with — a clean, well-lit plate reads in the 0.82–0.90 band
 often enough that the higher bar sent most registered cars round the full
 voting path anyway, which is the latency the fast path exists to remove. A site
-that would rather keep the confirmation sets `voting.fast_path_enabled: false`,
-which also gives up the escalation saving — they are the same early exit.
+that wants no early exit at all sets `voting.fast_path_enabled: false`, which
+gives up the escalation saving too — that one switch controls both halves,
+whereas `fast_path_opens_gate` controls only the half that touches the relay.
 
 Everything that is not a live permit keeps the full path: an unknown plate, a
 blocked one, and an expired permit are exactly the cases the enhanced views and
@@ -658,7 +1158,8 @@ verdicts, so engines vote on equal footing instead of one being a tie-break for 
 Members are queried in order and the vote stops as soon as it holds a grammatical read, so
 a second engine is a cost paid on hard crops, not on every car. A member that raises is
 dropped for that crop and the vote proceeds on the rest — half an ensemble still beats no
-read. Enable with `ocr.ensemble_backends: [paddleocr]`; a configured engine that is not
+read. Enable with `ocr.ensemble_backends: [easyocr]` (the second engine beside the
+default PaddleOCR); a configured engine that is not
 installed logs a warning and is skipped rather than failing the pipeline.
 
 The module is pure Python (standard library + `lpr.contracts`), so it is unit-testable with
@@ -1274,6 +1775,13 @@ dashboard half-alive.
 The navbar carries the username and a role chip (**Yönetici** / **Operatör**),
 which is the fastest answer to "why can't I press that?".
 
+Beside it, in the same counter row so it costs no vertical space — the dashboard
+is locked to one viewport — sit two numbers that should agree: **İÇERİDEKİ ARAÇ**
+(occupancy, counted from the gate log against the configured capacity) and
+**AKTİF PARK** (open stays, counted from the sessions ledger, with the longest
+one alongside). They are computed from different sources on purpose; see
+[Vehicle sessions](#vehicle-sessions-who-is-inside-and-for-how-long).
+
 **What an operator does not see.** Role gating is mirrored in the UI so an
 operator sees why a control is inert rather than collecting 403s — the add
 form, the CSV import/export row, and every row action are hidden or disabled;
@@ -1750,7 +2258,7 @@ It is idempotent and transactional. Legacy password hashes are imported with a
 | Worker threads mutating Tkinter widgets | queue + single `root.after` drain on the main thread |
 | Unsalted SHA-256 passwords | argon2, with legacy verify-then-rehash |
 | `ctypes.windll` at import (crashed on Linux) | guarded in `platform_compat` |
-| 123 MB vendored `Tesseract-OCR/` in git | untracked; OCR via EasyOCR/PaddleOCR |
+| 123 MB vendored `Tesseract-OCR/` in git | untracked; OCR via PaddleOCR by default, EasyOCR as the fallback and second voter |
 | OCR on every frame of both cameras | `frame_stride` gating + detector plausibility filters |
 | YOLO on an empty driveway all day | motion gating in the capture thread: a ~0.09 ms frame-difference check drops ~99% of idle frames before inference |
 
@@ -1767,47 +2275,58 @@ make fmt
 
 ### Test suite
 
-**862 passing tests** across 23 modules (864 collected: 862 pass, 1 skipped, 1 known
-failure — see below). Tests run without torch, a GPU or a camera: ML-dependent modules are
+**1688 passing tests** across 40 modules, with no skips and no expected
+failures. Tests run without torch, a GPU or a camera: ML-dependent modules are
 `importorskip`-guarded and the pipeline tests drive the orchestrator through protocol
 fakes, so the suite is fully collectable in a CI job with no ML wheels installed.
 
 | Module | Tests | Covers |
 | --- | ---: | --- |
-| `test_api.py` | 203 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records |
-| `test_web_ui.py` | 121 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
+| `test_api.py` | 223 | Routes, JWT auth, MJPEG stream, WebSocket events, OTA authorisation, CSV endpoints, plate records, the snapshot route |
+| `test_web_ui.py` | 134 | Dashboard endpoints, role gating, gate button, CSV controls, plate table redesign |
 | `test_detect.py` | 109 | Box plausibility, letterbox round-trips, crop padding, gamma/contrast, unsharp, perspective rectification, sharpness gating |
 | `test_normalize.py` | 93 | Turkish grammar, positional repair, edit-cost cap, candidate extraction |
-| `test_pipeline.py` | 80 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring |
+| `test_pipeline.py` | 90 | Queue semantics, frame stride, thread lifecycle, sliding-gate cooldown, alert wiring, vehicle sessions |
+| `test_db.py` | 77 | Repositories, migrations, retention, system-event trail, partial plate updates |
 | `test_updater.py` | 71 | OTA: command construction, conflict/permission/timeout paths, restart state, remote check, version naming |
-| `test_db.py` | 57 | Repositories, migrations, retention, system-event trail, partial plate updates |
+| `test_evaluation.py` | 62 | Plate accuracy, CER, wrong-plate and false-positive rates |
 | `test_csvio.py` | 51 | CSV parsing: BOM, delimiters, encodings, Turkish headers, conflict policy |
 | `test_secrets.py` | 50 | No credentials in tracked templates; `.env*` ignore rules |
-| `test_evaluation.py` | 47 | Plate accuracy, CER, wrong-plate and false-positive rates |
+| `test_preprocess_pipeline.py` | 46 | Preprocessing wiring: escalation staging, frame-hook injection |
+| `test_ocr_recognizer.py` | 42 | OCR backend construction: which device it claims, where the weights are cached, a bad network wedging startup |
 | `test_notify.py` | 40 | SMTP dispatch (mocked), attachment handling, failure containment |
 | `test_voting.py` | 38 | Multi-frame consensus, TTL expiry, cooldown, track-aware merging |
-| `test_camera.py` | 32 | RTSP hardening: FFmpeg options, stall watchdog, backoff, credential masking |
+| `test_config.py` | 36 | Shipped defaults: sliding-gate cooldown, pulse width, voting threshold, single-frame gate bypass off, fast-path key migration |
+| `test_camera.py` | 35 | RTSP hardening: FFmpeg options, stall watchdog, backoff, credential masking, a source that never opens |
 | `test_license.py` | 30 | Signature validation, anti-rollback, expiry |
 | `test_relay.py` | 30 | Serial pulse queue, MockRelay fallback |
-| `test_preprocess_pipeline.py` | 28 | Preprocessing wiring: escalation staging, frame-hook injection |
 | `test_snapshots.py` | 28 | Evidence writer, retention, off-hot-path encoding |
 | `test_user_license.py` | 28 | Key issue/verify, binding, expiry, revocation precedence |
 | `test_dataset.py` | 27 | YOLO dataset validation: empty splits, train/val leaks, pixel labels |
+| `test_camera_sources.py` | 26 | Camera source classification; duplicate and unopenable sources refused while the string is still a string |
 | `test_ui_client.py` | 26 | Transport-only API/WS client |
 | `test_scheduler.py` | 24 | Nightly job: clock arithmetic, refusal-to-act paths, loop resilience |
+| `test_accel.py` | 22 | GPU probing and the device/model-cache wiring it feeds, asserted from a CPU-only host |
 | `test_machine.py` | 22 | Machine fingerprinting, tolerant matching, hardware-bound licences |
 | `test_ratelimit.py` | 21 | Login rate limiting, progressive lockout, eviction safety |
+| `test_label_ocr_dataset.py` | 20 | OCR ground-truth labelling tool: a human's label is stored as typed, never normalised |
+| `test_web_assets.py` | 20 | The dashboard is fully styled with no network access; the generated stylesheet stays in step with the markup |
 | `test_backup.py` | 19 | SQLite backup consistency, restore, pre-migration safety net |
-| `test_config.py` | 19 | Shipped defaults: sliding-gate cooldown, pulse width, voting threshold, fast-path key migration |
 | `test_ensemble.py` | 19 | Confidence-weighted vote, near-miss merging, multi-engine pooling |
 | `test_ui_app.py` | 19 | Tkinter queue drain, widget thread safety |
 | `test_parking.py` | 18 | Occupancy accounting |
 | `test_auth_sessions.py` | 14 | Role-scoped session lengths, token revocation on delete/demote |
+| `test_model_assets.py` | 14 | Model-file reporting and provisioning: a fresh clone is degraded, not broken |
+| `test_pipeline_streaming.py` | 14 | Camera selection and live-view decoupling: an unsourced role is skipped, two roles never share a device |
+| `test_provisioning.py` | 14 | `lpr init`: a second run destroys nothing — not the signing key, the licence, nor the `.env` |
+| `test_degraded_reporting.py` | 13 | What `/health` and `/api/stats` say when the weights, the pipeline or a camera is missing |
+| `test_paths_cross_platform.py` | 13 | Paths that must mean the same on Linux and Windows: snapshot filenames, configured directories, containment |
+| `test_env_example.py` | 10 | `.env.example` and the settings models must not drift apart |
 
 The accuracy layers are deliberately the most heavily tested: `test_detect.py`,
 `test_normalize.py`, `test_voting.py`, `test_ensemble.py`,
 `test_preprocess_pipeline.py`, `test_evaluation.py` and `test_dataset.py`
-together account for 361 of the 1416 collected tests. Every
+together account for 394 of the 1688 collected tests. Every
 preprocessing primitive is additionally asserted to be *total* — it must return its input
 unchanged rather than raise, on `None`, on an empty array, and on a degenerate crop.
 

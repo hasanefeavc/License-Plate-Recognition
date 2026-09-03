@@ -24,9 +24,12 @@ lap>=0.5.12,<1
 # install that variant explicitly instead of letting it AutoUpdate.
 onnxruntime>=1.17,<2
 # The default recognition engine, and by a wide margin: measured on 47
-# hand-labelled frames from a live installation it read 89.4% of plates
-# exactly against EasyOCR's 25.5%, at a comparable latency. See
-# scripts/evaluate.py --compare-backends to re-measure on your own site.
+# hand-labelled frames from a live installation it read 95.7% of plates
+# exactly against EasyOCR's 38.3% (CER 0.6% against 17.6%). It is the slower
+# of the two per frame -- p50 96 ms against 53 ms on the same GPU -- but the
+# tail, which is what a gate actually waits on, is the same: p95 135 ms
+# against 134 ms. See scripts/evaluate.py --compare-backends to re-measure on
+# your own site.
 #
 # Capped below 3.0 deliberately. PaddleOCR 3.x moved to PIR-format model files
 # through paddlex, and a paddlepaddle that cannot execute them fails at
