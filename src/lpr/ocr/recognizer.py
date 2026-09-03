@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import signal
 import socket
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -700,6 +701,99 @@ class EasyOcrRecognizer(_BaseRecognizer):
         return method(image, **allowed)
 
 
+#: Signals whose disposition ``import paddleocr`` has to be protected from.
+#: ``SIGBREAK`` exists only on Windows and ``getattr`` is how that is asked --
+#: this is a capability check, not an OS branch, so it stays out of
+#: :mod:`lpr.platform_compat`.
+_GUARDED_SIGNALS: tuple[int, ...] = tuple(
+    sig
+    for sig in (
+        getattr(signal, "SIGINT", None),
+        getattr(signal, "SIGTERM", None),
+        getattr(signal, "SIGBREAK", None),
+    )
+    if sig is not None
+)
+
+
+def _capture_process_globals() -> tuple[int, list[logging.Handler], dict[int, Any]]:
+    """Snapshot the process-wide state ``import paddleocr`` is about to change.
+
+    Taken immediately before the import and handed straight back to
+    :func:`_undo_paddle_process_globals`, so what is restored is whatever this
+    process had actually configured rather than a guess at it.
+    """
+    root = logging.getLogger()
+    handlers: dict[int, Any] = {}
+    for sig in _GUARDED_SIGNALS:
+        try:
+            handlers[sig] = signal.getsignal(sig)
+        except (OSError, ValueError):  # pragma: no cover - platform refusal
+            continue
+    return root.level, list(root.handlers), handlers
+
+
+def _undo_paddle_process_globals(
+    previous_level: int,
+    previous_handlers: list[logging.Handler],
+    previous_signals: dict[int, Any],
+) -> None:
+    """Put back the process-wide settings ``import paddleocr`` overwrites.
+
+    Both are library-wide side effects of the import itself, not of anything
+    this project asked for, and both stay silent until the day they matter.
+
+    **Root logger.** paddleocr configures logging on import: the root logger is
+    raised to WARNING and a plain stderr handler is attached. Everything this
+    service logs at INFO from that moment on -- "pipeline started", "snapshot
+    saved", "lpr-api kapatıldı" -- disappears, and what still gets through is
+    emitted twice, once as the configured JSON line and once in the default
+    format. The symptom is a site whose log stops halfway through start-up and
+    never records a shutdown, which is precisely the log somebody needs after
+    an unexplained restart.
+
+    **Termination signals.** paddlepaddle installs fatal-signal handlers in
+    C++; its SIGTERM handler aborts the process with "FatalError:
+    ``Termination signal`` is detected by the operating system". Those handlers
+    are invisible to :func:`signal.getsignal`, so uvicorn's own handler looks
+    installed and is simply never reached. ``docker stop`` and
+    ``systemctl stop`` both send SIGTERM, so on every ordinary stop of the
+    service the graceful shutdown -- orchestrator stopped, camera threads
+    joined, snapshot queue drained, relay closed -- never ran at all.
+
+    ``paddle.disable_signal_handler()`` exists for exactly this, but it only
+    returns the signal to its *default* disposition, which would still kill the
+    process outright; the Python-level handlers uvicorn installed are
+    reinstated afterwards, and that is the half that makes the shutdown
+    graceful again.
+
+    Never raises: a recogniser that works must not be refused over any of this.
+    """
+    root = logging.getLogger()
+    root.setLevel(previous_level)
+    for handler in list(root.handlers):
+        if handler not in previous_handlers:
+            root.removeHandler(handler)
+
+    try:
+        import paddle
+
+        paddle.disable_signal_handler()
+    except Exception:  # pragma: no cover - paddle absent or API changed
+        logger.debug("paddle signal handlers could not be disabled", exc_info=True)
+
+    for sig, handler in previous_signals.items():
+        # `signal.signal` is main-thread-only and refuses a handler it did not
+        # hand out (a C-level one reads back as None). Either is a reason to
+        # leave that signal alone, not to fail the recogniser.
+        if handler is None:
+            continue
+        try:
+            signal.signal(sig, handler)
+        except (OSError, ValueError, TypeError):  # pragma: no cover - defensive
+            logger.debug("Could not restore the handler for signal %s", sig, exc_info=True)
+
+
 class PaddleOcrRecognizer(_BaseRecognizer):
     """PaddleOCR backend (satisfies ``Recognizer``).
 
@@ -730,6 +824,10 @@ class PaddleOcrRecognizer(_BaseRecognizer):
         self._settings = settings
         self._configure_preprocessing(settings)
 
+        # `import paddleocr` is not a passive import -- see
+        # `_undo_paddle_process_globals` for what it changes underneath us and
+        # why each change has to be put back.
+        previous_level, previous_handlers, previous_signals = _capture_process_globals()
         try:
             from paddleocr import PaddleOCR
         except ImportError as exc:  # pragma: no cover - depends on environment
@@ -738,6 +836,8 @@ class PaddleOcrRecognizer(_BaseRecognizer):
                 "Install it with `pip install paddleocr paddlepaddle`, or set "
                 "ocr.backend to 'easyocr'."
             ) from exc
+        finally:
+            _undo_paddle_process_globals(previous_level, previous_handlers, previous_signals)
 
         logger.info("initialising PaddleOCR")
         #: Set once the engine has raised, so the diagnosis is logged a single
