@@ -3293,6 +3293,123 @@ def test_the_log_list_says_which_rows_have_a_picture(
     assert flags == {"34ABC123": True, "06BZ1234": False}
 
 
+def test_a_pruned_file_still_reads_as_linked_in_the_log_list(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    """``has_snapshot`` answers the database, not the disk, and that is the
+    contract ``LogOut`` documents.
+
+    The history view renders up to a thousand rows and the flag decides one
+    thing: whether to draw a thumbnail affordance. Confirming each one would
+    cost a stat per row on every page load to be right about a file that can
+    vanish between the list and the click anyway. The route is what re-checks,
+    and the row above proves it still refuses -- so the client's fallback is
+    the correct place for this, not a per-row filesystem probe.
+    """
+    from lpr.db import LogRepository
+
+    row_id = _granted_row()
+    photo = snaps_dir / "vanished.jpg"
+    photo.write_bytes(b"x")
+    LogRepository().attach_snapshot(row_id, photo)
+    photo.unlink()
+
+    client = TestClient(snapshot_app)
+    (row,) = client.get("/api/logs", headers=auth(operator_token)).json()
+    assert row["has_snapshot"] is True
+    assert (
+        client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token)).status_code == 404
+    )
+
+
+def test_a_stored_path_spelled_with_forward_slashes_is_still_served(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    """The Windows round trip, in the only form Linux can exercise.
+
+    ``logs.snapshot_path`` holds text, and the route rebuilds a ``Path`` from
+    it and re-resolves it against the snapshot directory. On Windows the stored
+    spelling and the configured one genuinely differ -- ``D:/lpr/shots\\a.jpg``
+    against ``D:\\lpr\\shots\\a.jpg`` -- and both name the same file, so the
+    check has to compare resolved paths. Replacing it with a string comparison
+    passes every test on this machine and 404s every snapshot on a Windows
+    install.
+    """
+    from lpr.db import LogRepository
+
+    row_id = _granted_row()
+    photo = snaps_dir / "nested" / "shot.jpg"
+    photo.parent.mkdir(parents=True, exist_ok=True)
+    photo.write_bytes(b"\xff\xd8\xff\xe0jpegbytes")
+    LogRepository().attach_snapshot(row_id, photo.as_posix())
+
+    client = TestClient(snapshot_app)
+    response = client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token))
+    assert response.status_code == 200
+    assert response.content == b"\xff\xd8\xff\xe0jpegbytes"
+
+
+def test_a_directory_whose_name_merely_starts_like_the_snapshot_one_is_refused(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    """``.../snapshots-old`` is a text prefix of ``.../snapshots`` and is not
+    inside it.
+
+    This is what a ``startswith`` containment check lets through, and the kind
+    of directory a site really does end up with after a migration. The route
+    compares resolved paths, so it refuses.
+    """
+    from lpr.db import LogRepository
+
+    sibling = snaps_dir.parent / f"{snaps_dir.name}-old"
+    sibling.mkdir(parents=True, exist_ok=True)
+    photo = sibling / "archived.jpg"
+    photo.write_bytes(b"older evidence")
+    assert str(photo).startswith(str(snaps_dir)), "the string comparison would have allowed it"
+
+    row_id = _granted_row()
+    LogRepository().attach_snapshot(row_id, photo)
+
+    client = TestClient(snapshot_app)
+    response = client.get(f"/api/logs/{row_id}/snapshot", headers=auth(operator_token))
+    assert response.status_code == 404
+    assert b"older evidence" not in response.content
+
+
+def test_every_kind_of_absent_snapshot_answers_the_identical_404(
+    snapshot_app: Any, operator_token: str, snaps_dir: Any
+) -> None:
+    """Anti-enumeration, asserted as sameness rather than three times as 404.
+
+    An unknown row, a row with nothing linked and a row whose file the
+    retention sweep removed are three different server-side facts and one
+    answer to the client. Distinguishing any of them -- a different phrase, a
+    404 against a 410, a header only one branch sets -- turns this endpoint
+    into an oracle for which log ids exist, behind a licence check that the
+    picture itself is deliberately kept level with.
+
+    Each branch already has its own test above; this pins the property those
+    three cannot state individually.
+    """
+    from lpr.db import LogRepository
+
+    pruned_id = _granted_row("35XYZ789")
+    photo = snaps_dir / "swept.jpg"
+    photo.write_bytes(b"x")
+    LogRepository().attach_snapshot(pruned_id, photo)
+    photo.unlink()
+
+    client = TestClient(snapshot_app)
+    responses = [
+        client.get(f"/api/logs/{log_id}/snapshot", headers=auth(operator_token))
+        for log_id in (999999, _granted_row("06BZ1234"), pruned_id)
+    ]
+
+    assert {response.status_code for response in responses} == {404}
+    assert len({response.text for response in responses}) == 1, "the bodies must not differ"
+    assert len({tuple(sorted(response.headers)) for response in responses}) == 1
+
+
 # ---------------------------------------------------------------------------
 # Session routes
 # ---------------------------------------------------------------------------

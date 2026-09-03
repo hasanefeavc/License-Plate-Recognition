@@ -16,6 +16,7 @@ default that is right for an arm barrier is actively harmful here.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,6 +33,12 @@ from lpr.config import (
     unknown_env_names,
     warn_about_unknown_env_names,
 )
+
+#: The committed ``config.yaml``, addressed as a file rather than through
+#: ``_default_config_yaml_path()``. That helper honours ``LPR_CONFIG_FILE``,
+#: so a developer with the variable exported would have the one assertion in
+#: this module that is *about* the shipped file quietly read a different one.
+SHIPPED_CONFIG_YAML = Path(__file__).resolve().parents[1] / "config.yaml"
 
 # ---------------------------------------------------------------------------
 # Voting: the re-trigger window
@@ -125,6 +132,42 @@ def test_the_fast_path_threshold_is_above_the_ocr_floor() -> None:
     """The orchestrator floors one at the other; shipping them inverted would
     mean the shipped configuration relies on that floor to stay honest."""
     assert VotingConfig().fast_path_confidence > OcrConfig().min_confidence
+
+
+def test_the_fast_path_does_not_open_the_gate_by_default() -> None:
+    """The one default here that can move a barrier on uncorroborated evidence.
+
+    Measured on 47 hand-labelled frames from a live site, correct reads score
+    0.905-0.999 and the two wrong ones score 0.949 and 0.955: the distributions
+    overlap, so no confidence threshold separates a confident read from a
+    correct one. The multi-frame vote costs about 130 ms in front of a barrier
+    that takes seconds to open, which is the whole price of keeping it.
+
+    The behaviour is covered at the orchestrator in ``test_pipeline.py``; this
+    covers the *default*, which is the half a refactor can flip without any of
+    those tests noticing -- they build their settings from this model.
+    """
+    assert VotingConfig().fast_path_opens_gate is False
+
+
+def test_the_shipped_config_yaml_leaves_the_gate_bypass_off() -> None:
+    """The committed file, read as a file, and the one exception in this module.
+
+    Everything else here goes through the models, because ``Settings`` would
+    read whatever ``config.yaml`` the machine happens to have. This assertion
+    is *about* the committed ``config.yaml``, which is the same on every
+    checkout -- and it is needed because the YAML outranks the model default:
+    shipping ``true`` here would arm the single-frame bypass on every fresh
+    install while the default above still read ``False``.
+
+    A site that has measured its own risk and wants the bypass edits this line
+    and sees this test say so, which is the right amount of friction for the
+    one setting that can move a barrier on a single unvetted frame.
+    """
+    import yaml
+
+    shipped = yaml.safe_load(SHIPPED_CONFIG_YAML.read_text(encoding="utf-8"))
+    assert shipped["voting"]["fast_path_opens_gate"] is False
 
 
 # ---------------------------------------------------------------------------

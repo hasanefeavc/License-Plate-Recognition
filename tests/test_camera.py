@@ -200,6 +200,97 @@ def test_a_delivered_frame_resets_the_backoff() -> None:
 
 
 # ---------------------------------------------------------------------------
+# A source that never opens
+#
+# The other end of the same contract as the watchdog: a camera the capture
+# backend refuses outright must degrade the service, never stop it. Nothing
+# here opens a device -- ``cv2.VideoCapture`` is replaced by a class that
+# reports itself closed, which is what the real one does for a wrong index, a
+# device another process holds, or a URL nothing answers on.
+# ---------------------------------------------------------------------------
+
+
+class RefusingCapture:
+    """A capture handle that never opens. Counts its own release."""
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.releases = 0
+
+    def isOpened(self) -> bool:  # noqa: N802 - mirrors the cv2 API
+        return False
+
+    def release(self) -> None:
+        self.releases += 1
+
+
+def test_a_source_that_will_not_open_is_reported_and_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure an operator sees as "the entry camera is offline".
+
+    ``_open`` has to hand back ``None`` and put the reason on the status
+    object, because that status is the only thing standing between this and a
+    gate that is silently blind: it is what ``/health`` and the dashboard read.
+    Raising instead would take the whole capture thread down and, with it, the
+    other camera.
+    """
+    cv2 = pytest.importorskip("cv2")
+    monkeypatch.setattr(cv2, "VideoCapture", RefusingCapture)
+    worker = CameraWorker("entry", CameraConfig(source="9", reconnect_delay_s=0.01))
+
+    assert worker._open() is None
+    status = worker.status()
+    assert status.connected is False
+    assert status.last_error and "could not open" in status.last_error
+    assert worker.enabled, "a camera that is fitted but unreachable is still configured"
+
+
+def test_a_source_that_will_not_open_is_retried_instead_of_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A camera that is merely rebooting must be picked up when it returns.
+
+    Giving up after the first refusal would mean a power-cycled camera stays
+    dark until somebody restarts the service, which is the failure the backoff
+    exists to avoid. The loop is stopped from inside the third open so the test
+    terminates on a deterministic count rather than on a timer.
+    """
+    cv2 = pytest.importorskip("cv2")
+    monkeypatch.setattr(cv2, "VideoCapture", RefusingCapture)
+    config = CameraConfig(source="9", reconnect_delay_s=0.01, reconnect_max_delay_s=0.01)
+    worker = CameraWorker("entry", config)
+    real_open = worker._open
+    attempts = 0
+
+    def counting_open() -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 3:
+            worker._stop_event.set()
+        return real_open()
+
+    monkeypatch.setattr(worker, "_open", counting_open)
+    worker._capture_loop()
+
+    assert attempts == 3, "the loop must keep retrying, not return on the first failure"
+    assert worker.status().connected is False
+
+
+def test_an_unfitted_camera_starts_and_stops_without_touching_a_device() -> None:
+    """A blank source is the normal single-camera site, not a failure.
+
+    ``run`` returns immediately, so a role nobody wired up costs a thread that
+    exits rather than one reconnecting to nothing all night.
+    """
+    worker = CameraWorker("exit", CameraConfig(source=""))
+
+    assert not worker.enabled
+    assert worker.status().last_error == "no source configured"
+    worker.run()  # must not block, and must not raise
+    assert worker.status().connected is False
+
+
+# ---------------------------------------------------------------------------
 # The stall watchdog
 # ---------------------------------------------------------------------------
 

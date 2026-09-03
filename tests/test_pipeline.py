@@ -1710,6 +1710,53 @@ def test_a_broken_sessions_table_does_not_stop_the_gate(db, frame) -> None:
     assert relay.triggers == 1
 
 
+def test_a_broken_sessions_table_still_leaves_an_audit_trail(db, frame) -> None:
+    """Accounting and audit are separate records, and only one may be lost.
+
+    The stay ledger is derived bookkeeping -- ``occupancy_since`` recomputes
+    the live count from the log without it. The ``logs`` row is not: it is the
+    only account of what the barrier did, and it is written before the session
+    is touched precisely so a broken ``sessions`` table cannot take it with it.
+    A future refactor that wrote both inside one transaction would satisfy the
+    test above and silently lose the evidence for every grant.
+    """
+    from lpr.db.connection import transaction
+
+    PlateRepository().upsert("34ABC123")
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=FakeRelay())
+    with transaction() as conn:
+        conn.execute("DROP TABLE sessions")
+
+    pipeline.process_frame("entry", frame)
+
+    rows = LogRepository().recent(limit=5)
+    assert [row.action for row in rows] == [str(Action.GRANTED)]
+    assert rows[0].plate == "34ABC123"
+
+
+def test_a_broken_sessions_table_does_not_stop_a_departure(db, frame) -> None:
+    """The exit half of the same contract.
+
+    ``_track_session`` branches on the camera role, so the entry path being
+    safe says nothing about the exit path -- and a car that cannot get *out*
+    is the worse of the two failures. The session write is closing a stay that
+    was never opened here, which is the ordinary orphan-exit case on top of a
+    table that is no longer there.
+    """
+    from lpr.db.connection import transaction
+
+    PlateRepository().upsert("34ABC123")
+    relay = FakeRelay()
+    pipeline = _build_pipeline(db, voter=FakeVoter(confirm=True), relay=relay)
+    with transaction() as conn:
+        conn.execute("DROP TABLE sessions")
+
+    events = pipeline.process_frame("exit", frame)
+
+    assert [e.action for e in events] == [str(Action.GRANTED)]
+    assert relay.triggers == 1
+
+
 def test_a_snapshot_is_linked_to_the_row_it_evidences(db, frame, tmp_path) -> None:
     """The link is one UPDATE: `_record` already put the rowid on the event."""
     from lpr.db import LogRepository

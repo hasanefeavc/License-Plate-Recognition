@@ -128,6 +128,63 @@ def test_health_falls_back_to_the_generic_camera_message(tmp_settings: Any) -> N
     assert TestClient(app).get("/health").json()["detail"] == "Kamera bağlantısı yok"
 
 
+def test_health_answers_rather_than_raises_when_no_camera_is_configured_at_all(
+    tmp_settings: Any,
+) -> None:
+    """Both roles blank -- a first boot, or a site whose cameras are not fitted.
+
+    Distinct from the case above, where two cameras *are* configured and simply
+    are not connected. Here every source is empty, which means ``enabled`` is
+    False, ``resolved_source`` and ``device_key`` are both ``None`` and the
+    validator has nothing to complain about, so ``issues`` is empty. The probe
+    has to reach its generic fallback through all of that without a role
+    lookup handing it a ``None`` -- and it has to keep answering 200, because
+    a fresh install with no cameras yet is precisely when somebody is trying
+    to reach the setup screen behind this same process.
+    """
+    from lpr.config import CameraConfig, CamerasConfig
+
+    tmp_settings.cameras = CamerasConfig(
+        entry=CameraConfig(source=""), exit=CameraConfig(source="")
+    )
+    assert tmp_settings.cameras.issues == [], "an unfitted camera is not a misconfiguration"
+
+    app = create_app(tmp_settings)
+    app.state.pipeline = _NoCamerasPipeline()
+    app.dependency_overrides[deps.get_user_repository] = _FakeUserRepository
+
+    response = TestClient(app).get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["cameras"] == {"entry": False, "exit": False}
+    assert body["detail"] == "Kamera bağlantısı yok"
+
+
+def test_health_names_a_source_that_could_not_be_opened(tmp_settings: Any) -> None:
+    """The other half of "which is it": a typo, not an unplugged cable.
+
+    ``duplicate`` is covered above. ``invalid`` is the reason an operator hits
+    when they type a device name the capture layer cannot open -- and without
+    this the answer is "Kamera bağlantısı yok", which sends them to the wiring
+    cupboard instead of to one line of configuration. The offending string is
+    echoed back so they can see what was actually read.
+    """
+    from lpr.config import CameraConfig, CamerasConfig
+
+    tmp_settings.cameras = CamerasConfig(
+        entry=CameraConfig(source="kamera bir"), exit=CameraConfig(source="1")
+    )
+    app = create_app(tmp_settings)
+    app.state.pipeline = _NoCamerasPipeline()
+    app.dependency_overrides[deps.get_user_repository] = _FakeUserRepository
+
+    response = TestClient(app).get("/health")
+    assert response.status_code == 200
+    detail = response.json()["detail"]
+    assert "entry" in detail and "kamera bir" in detail, detail
+
+
 # ---------------------------------------------------------------------------
 # The 503
 # ---------------------------------------------------------------------------
