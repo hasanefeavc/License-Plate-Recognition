@@ -1,0 +1,15 @@
+# Line endings for the two one-click launchers.
+#
+# cmd.exe is the reason this file exists. A .bat checked out with LF-only line
+# endings is read one byte-run at a time by a parser that expects CR before LF,
+# and the failure mode is not a syntax error -- it is a `goto` that lands on the
+# wrong line, or a label the interpreter cannot find at all. So run.bat is
+# pinned to CRLF in the working tree regardless of what core.autocrlf is set to
+# on the machine doing the checkout.
+#
+# run.sh gets the mirror-image treatment: a shell script with CRLF endings dies
+# on its own shebang ("/usr/bin/env: 'bash\r': No such file or directory"),
+# which is exactly what happens when a Windows checkout is copied onto a Linux
+# box or shared into a container.
+*.bat text eol=crlf
+*.sh  text eol=lf

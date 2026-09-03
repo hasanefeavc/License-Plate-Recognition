@@ -1,4 +1,4 @@
-.PHONY: run start stop restart init setup status doctor css css-check install install-gui dev lint fmt \
+.PHONY: run launch start stop restart init setup status doctor css css-check install install-gui dev lint fmt \
         test test-fast secrets dataset-scaffold dataset-check evaluate train \
         export-onnx run-api run-gui docker-build docker-up docker-down clean
 
@@ -18,6 +18,15 @@ COMPOSE = docker compose -f docker/docker-compose.yml
 run:
 	@test -d $(VENV) || $(MAKE) setup
 	$(UVICORN) lpr.api.main:app --reload --host 0.0.0.0 --port 8000
+
+# Aynı işin tek tıklık hâli: ./run.sh (Windows'ta run.bat). `run` hedefinden
+# kasıtlı olarak ayrı tutuldu, çünkü ikisi farklı iki kullanıcıya hizmet ediyor:
+# `make run` geliştirici içindir ve --reload ile 0.0.0.0'a bağlanır; run.sh ise
+# sahadaki kurulum içindir, sanal ortamı ve bağımlılıkları kendisi hazırlar,
+# reload açmaz ve host/port'u config.yaml'dan okur. `run` hedefini run.sh'a
+# devretmek geliştiricinin reload'unu sessizce kapatırdı.
+launch:
+	./run.sh
 
 # Tek komutla arka planda başlat
 start:
