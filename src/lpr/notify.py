@@ -109,6 +109,10 @@ class EmailNotifier:
         self.sent = 0
         self.failed = 0
         self.dropped = 0
+        #: Set once a 535 has been explained, so a gate whose credential is
+        #: wrong reports it at the first refused notification instead of at
+        #: every one. See ``_warn_authentication``.
+        self._auth_warned = False
         #: Alerts thrown away because the notifier was never in a position to
         #: send them -- unusable configuration, or a worker that was not
         #: started. Counted separately from ``dropped`` (a full queue), which
@@ -247,6 +251,10 @@ class EmailNotifier:
 
         try:
             self._send(message)
+        except smtplib.SMTPAuthenticationError as exc:
+            self.failed += 1
+            self._warn_authentication(exc)
+            return
         except Exception as exc:
             self.failed += 1
             logger.warning("E-posta gönderilemedi (%s): %s", notification.plate, exc, exc_info=True)
@@ -258,6 +266,37 @@ class EmailNotifier:
             notification.plate,
             notification.reason,
             notification.snapshot.name if notification.snapshot else "yok",
+        )
+
+    def _warn_authentication(self, exc: smtplib.SMTPAuthenticationError) -> None:
+        """Say what a 535 from Gmail actually means, once.
+
+        The server's own words are ``(535, b'5.7.8 Username and Password not
+        accepted')`` -- or ``BadCredentials`` -- which reads as "you typed your
+        password wrong". For Gmail and Google Workspace it almost never is:
+        those accounts refuse the account password over SMTP outright, and want
+        a 16-character app password minted separately at
+        https://myaccount.google.com/apppasswords, which in turn needs 2-step
+        verification enabled first. Nothing in the server's reply says so, and
+        the operator has no reason to guess it.
+
+        Logged once per process rather than per notification. The credential
+        cannot fix itself, so a gate that is refusing entries would otherwise
+        repeat this at every unauthorised plate, and the flood is what buries
+        the first occurrence.
+        """
+        if self._auth_warned:
+            logger.debug("SMTP kimlik doğrulama hatası yineledi: %s", exc)
+            return
+        self._auth_warned = True
+        logger.error(
+            "SMTP kimlik doğrulaması reddedildi (%s). Gmail/Google Workspace "
+            "hesaplarında hesap parolası SMTP için kabul edilmez: "
+            "https://myaccount.google.com/apppasswords adresinden 16 karakterlik "
+            "bir uygulama parolası (app password) oluşturup LPR_SMTP__PASSWORD "
+            "değerine .env dosyasında yazın. Bunun için önce 2 adımlı doğrulama "
+            "açık olmalıdır.",
+            exc,
         )
 
     # -- message construction --------------------------------------------

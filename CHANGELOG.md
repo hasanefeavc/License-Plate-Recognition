@@ -15,6 +15,31 @@ are currently driving through.
 
 ### Added
 
+- **Setup fetches the baseline detection weights when there are none.**
+  `models/` is gitignored wholesale, so every clone starts empty and the first
+  anybody heard of it was a warning banner at the gate, on the first frame —
+  the least useful moment to discover a download is needed.
+  `scripts/setup_dev.py` now asks at setup time and adds `--fetch-models`
+  itself; `--no-fetch-models` refuses, for a site that must never reach the
+  network. The check lives there rather than being written a second and third
+  time in batch and bash, and both launchers already call it.
+
+  It fetches the **baseline**, which is scaffolding and not a plate detector.
+  Stock COCO `yolov8n.pt` has no licence-plate class, the pipeline rejects it
+  and still falls back to contour detection — `lpr.model_assets` refuses to
+  install it as the plate model precisely so a gate cannot pass every readiness
+  check while reading nothing. Getting off the contour fallback still requires
+  a real fine-tune at `models/plate_yolov8n.pt` (see README_TRAINING.md).
+
+- **A history-content guard for committed credentials.** The existing history
+  check scanned the *paths* added in each commit, which catches a stray
+  `.pem` or `.pt` and misses a template whose path is legitimate in every
+  commit and whose *content* leaked. Historical blobs of the template files are
+  now scanned with the same shape checks applied to the working tree, with the
+  two already-rotated values pinned so a third one fails the suite. A second
+  test asserts the scan still reaches the known leak, so the allowlist cannot
+  quietly become a check that scans nothing.
+
 - **`lpr init` — one command from `git clone` to a service that starts.**
   Also `python scripts/setup_dev.py` (works before `pip install -e .`) and
   `make init`. It creates `data/`, `models/`, `keys/` and `data/snapshots/`,
@@ -152,6 +177,16 @@ are currently driving through.
   built (construction can raise the level back up). paddleocr gives that logger
   its own handler and `propagate = False`, so this removes stdout noise and no
   structured log line — `lpr.*` output is untouched.
+
+- **Gmail's `535 5.7.8 BadCredentials` now says what it means.** Google
+  accounts refuse the account password over SMTP outright and want a
+  16-character app password, minted separately, with 2-step verification
+  already enabled. None of that is in the server's reply, which reads as a
+  typo. `SMTPAuthenticationError` is now caught on its own and explained once
+  per process — once, because a wrong credential cannot fix itself between
+  notifications, and repeating it at every refused entry buries the first
+  occurrence. `.env.example` already carried the guidance; it now has tests
+  holding it there.
 
 - **Two cameras pointed at one device took the capture pipeline down** instead
   of being refused. Setting entry and exit to the same index — the default

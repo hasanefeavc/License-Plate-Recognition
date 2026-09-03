@@ -431,3 +431,85 @@ def test_the_shipped_config_does_not_carry_a_password(tmp_settings: Any) -> None
     from lpr.config import Settings
 
     assert Settings().smtp.password == ""
+
+
+# ---------------------------------------------------------------------------
+# Gmail refuses the account password, and says something else
+# ---------------------------------------------------------------------------
+
+
+def _auth_error() -> Any:
+    """The reply Gmail actually sends when handed an account password."""
+    import smtplib
+
+    return smtplib.SMTPAuthenticationError(535, b"5.7.8 Username and Password not accepted")
+
+
+def test_a_rejected_credential_explains_app_passwords(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`(535, b'5.7.8 BadCredentials')` reads as "you typed it wrong".
+
+    For Gmail and Google Workspace it almost never is: those accounts refuse
+    the account password over SMTP outright and want a 16-character app
+    password, minted separately, with 2-step verification already on. None of
+    that is in the server's reply, and the operator has no reason to guess it
+    -- so the notifier has to say it.
+    """
+    import logging
+
+    notifier = EmailNotifier(config(), sender=RecordingSender(_auth_error()))
+
+    with caplog.at_level(logging.DEBUG, logger="lpr.notify"):
+        run(notifier, notification())
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    message = errors[0].getMessage()
+    assert "apppasswords" in message
+    assert "16" in message
+    assert notifier.failed == 1
+    assert notifier.sent == 0
+
+
+def test_the_explanation_is_logged_once_not_per_plate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wrong credential cannot fix itself between notifications.
+
+    Repeating the explanation at every refused entry is what buries the first
+    occurrence, which is the one somebody would have read.
+    """
+    import logging
+
+    notifier = EmailNotifier(config(), sender=RecordingSender(_auth_error()))
+
+    with caplog.at_level(logging.DEBUG, logger="lpr.notify"):
+        run(notifier, notification(), notification(plate="06BZ1234"), notification())
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert notifier.failed == 3
+
+
+def test_an_authentication_failure_is_still_just_a_failed_notification() -> None:
+    """It must not reach the gate. The decision was made and logged already."""
+    notifier = EmailNotifier(config(), sender=RecordingSender(_auth_error()))
+    run(notifier, notification())
+
+    assert notifier.failed == 1
+
+
+def test_other_smtp_failures_keep_their_own_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dead server is not a credential problem and must not be described as one."""
+    import logging
+
+    notifier = EmailNotifier(config(), sender=RecordingSender(ConnectionRefusedError("down")))
+
+    with caplog.at_level(logging.DEBUG, logger="lpr.notify"):
+        run(notifier, notification())
+
+    assert not any("apppasswords" in r.getMessage() for r in caplog.records)
+    assert notifier.failed == 1

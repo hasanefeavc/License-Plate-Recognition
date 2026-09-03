@@ -508,6 +508,95 @@ def test_git_history_holds_no_key_material() -> None:
     )
 
 
+#: The two credentials that were committed in `.env.example` and are still in
+#: history at 6675bf2. Both are recorded here rather than discovered, because
+#: the test below has to distinguish "the leak we already know about, rotated
+#: and documented" from a new one -- and a scan that simply passed would be
+#: claiming a history that is clean when it is not.
+#:
+#: They are already published: in this repository's history, and in the two
+#: positive-control tests above that pin the guards against the real strings.
+#: Writing them once, here, is what lets the check below be exact.
+KNOWN_HISTORICAL_LEAKS = frozenset(
+    {
+        "1zlalzlrpkbtklven",
+        "e8e6f8c10542b950766a39505a822588fbae0d2c79fd9ba9a524ab4a43732d5e",
+    }
+)
+
+
+def _template_blobs() -> list[tuple[str, str, str]]:
+    """Every historical version of every template file: (commit, path, text)."""
+    blobs: list[tuple[str, str, str]] = []
+    for name in TEMPLATE_FILES:
+        revs = subprocess.run(
+            ["git", "log", "--all", "--format=%H", "--", name],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        )
+        if revs.returncode != 0:  # pragma: no cover - not a git checkout
+            pytest.skip("not a git checkout")
+        for commit in revs.stdout.decode().split():
+            show = subprocess.run(
+                ["git", "show", f"{commit}:{name}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+            )
+            if show.returncode == 0:
+                blobs.append((commit[:7], name, show.stdout.decode("utf-8", "replace")))
+    return blobs
+
+
+def test_git_history_holds_no_new_credential_content() -> None:
+    """The gap the filename scan above leaves open.
+
+    `test_git_history_holds_no_key_material` looks at the *paths* added in
+    every commit, which catches `keys/private_key.pem` and a stray `.pt` and
+    misses this entirely: `.env.example` is a path that legitimately exists in
+    every commit, and what leaked was its *content*.
+
+    So this reads the blob at each revision and applies the same shape checks
+    the template scan applies to the working tree. The two values already known
+    to be in history are subtracted rather than ignored -- they are rotated and
+    on the record, and pinning them is what lets everything else be an
+    assertion instead of a hope. A third value appearing here means a
+    credential was committed after those, and rotation comes first.
+    """
+    offenders: list[str] = []
+    for commit, name, text in _template_blobs():
+        for value in ASSIGNMENT_RE.findall(text):
+            compact = _compact(value)
+            if compact in KNOWN_HISTORICAL_LEAKS or _is_placeholder(value):
+                continue
+            if OPAQUE_SECRET_RE.match(compact) or HEX_SECRET_RE.search(compact):
+                offenders.append(f"{name}@{commit}")
+
+    assert not offenders, (
+        "a credential was committed after the known leaks: "
+        + ", ".join(sorted(set(offenders)))
+        + " -- rotate it first, then purge with git filter-repo"
+    )
+
+
+def test_the_history_scan_sees_the_leak_it_is_calibrated_against() -> None:
+    """A subtraction nobody has watched apply is a guess.
+
+    If the scan stopped finding the known leak -- a changed regex, a `git log`
+    that returns nothing, `TEMPLATE_FILES` losing an entry -- the test above
+    would pass by scanning nothing at all, which is the failure mode of every
+    allowlist. This asserts the leak is still visible to the scanner, so the
+    subtraction above is doing work rather than covering for a dead check.
+    """
+    found = {
+        _compact(value)
+        for _commit, _name, text in _template_blobs()
+        for value in ASSIGNMENT_RE.findall(text)
+    }
+    assert KNOWN_HISTORICAL_LEAKS & found, "the history scan no longer reaches the known leak"
+
+
 def test_the_url_exemption_does_not_cover_vendor_tokens() -> None:
     """The narrow half of the exemption, asserted rather than assumed.
 
