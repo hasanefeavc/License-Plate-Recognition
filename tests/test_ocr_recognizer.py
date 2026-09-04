@@ -773,9 +773,7 @@ def test_the_stubs_are_in_place_before_paddleocr_is_imported(
             # which is the moment paddleocr's own module body would have run.
             if attribute != "PaddleOCR":
                 raise AttributeError(attribute)
-            stubbed_at_import.append(
-                all(name in sys.modules for name, _ in _UNUSED_PADDLE_MODULES)
-            )
+            stubbed_at_import.append(all(name in sys.modules for name, _ in _UNUSED_PADDLE_MODULES))
             return lambda **_kwargs: None
 
     monkeypatch.setitem(sys.modules, "paddleocr", Watching("paddleocr"))
