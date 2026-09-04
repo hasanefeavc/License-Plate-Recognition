@@ -65,6 +65,7 @@ from lpr.detect.preprocess import (
     rectify_perspective,
 )
 from lpr.ocr.ensemble import Ballot, vote
+from lpr.torch_preload import preload_torch
 
 if TYPE_CHECKING:
     from lpr.config import Settings
@@ -943,6 +944,14 @@ class PaddleOcrRecognizer(_BaseRecognizer):
         # records what it is about to overwrite. Order matters only in that
         # both must precede the import.
         _stub_unused_paddle_imports()
+
+        # Torch before paddle, always. paddleocr reaches `albumentations.pytorch`
+        # and imports torch itself, and on Windows a torch that arrives *after*
+        # paddlepaddle's OpenMP runtime fails to link `torch/lib/shm.dll` with
+        # WinError 127. This is the one import site that matters, so the
+        # ordering is guaranteed here rather than left to the caller -- see
+        # `lpr.torch_preload`. A machine with no torch is unaffected.
+        preload_torch()
 
         # `import paddleocr` is not a passive import -- see
         # `_undo_paddle_process_globals` for what it changes underneath us and

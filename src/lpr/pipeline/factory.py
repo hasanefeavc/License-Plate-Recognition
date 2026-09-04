@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from lpr.hardware.relay import build_relay
 from lpr.model_assets import ensure_detection_weights, ensure_runtime_dirs
 from lpr.pipeline.orchestrator import PipelineOrchestrator
+from lpr.torch_preload import preload_torch
 
 if TYPE_CHECKING:  # pragma: no cover
     from lpr.config import Settings
@@ -66,6 +67,12 @@ def build_pipeline(settings: Settings | None = None) -> PipelineOrchestrator:
         logger.warning("%s", assets.detail)
         for note in assets.notes:
             logger.warning("%s", note)
+
+    # Torch first, before anything that might reach paddle. On Windows the two
+    # runtimes collide in load order and torch is the one that loses -- see
+    # `lpr.torch_preload`. Cheap and idempotent once torch is resident, and a
+    # no-op on a machine that has no torch to load.
+    preload_torch()
 
     # Imported here, never at module scope -- see the module docstring.
     try:

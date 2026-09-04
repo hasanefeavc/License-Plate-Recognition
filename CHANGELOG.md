@@ -158,6 +158,32 @@ are currently driving through.
     already-imported real module always wins, so a genuine PP-Structure user in
     the same process is unaffected.
 
+- **The same `shm.dll` error came back on Windows, from a different cause.**
+  With the install fixed, `import torch` succeeded on its own and the pipeline
+  still died at start-up with `[WinError 127] … torch\lib\shm.dll`. The wheel
+  was fine this time; the load *order* was not. Importing `paddleocr` puts
+  paddlepaddle's own OpenMP/MKL runtime into the process, and paddleocr then
+  reaches `albumentations.pytorch` and imports torch — which binds `shm.dll`
+  against the symbols paddle has already claimed, finds the wrong ones, and
+  fails to link. Windows resolves DLL dependencies per process in load order,
+  so whichever runtime arrives first wins, and torch is the one that cannot
+  survive losing.
+
+  The recogniser now imports torch immediately before `from paddleocr import
+  PaddleOCR`, and `build_pipeline` does the same before it touches the ML stack
+  at all, so the ordering does not depend on which component happens to import
+  what. It is deliberately **not** an `import torch` at the top of either
+  module: both promise an import that costs nothing and needs no ML stack
+  installed, which is what lets the test suite build a pipeline out of fakes on
+  a machine with no torch. A missing or broken torch stays a warning and a
+  degraded pipeline, never a crash — the preload owns load order and nothing
+  else.
+
+  Worth knowing when reading a bug report: `[WinError 127] … shm.dll` now has
+  two known causes on Windows, a missing OpenMP redistributable at install
+  time and this collision at run time. The first fails on `import torch` alone,
+  the second only when paddle got there first.
+
 - **PaddleOCR narrated every frame to stdout and the console became the
   bottleneck.** Two DEBUG lines per inference (`dt_boxes num : 1, elapsed :
   0.012s` and the matching `rec_res`) plus a repeating WARNING about the angle
