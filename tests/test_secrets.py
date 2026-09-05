@@ -265,14 +265,21 @@ def test_the_smtp_password_is_not_set_in_the_committed_config() -> None:
 
 
 def test_the_shipped_api_secret_is_still_the_refuse_to_start_sentinel() -> None:
-    """`change-me` is what makes LPR_ENV=production refuse to boot unconfigured.
+    """`change-me` is what makes startup refuse an unconfigured deployment.
 
     Replacing it with a real key in config.yaml would both publish the key and
     disarm that guard, so the sentinel staying put is worth asserting.
-    """
-    from lpr.config import Settings
 
-    assert Settings().api.secret_key == "change-me"
+    Read out of the committed YAML rather than through ``Settings``: the test
+    session sets ``LPR_API__SECRET_KEY`` (it has to -- the guard now refuses
+    the sentinel on any non-loopback bind, and config.yaml states
+    ``host: 0.0.0.0``), and an environment override is exactly what a real
+    deployment is supposed to do. What must not drift is the *file*.
+    """
+    import yaml
+
+    shipped = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+    assert shipped["api"]["secret_key"] == "change-me"
 
 
 # ---------------------------------------------------------------------------

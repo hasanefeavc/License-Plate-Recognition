@@ -26,12 +26,19 @@ import contextlib
 import json
 import logging
 import queue
+import time
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from lpr.api.security import AuthError, AuthUser, license_refusal, user_from_token
+from lpr.api.security import (
+    AuthError,
+    AuthUser,
+    license_refusal,
+    resolve_live_user,
+    user_from_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +60,17 @@ EVENTS_PATH = "/api/ws/events"
 LEGACY_EVENTS_PATH = "/ws/events"
 #: How often camera health is pushed to clients while the stream is idle.
 CAMERA_STATUS_INTERVAL_S = 5.0
+#: How often a live socket re-checks the token that opened it.
+#:
+#: The handshake is a single point-in-time decision, and these connections are
+#: meant to stay up for a whole shift. Without this, an expiry and a revocation
+#: both become "effective at next reconnect": an operator's 8-hour token holds
+#: the stream open indefinitely, and deleting an account mid-shift leaves it
+#: watching the gate until the browser happens to drop.
+#:
+#: A minute rather than every pass, because the check is a database read and
+#: the thing it defends against is measured in shifts, not seconds.
+REAUTH_INTERVAL_S = 60.0
 
 __all__ = [
     "CAMERA_STATUS_INTERVAL_S",
@@ -62,6 +80,7 @@ __all__ = [
     "ConnectionManager",
     "PING_INTERVAL_S",
     "QUEUE_POLL_S",
+    "REAUTH_INTERVAL_S",
     "camera_status_payload",
     "manager",
     "ws_router",
@@ -141,6 +160,32 @@ def _drain(q: queue.Queue[Any]) -> list[Any]:
     return items
 
 
+def _drain_nowait(q: queue.Queue[Any]) -> list[Any]:
+    """Whatever is already queued, without ever waiting.
+
+    Safe to call straight from the event loop, which :func:`_drain` is not.
+    The telemetry stream rides along on the pacing the event-queue read
+    already provides -- that read is the one that blocks for
+    :data:`QUEUE_POLL_S`, and it does so inside an executor. Draining
+    telemetry with :func:`_drain` as well put a second blocking wait *on the
+    loop's own thread*, so a quiet gate (an idle queue waits the full poll
+    window) stalled every other request in the process for a second per
+    iteration, per connected dashboard.
+
+    Moving it to a second executor hop would have fixed the stall and added a
+    second of latency to every cycle. Not waiting at all costs nothing: an
+    event that arrives a few milliseconds after this returns is picked up on
+    the next pass.
+    """
+    items: list[Any] = []
+    while len(items) < MAX_BATCH:
+        try:
+            items.append(q.get_nowait())
+        except queue.Empty:
+            break
+    return items
+
+
 def _as_payload(event: Any) -> dict[str, Any]:
     """Normalise whatever the pipeline queued into the wire format."""
     if isinstance(event, dict):
@@ -194,7 +239,17 @@ async def _authenticate(websocket: WebSocket, token: str | None) -> AuthUser | N
     """
     await websocket.accept()
     try:
-        user = user_from_token(token or "")
+        # Resolved against the database, exactly as `current_user` does for
+        # HTTP. A socket is a standing subscription to everything the site
+        # sees, so a token whose account has been deleted -- or demoted since
+        # it was signed -- must not open one. The licence check below cannot
+        # stand in for this: it exempts admins and is switched off entirely on
+        # a site with no licence secret.
+        user = await asyncio.to_thread(
+            resolve_live_user,
+            user_from_token(token or ""),
+            _user_repository(websocket),
+        )
     except AuthError as exc:
         logger.info("WebSocket kimlik doğrulaması reddedildi: %s", exc)
         await _close_policy(websocket, str(exc))
@@ -318,9 +373,35 @@ async def events_socket(
 
         idle_for = 0.0
         since_status = 0.0
+        # Wall clock rather than an accumulator, and checked at the top of the
+        # loop: a busy socket `continue`s past the counters below on every pass
+        # that carried an event, so anything paced by adding QUEUE_POLL_S is
+        # never reached on exactly the connections that stay up longest.
+        next_reauth = time.monotonic() + REAUTH_INTERVAL_S
         while not reader.done():
             if websocket.client_state is not WebSocketState.CONNECTED:
                 break
+
+            if time.monotonic() >= next_reauth:
+                next_reauth = time.monotonic() + REAUTH_INTERVAL_S
+                try:
+                    # Re-decodes the original token, so expiry is enforced for
+                    # as long as the socket lives, and re-reads the account, so
+                    # a mid-shift deletion or demotion closes the stream
+                    # instead of waiting for the client to reconnect.
+                    user = await asyncio.to_thread(
+                        resolve_live_user,
+                        user_from_token(token or ""),
+                        _user_repository(websocket),
+                    )
+                except AuthError as exc:
+                    logger.info("WebSocket oturumu sonlandırıldı: %s", exc)
+                    await _close_policy(websocket, str(exc))
+                    break
+                lapsed = await license_refusal(user, _user_repository(websocket))
+                if lapsed is not None:
+                    await _close_policy(websocket, lapsed)
+                    break
 
             if event_queue is None:
                 # Degraded mode: nothing to pump, just keep the socket warm so
@@ -330,7 +411,7 @@ async def events_socket(
             else:
                 events = await loop.run_in_executor(None, _drain, event_queue)
 
-            telemetry = _drain(telemetry_queue) if telemetry_queue is not None else []
+            telemetry = _drain_nowait(telemetry_queue) if telemetry_queue is not None else []
 
             if events or telemetry:
                 idle_for = 0.0

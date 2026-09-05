@@ -100,6 +100,16 @@ services:
       - ../config.yaml:/app/config.yaml:ro
 
     environment:
+      # Production unless the operator deliberately says otherwise. This is what
+      # arms the checks that only make sense on a real site: the refusal to boot
+      # with the shipped `change-me` signing key, the refusal to serve wildcard
+      # CORS, and switching /docs and /openapi.json off. None of them used to
+      # fire under compose, because nothing set this and the default was "not
+      # production" -- so a site that never wrote a .env got the development
+      # posture without ever having chosen it.
+      #
+      # `LPR_ENV=development docker compose up` still opts out for a bench box.
+      LPR_ENV: ${LPR_ENV:-production}
       # Put the OCR weights on the models/ volume rather than in $HOME, so they
       # survive `docker compose up --build`. Without this every rebuild
       # re-downloaded ~100 MB before the first frame could be processed, and a

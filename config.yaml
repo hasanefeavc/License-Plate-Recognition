@@ -278,9 +278,22 @@ anti_passback:
 api:
   host: 0.0.0.0
   port: 8000
-  cors_origins:
-    - "*"
+  # Empty = same-origin only, and that is the right default. The dashboard is
+  # served by this very app at /web, so a site behind the shipped reverse proxy
+  # needs no CORS at all and the safest configuration is the one that grants
+  # nothing. This used to be ["*"], which granted every origin on the internet
+  # read access to the API from any page a logged-in operator happened to open.
+  #
+  # Add the real origin(s) here -- e.g. https://gate.example.com -- only for a
+  # front end hosted somewhere other than this service.
+  cors_origins: []
   token_ttl_min: 720
+  # MUST be replaced before this service binds to anything but loopback; the
+  # value below is in the public repository, so a deployment that keeps it is
+  # signing its sessions with a key anybody can look up. Startup refuses it --
+  # see Settings._check_secret_key_in_production.
+  #   openssl rand -hex 32
+  # `python scripts/setup_dev.py` writes a generated one into .env for you.
   secret_key: change-me
 
 system_update:

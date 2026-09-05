@@ -137,6 +137,53 @@ class FakeUserRepository:
             for name, (_pw, role) in self._users.items()
         ]
 
+    def create_bootstrap_admin(self, username: str, password: str) -> bool:
+        """Claim the first account as admin, or False if one already exists.
+
+        Single-threaded here, so the atomicity the real repository gets from
+        ``BEGIN IMMEDIATE`` is free -- what this gives the suite is coverage of
+        the route branch that calls it, rather than of the legacy
+        ``is_first_user``-then-write fallback.
+        """
+        if self._users:
+            return False
+        return self.register(username, password, "admin")
+
+    def get(self, username: str) -> dict[str, Any] | None:
+        """The account row, or ``None`` when it no longer exists.
+
+        Not optional, despite nothing in this file calling it directly.
+        ``lpr.api.security.resolve_live_user`` is the revocation layer -- it
+        re-reads the account behind every token so that deleting a user ends
+        their sessions and demoting one takes effect immediately -- and it
+        treats a *lookup failure* as "the database is having a moment, honour
+        the signature" rather than as "the account is gone".
+
+        Without this method that call raised ``AttributeError`` on every
+        request, so the whole suite ran with revocation silently failing open
+        and could not have caught a missing revocation check anywhere. It did
+        not: three were found (``register``, the MJPEG stream and the
+        WebSocket handshake).
+        """
+        stored = self._users.get(username)
+        if stored is None:
+            return None
+        # Carries a live licence. These tests are about roles, plate CRUD and
+        # the log views, not about licensing -- and `license_refusal` reads the
+        # same row, so a row with no licence columns would refuse every
+        # operator with "lisans süresi dolmuştur" and quietly turn most of this
+        # file into a licence test. The dedicated licence coverage builds its
+        # own rows (see ManagedUserRepository).
+        return {
+            "username": username,
+            "role": stored[1],
+            "created_at": "2026-05-01",
+            "license_status": "active",
+            "license_expires_at": "2099-01-01T00:00:00+00:00",
+            "license_activated_at": "2026-01-01T00:00:00+00:00",
+            "license_duration_days": 365,
+        }
+
 
 class FakeRelay:
     def __init__(self) -> None:
@@ -313,12 +360,22 @@ def auth(token: str) -> dict[str, str]:
 
 
 @pytest.fixture()
-def admin_token() -> str:
+def admin_token(user_repo: FakeUserRepository) -> str:
+    """A token for an admin account that actually exists in the repository.
+
+    The account is registered, not just named. ``resolve_live_user`` re-reads
+    every token's account on every request, so a token minted for a username
+    the repository has never heard of is now correctly refused as a deleted
+    account -- which is a 401, and not the thing most of these tests are
+    asserting about.
+    """
+    user_repo.register("admin", "gizli123", "admin")
     return create_token("admin", "admin")
 
 
 @pytest.fixture()
-def operator_token() -> str:
+def operator_token(user_repo: FakeUserRepository) -> str:
+    user_repo.register("operator", "gizli123", "operator")
     return create_token("operator", "operator")
 
 
@@ -1276,24 +1333,28 @@ def test_an_expired_deployment_licence_no_longer_halts_the_pipeline(expired_app:
     assert expired_app.state.pipeline.paused is False
 
 
-def test_an_expired_deployment_licence_no_longer_blocks_the_gate(expired_app: Any) -> None:
+def test_an_expired_deployment_licence_no_longer_blocks_the_gate(
+    expired_app: Any, admin_token: str
+) -> None:
     client = TestClient(expired_app)
-    response = client.post("/api/relay/trigger", headers=auth(create_token("admin", "admin")))
+    response = client.post("/api/relay/trigger", headers=auth(admin_token))
     assert response.status_code == 200
     assert expired_app.state.pipeline.relay.triggers == 1
 
 
-def test_an_expired_deployment_licence_does_not_block_resume(expired_app: Any) -> None:
+def test_an_expired_deployment_licence_does_not_block_resume(
+    expired_app: Any, admin_token: str
+) -> None:
     """There is nothing to recover from: the licence never paused anything."""
     client = TestClient(expired_app)
-    response = client.post("/api/pipeline/resume", headers=auth(create_token("admin", "admin")))
+    response = client.post("/api/pipeline/resume", headers=auth(admin_token))
     assert response.status_code == 200
     assert expired_app.state.paused is False
 
 
-def test_submitting_a_key_releases_the_halt(expired_app: Any) -> None:
+def test_submitting_a_key_releases_the_halt(expired_app: Any, admin_token: str) -> None:
     client = TestClient(expired_app)
-    token = create_token("admin", "admin")
+    token = admin_token
 
     response = client.post(
         "/api/license", headers=auth(token), json={"key": "yeni-lisans-anahtari-jwt"}
@@ -1309,24 +1370,26 @@ def test_submitting_a_key_releases_the_halt(expired_app: Any) -> None:
     assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
 
 
-def test_a_rejected_deployment_key_is_a_400_carrying_the_reason(expired_app: Any) -> None:
+def test_a_rejected_deployment_key_is_a_400_carrying_the_reason(
+    expired_app: Any, admin_token: str
+) -> None:
     """The endpoint still validates keys; it just no longer gates anything."""
     client = TestClient(expired_app)
     response = client.post(
         "/api/license",
         json={"key": "gecersiz-anahtar"},  # what FakeLicenseGuard refuses
-        headers=auth(create_token("admin", "admin")),
+        headers=auth(admin_token),
     )
     assert response.status_code == 400
     assert "geçersiz" in response.json()["error"]["detail"]
 
 
-def test_pasted_key_whitespace_is_stripped(expired_app: Any) -> None:
+def test_pasted_key_whitespace_is_stripped(expired_app: Any, admin_token: str) -> None:
     """Keys arrive wrapped across lines out of an e-mail."""
     client = TestClient(expired_app)
     client.post(
         "/api/license",
-        headers=auth(create_token("admin", "admin")),
+        headers=auth(admin_token),
         json={"key": "  yeni-lisans\n-anahtari-jwt  "},
     )
     assert expired_app.state.license_guard.activated == ["yeni-lisans-anahtari-jwt"]
@@ -1337,10 +1400,10 @@ def test_submitting_a_key_requires_admin(api_client: TestClient, operator_token:
     assert response.status_code == 403
 
 
-def test_manual_pause_survives_a_licence_renewal(expired_app: Any) -> None:
+def test_manual_pause_survives_a_licence_renewal(expired_app: Any, admin_token: str) -> None:
     """An operator's pause must not be undone by the licence coming back."""
     client = TestClient(expired_app)
-    token = create_token("admin", "admin")
+    token = admin_token
 
     client.post("/api/pipeline/pause", headers=auth(token))
     client.post("/api/license", headers=auth(token), json={"key": "yeni-anahtar-jwt-degeri"})
@@ -2994,7 +3057,8 @@ def test_the_auth_path_uses_the_overridden_repository(api_app: Any) -> None:
 
 
 @pytest.fixture()
-def viewer_token() -> str:
+def viewer_token(user_repo: FakeUserRepository) -> str:
+    user_repo.register("watcher", "gizli123", "viewer")
     return create_token("watcher", "viewer")
 
 
@@ -3093,9 +3157,16 @@ def test_an_admin_may_still_write(api_client: TestClient, admin_token: str) -> N
 
 def test_a_token_with_an_unknown_role_gets_the_least_authority(
     api_client: TestClient,
+    user_repo: FakeUserRepository,
 ) -> None:
     """A role this build has never heard of -- a downgrade, a typo, a forged
-    claim -- must rank below everything, not above it."""
+    claim -- must rank below everything, not above it.
+
+    The account is registered with that role so the refusal is about the role.
+    Without it the request would be refused for having no account at all, and
+    the test would pass while proving nothing about `role_at_least`.
+    """
+    user_repo.register("stranger", "gizli123", "superuser")
     token = create_token("stranger", "superuser")
     assert api_client.post("/api/relay/trigger", headers=auth(token)).status_code == 403
 

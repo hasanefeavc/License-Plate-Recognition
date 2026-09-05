@@ -867,7 +867,15 @@ class RegisterIn(BaseModel):
     )
 
     username: str = Field(min_length=3, max_length=64, examples=["operator1"])
-    password: str = Field(min_length=4, max_length=256, examples=["s3cret!"])
+    #: Eight characters, matching :class:`UserCreateIn`.
+    #:
+    #: This used to be four, which put the loosest password rule in the system
+    #: on the one account that is always an administrator: the route forces
+    #: ``admin`` for the first account on an empty installation regardless of
+    #: what the body asks for. The floor was inverted with respect to
+    #: privilege, and the account it governed owns the plate list, the user
+    #: table and the barrier.
+    password: str = Field(min_length=8, max_length=256, examples=["s3cret!"])
     #: Least privilege by default, as in :class:`UserCreateIn`; see the note
     #: there. The bootstrap case is unaffected -- the route forces ``admin``
     #: for the first account on an empty installation regardless of the body,

@@ -49,6 +49,15 @@ from lpr.platform_compat import IS_WINDOWS, default_serial_port
 
 logger = logging.getLogger(__name__)
 
+#: Addresses that reach only this machine.
+#:
+#: Used by :meth:`Settings._check_secret_key_in_production` to tell a
+#: development box apart from a deployment: binding anywhere else means the
+#: service is reachable by somebody, and the default signing key stops being
+#: survivable at that moment. ``0.0.0.0`` and ``::`` are deliberately absent --
+#: they are the *widest* binds there are.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
 # ---------------------------------------------------------------------------
 # Section models
 # ---------------------------------------------------------------------------
@@ -1361,13 +1370,67 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_secret_key_in_production(self) -> Settings:
+        """Refuse the shipped default signing key on any reachable address.
+
+        ``change-me`` is in the public repository, so a deployment that keeps
+        it signs its HS256 sessions with a value anybody can look up. Forging
+        ``{"sub": "anyone", "role": "admin"}`` is then trivial, and every other
+        control -- the revocation check, the login lockout, the role
+        dependencies -- is downstream of a signature that no longer proves
+        anything.
+
+        Two conditions arm the refusal, not one:
+
+        * ``LPR_ENV=production``, as before.
+        * **Binding to anything but loopback.** This is the one that matters in
+          practice. ``LPR_ENV`` is set by nobody -- the shipped compose file
+          declares it (see ``docker/docker-compose.yml``) but a bare
+          ``uvicorn`` or a hand-rolled unit file does not, and a guard that
+          only fires when a site has already been configured correctly is not
+          a guard. What the deployment *binds to* is a fact about its
+          exposure that cannot be forgotten.
+
+        ``app.headless`` used to be part of this condition and is deliberately
+        gone. Headlessness governs the log format and whether a UI is
+        attached; it has no bearing on whether a published signing key is
+        acceptable, and coupling the two exempted every production site
+        running the desktop client.
+
+        A loopback-only development box keeps working, with a warning -- that
+        is the case the default exists for.
+
+        The exposure arm reads the host only when configuration actually stated
+        one. ``ApiConfig.host`` defaults to ``0.0.0.0``, and that default is
+        inherited by every ``Settings`` built by something that is not serving
+        HTTP at all -- a CLI subcommand, an evaluation script, a test fixture.
+        Refusing those would turn a field they never read into a hard error.
+        Anything that really serves has said so: ``config.yaml`` writes
+        ``api.host`` explicitly, and the shipped compose file sets
+        ``LPR_ENV=production``, so a live deployment is covered by one arm or
+        the other.
+        """
+        if self.api.secret_key != "change-me":
+            return self
+
         is_production = os.environ.get("LPR_ENV", "").strip().lower() == "production"
-        if self.app.headless and is_production and self.api.secret_key == "change-me":
+        host_configured = "host" in self.api.model_fields_set
+        loopback = str(self.api.host).strip() in _LOOPBACK_HOSTS
+
+        if is_production or (host_configured and not loopback):
             raise ValueError(
                 "api.secret_key is still the default 'change-me'. Set it via "
                 "config.yaml (api.secret_key) or the LPR_API__SECRET_KEY "
-                "environment variable before running with LPR_ENV=production."
+                "environment variable before serving on a reachable address "
+                f"(api.host is {self.api.host!r}). Generate one with: "
+                "openssl rand -hex 32"
             )
+
+        logger.warning(
+            "api.secret_key is the default 'change-me'. Tolerated only because "
+            "api.host is %r (loopback). Set LPR_API__SECRET_KEY before exposing "
+            "this service.",
+            self.api.host,
+        )
         return self
 
     @property

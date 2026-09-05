@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import stat
 import uuid
 from dataclasses import dataclass
@@ -334,13 +335,34 @@ def ensure_dev_license(
 # ---------------------------------------------------------------------------
 
 
+#: Placeholder values in ``.env.example`` that are filled in with a freshly
+#: generated secret when the file is copied.
+#:
+#: Keyed by the exact placeholder text so a line whose value an operator has
+#: already chosen is never touched. The two must not collide -- reusing one
+#: secret for sessions and licences means a single leak forges both, and
+#: rotating either forces rotating the other -- so each gets its own draw.
+_GENERATED_SECRETS: tuple[str, ...] = (
+    "replace-with-openssl-rand-hex-32",
+    "replace-with-a-different-openssl-rand-hex-32",
+)
+
+
 def ensure_env_file(root: Path | None = None, *, force: bool = False) -> Step:
-    """Copy ``.env.example`` to ``.env`` when there is no ``.env``.
+    """Copy ``.env.example`` to ``.env``, minting real secrets on the way.
 
     Copied rather than symlinked, and never overwritten: ``.env`` is the
     uncommitted file carrying this machine's secrets, and clobbering it during
     a re-run of a setup script would be the most expensive thing in this
     module.
+
+    The placeholder secrets are replaced with ``secrets.token_hex(32)`` as the
+    copy is written. Leaving them as literal text made the documented setup
+    path produce an installation that could not start -- startup refuses the
+    shipped ``change-me`` signing key on any non-loopback bind -- and, worse,
+    invited an operator to work around that by keeping a value printed in the
+    public repository. A secret nobody has to remember to generate is a secret
+    that actually gets generated.
     """
     base = root or repo_root()
     example = base / ".env.example"
@@ -351,13 +373,19 @@ def ensure_env_file(root: Path | None = None, *, force: bool = False) -> Step:
     if not example.is_file():
         return Step("env", False, f"skipped: no {example} to copy from", target)
 
-    target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
-    return Step(
-        "env",
-        True,
-        f"copied {example.name} -> {target.name}; replace every placeholder secret in it",
-        target,
-    )
+    content = example.read_text(encoding="utf-8")
+    minted = 0
+    for placeholder in _GENERATED_SECRETS:
+        if placeholder in content:
+            content = content.replace(placeholder, secrets.token_hex(32))
+            minted += 1
+
+    target.write_text(content, encoding="utf-8")
+    detail = f"copied {example.name} -> {target.name}"
+    if minted:
+        detail += f"; generated {minted} secret(s)"
+    detail += "; replace any remaining placeholder in it"
+    return Step("env", True, detail, target)
 
 
 # ---------------------------------------------------------------------------

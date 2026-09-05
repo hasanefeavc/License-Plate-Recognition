@@ -92,6 +92,7 @@ from lpr.api.security import (
     require_admin,
     require_license,
     require_licensed_operator,
+    resolve_live_user,
     token_ttl_seconds,
     user_from_token,
 )
@@ -461,7 +462,28 @@ async def register(
     path the desktop client's login screen uses. Once that account exists,
     every further registration needs an admin bearer token.
     """
-    first_user = bool(await _in_thread(user_repo.is_first_user))
+    # The bootstrap account is claimed atomically, in one statement pair under
+    # a write lock, rather than by asking "is the table empty?" and writing
+    # afterwards. Two requests arriving together on a fresh installation both
+    # used to pass that check and both were made administrators.
+    #
+    # `getattr` because the repository is duck-typed here and older doubles do
+    # not implement it; a repository without the atomic path falls back to the
+    # original check-then-write below, which is racy but no worse than it was.
+    claim_bootstrap = getattr(user_repo, "create_bootstrap_admin", None)
+    if callable(claim_bootstrap):
+        claimed = bool(await _in_thread(claim_bootstrap, payload.username, payload.password))
+        if claimed:
+            logger.info("Yeni kullanıcı oluşturuldu: %s (%s)", payload.username, ADMIN_ROLE)
+            return TokenOut(
+                access_token=create_token(payload.username, ADMIN_ROLE),
+                expires_in=token_ttl_seconds(ADMIN_ROLE),
+                username=payload.username,
+                role=ADMIN_ROLE,
+            )
+        first_user = False
+    else:
+        first_user = bool(await _in_thread(user_repo.is_first_user))
 
     if first_user:
         role = ADMIN_ROLE
@@ -473,7 +495,18 @@ async def register(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         try:
-            requester = user_from_token(credentials.credentials)
+            # Resolved against the database, not read off the token. The role
+            # in a signed claim is frozen at sign time and admin sessions run
+            # for a year, so trusting it here made this the one admin-gated
+            # route a *demoted* administrator could still use -- to create a
+            # fresh admin account and undo the demotion. Every other such
+            # route reaches the database through `current_user`; this one
+            # takes its credential differently and has to ask explicitly.
+            requester = await asyncio.to_thread(
+                resolve_live_user,
+                user_from_token(credentials.credentials),
+                user_repo,
+            )
         except AuthError as exc:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1426,7 +1459,13 @@ async def stream_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        user = user_from_token(raw)
+        # Revocation, on the same terms as every header-authenticated request.
+        # The licence check below is not a substitute for it: `requires_license`
+        # exempts admins outright, and enforcement is off entirely on a site
+        # with no licence secret -- so without this a deleted operator kept the
+        # live gate camera for the remaining life of their token, and a demoted
+        # administrator kept it on a claim the database had already contradicted.
+        user = await asyncio.to_thread(resolve_live_user, user_from_token(raw), user_repo)
     except AuthError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -1001,6 +1001,57 @@ class UserRepository:
             logger.warning("Registration refused, username already taken: %s", name)
         return created
 
+    def create_bootstrap_admin(self, username: str, password: str) -> bool:
+        """Create the very first account as ``admin``, atomically.
+
+        Returns ``False`` when the installation already has an account -- the
+        caller then falls through to the ordinary admin-authenticated path.
+
+        The atomicity is the entire point. The route used to ask
+        :meth:`is_first_user` and then, after an ``await``, call
+        :meth:`register` with the admin role. Two requests arriving together
+        on a fresh installation both saw an empty table and both were made
+        administrators, so somebody watching a box being provisioned could end
+        up with an account of their own beside the installer's -- and the
+        installer would see nothing but a successful setup. The ``UNIQUE``
+        constraint on ``username`` does not help, because the two accounts have
+        different names.
+
+        ``BEGIN IMMEDIATE`` rather than the usual :func:`transaction` helper:
+        that one opens SQLite's default *deferred* transaction, which takes no
+        write lock until the first write and so would let both readers through
+        the count exactly as before. IMMEDIATE takes the reserved lock up
+        front, which is what makes the count and the insert one decision.
+        """
+        name = (username or "").strip()
+        if not name or not password:
+            return False
+
+        digest = _password_hasher().hash(password)
+        conn = get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+            if int(row["n"]) != 0:
+                conn.rollback()
+                return False
+            # Admins hold no licence row -- they are exempt, and a status on
+            # their row would only be something to keep in sync with a rule
+            # that ignores it. Same reasoning as `register`.
+            conn.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at, token_ttl_min, license_status) "
+                "VALUES (?, ?, 'admin', ?, NULL, NULL)",
+                (name, digest, utc_now_iso()),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+        logger.info("Bootstrap administrator created: %s", name)
+        return True
+
     def verify(self, username: str, password: str) -> bool:
         """Check a password. Never logs, returns or raises the password itself.
 

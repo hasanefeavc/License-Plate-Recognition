@@ -87,6 +87,39 @@ def _ignore_the_developers_dotenv() -> Iterator[None]:
             os.environ["LPR_ENV_FILE"] = previous
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _test_api_secret_key() -> Iterator[None]:
+    """Give the whole session a real ``api.secret_key``, for the session.
+
+    ``config.yaml`` ships ``api.secret_key: change-me`` and
+    ``api.host: 0.0.0.0``, and startup now refuses that combination outright --
+    a key printed in the public repository cannot sign sessions for a service
+    that is reachable. Without this the suite would not build a single
+    ``Settings`` object, because ``.env`` (which is where a developer's real
+    key lives) is deliberately neutralised above.
+
+    Setting it here rather than per-fixture also removes something worth being
+    rid of: until now every API test ran against an application signing its
+    tokens with the same publicly known string, so nothing in the suite would
+    have noticed if that string had leaked into a fixture or a recorded
+    response.
+
+    The value is not a secret and does not need to be -- it exists only so the
+    signature is *some* key other than the shipped default.
+    """
+    import os
+
+    previous = os.environ.get("LPR_API__SECRET_KEY")
+    os.environ["LPR_API__SECRET_KEY"] = "test-suite-signing-key-not-a-real-secret"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("LPR_API__SECRET_KEY", None)
+        else:
+            os.environ["LPR_API__SECRET_KEY"] = previous
+
+
 @pytest.fixture
 def tmp_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     """A ``Settings`` object backed entirely by ``tmp_path``.
